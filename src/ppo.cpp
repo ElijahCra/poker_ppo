@@ -52,7 +52,6 @@ VectorizedEnv::step(const std::vector<int>& actions) {
 
         // Auto-reset on done
         if (result.done) {
-            // Store terminal reward, then reset
             rewards[i] = r;
             dones[i]   = 1.0f;
             auto reset_result  = envs_[i]->reset();
@@ -80,7 +79,7 @@ PPOTrainer::PPOTrainer(IPokerEnvironmentFactory& env_factory,
                        const PPOConfig& ppo_cfg,
                        torch::Device device)
     : cfg_(ppo_cfg), bet_cfg_(bet_cfg), device_(device),
-      network_(nullptr)
+      actor_(nullptr), critic_(nullptr)
 {
     // Create vectorized environment
     vec_env_ = std::make_unique<VectorizedEnv>(
@@ -89,15 +88,21 @@ PPOTrainer::PPOTrainer(IPokerEnvironmentFactory& env_factory,
     int obs_dim      = vec_env_->obs_dim();
     int action_count = vec_env_->action_count();
 
-    // Create network
-    network_ = ActorCritic(obs_dim, action_count,
-                           cfg_.hidden_dim, cfg_.num_layers);
-    network_->to(device_);
+    // Create separate actor and critic networks
+    actor_  = Actor(obs_dim, action_count, cfg_.hidden_dim, cfg_.num_layers);
+    critic_ = Critic(obs_dim, cfg_.hidden_dim, cfg_.num_layers);
+    actor_->to(device_);
+    critic_->to(device_);
 
-    // Optimiser
+    // Single optimiser over both networks' parameters.
+    // (Using separate optimisers with different learning rates is also
+    // reasonable — just create two Adam instances instead.)
+    std::vector<torch::Tensor> all_params;
+    for (auto& p : actor_->parameters())  all_params.push_back(p);
+    for (auto& p : critic_->parameters()) all_params.push_back(p);
+
     optimizer_ = std::make_unique<torch::optim::Adam>(
-        network_->parameters(),
-        torch::optim::AdamOptions(cfg_.learning_rate));
+        all_params, torch::optim::AdamOptions(cfg_.learning_rate));
 
     // Rollout buffer
     buffer_ = std::make_unique<RolloutBuffer>(
@@ -110,11 +115,18 @@ void PPOTrainer::train() {
     next_obs_  = vec_env_->reset_all().to(device_);
     next_done_ = torch::zeros({cfg_.num_envs}, device_);
 
-    // Build initial legal masks
+    // Build initial legal masks and player tracking
     int A = vec_env_->action_count();
-    next_legal_mask_ = torch::zeros({cfg_.num_envs, A}, device_);
-    for (int i = 0; i < cfg_.num_envs; ++i)
-        next_legal_mask_[i] = vec_env_->env(i).legal_action_mask().to(device_);
+    next_legal_mask_     = torch::zeros({cfg_.num_envs, A}, device_);
+    next_current_player_ = torch::zeros({cfg_.num_envs},
+                                        torch::TensorOptions()
+                                            .dtype(torch::kInt32)
+                                            .device(device_));
+
+    for (int i = 0; i < cfg_.num_envs; ++i) {
+        next_legal_mask_[i]     = vec_env_->env(i).legal_action_mask().to(device_);
+        next_current_player_[i] = vec_env_->env(i).current_player();
+    }
 
     int total_updates = cfg_.num_updates();
 
@@ -134,11 +146,16 @@ void PPOTrainer::train() {
 
 // ─────────────────────────────────────────────────────────────────────────────
 void PPOTrainer::collect_rollout() {
-    network_->eval();
+    actor_->eval();
+    critic_->eval();
     torch::NoGradGuard no_grad;
 
     for (int step = 0; step < cfg_.num_steps; ++step) {
-        auto ar = network_->get_action(next_obs_, next_legal_mask_);
+        // Actor: sample actions
+        auto ar = actor_->get_action(next_obs_, next_legal_mask_);
+
+        // Critic: estimate values
+        auto value = critic_->forward(next_obs_);
 
         // Convert actions to CPU ints
         auto actions_cpu = ar.action.to(torch::kCPU);
@@ -149,33 +166,39 @@ void PPOTrainer::collect_rollout() {
         // Step environments
         auto [obs, rewards, dones, masks, players] = vec_env_->step(actions);
 
-        // Store in buffer
+        // Store in buffer (including which player was acting)
         buffer_->insert(step,
                         next_obs_.cpu(),
                         ar.action.cpu(),
                         ar.log_prob.cpu(),
                         rewards,
                         next_done_.cpu(),
-                        ar.value.cpu(),
-                        next_legal_mask_.cpu());
+                        value.cpu(),
+                        next_legal_mask_.cpu(),
+                        next_current_player_.cpu());
 
         // Advance state
-        next_obs_        = obs.to(device_);
-        next_done_       = dones.to(device_);
-        next_legal_mask_ = masks.to(device_);
+        next_obs_            = obs.to(device_);
+        next_done_           = dones.to(device_);
+        next_legal_mask_     = masks.to(device_);
+        next_current_player_ = players.to(device_);
 
         global_step_ += cfg_.num_envs;
     }
 
-    // Bootstrap value
-    auto [_, next_value] = network_->forward(next_obs_);
-    buffer_->compute_returns(next_value.cpu(), next_done_.cpu(),
+    // Bootstrap value from critic
+    auto next_value = critic_->forward(next_obs_);
+
+    buffer_->compute_returns(next_value.cpu(),
+                             next_done_.cpu(),
+                             next_current_player_.cpu(),
                              cfg_.gamma, cfg_.gae_lambda);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 void PPOTrainer::update() {
-    network_->train();
+    actor_->train();
+    critic_->train();
 
     auto batch = buffer_->flatten();
     int B = batch.obs.size(0);
@@ -215,7 +238,11 @@ void PPOTrainer::update() {
                          (mb_adv.std() + 1e-8f);
             }
 
-            auto er = network_->evaluate(mb_obs, mb_masks, mb_actions);
+            // Actor forward: get new log_probs and entropy for stored actions
+            auto er = actor_->evaluate(mb_obs, mb_masks, mb_actions);
+
+            // Critic forward: get new value estimates
+            auto new_values = critic_->forward(mb_obs);
 
             // ── policy loss (clipped surrogate) ─────────────────────
             auto logratio = er.log_prob - mb_logp;
@@ -230,14 +257,14 @@ void PPOTrainer::update() {
             torch::Tensor v_loss;
             if (cfg_.clip_vloss) {
                 auto v_clipped = mb_val + torch::clamp(
-                    er.value - mb_val,
+                    new_values - mb_val,
                     -cfg_.clip_coef, cfg_.clip_coef);
-                auto v_loss_unclipped = (er.value - mb_ret).pow(2);
+                auto v_loss_unclipped = (new_values - mb_ret).pow(2);
                 auto v_loss_clipped   = (v_clipped - mb_ret).pow(2);
                 v_loss = 0.5f * torch::max(v_loss_unclipped,
                                            v_loss_clipped).mean();
             } else {
-                v_loss = 0.5f * (er.value - mb_ret).pow(2).mean();
+                v_loss = 0.5f * (new_values - mb_ret).pow(2).mean();
             }
 
             // ── entropy bonus ───────────────────────────────────────
@@ -250,8 +277,11 @@ void PPOTrainer::update() {
 
             optimizer_->zero_grad();
             loss.backward();
-            torch::nn::utils::clip_grad_norm_(network_->parameters(),
-                                              cfg_.max_grad_norm);
+            // Clip gradients for both networks jointly
+            std::vector<torch::Tensor> all_params;
+            for (auto& p : actor_->parameters())  all_params.push_back(p);
+            for (auto& p : critic_->parameters()) all_params.push_back(p);
+            torch::nn::utils::clip_grad_norm_(all_params, cfg_.max_grad_norm);
             optimizer_->step();
 
             // ── stats ───────────────────────────────────────────────
@@ -306,12 +336,14 @@ void PPOTrainer::update() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-void PPOTrainer::save(const std::string& path) {
-    torch::save(network_, path);
+void PPOTrainer::save(const std::string& path_prefix) {
+    torch::save(actor_,  path_prefix + "_actor.pt");
+    torch::save(critic_, path_prefix + "_critic.pt");
 }
 
-void PPOTrainer::load(const std::string& path) {
-    torch::load(network_, path);
+void PPOTrainer::load(const std::string& path_prefix) {
+    torch::load(actor_,  path_prefix + "_actor.pt");
+    torch::load(critic_, path_prefix + "_critic.pt");
 }
 
 } // namespace poker_ppo

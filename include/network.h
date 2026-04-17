@@ -6,46 +6,36 @@
 namespace poker_ppo {
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ActorCritic  — shared-trunk actor-critic with legal-action masking
+// Actor  — independent policy network with legal-action masking
 // ─────────────────────────────────────────────────────────────────────────────
 //
 // Architecture:
-//   observation → [shared MLP trunk] → features
-//       features → actor head  → logits [action_count]
-//       features → critic head → value  [1]
+//   observation → [MLP trunk] → features → linear head → logits [action_count]
 //
-// The actor head applies a legal-action mask *before* softmax:
+// The actor applies a legal-action mask before softmax:
 //   masked_logits = logits + (1 - mask) * (-1e8)
 //
-// A single network is used for both players (parameter sharing), consistent
-// with the approach shown effective in the paper for self-play PG methods.
+// A single Actor is used for both players (parameter sharing across seats),
+// consistent with the self-play PG approach shown effective in the paper.
 
-class ActorCriticImpl : public torch::nn::Module {
+class ActorImpl : public torch::nn::Module {
 public:
-    ActorCriticImpl(int obs_dim, int action_count, int hidden_dim, int num_layers);
+    ActorImpl(int obs_dim, int action_count, int hidden_dim, int num_layers);
 
-    /// Forward pass.  Returns {logits, value}.
-    /// logits are *unmasked* — call get_action() or evaluate() for masking.
-    std::pair<torch::Tensor, torch::Tensor> forward(torch::Tensor obs);
+    /// Raw logits (unmasked).  Shape: [B, action_count].
+    torch::Tensor forward(torch::Tensor obs);
 
-    /// Sample an action with masked categorical, return {action, log_prob, value}.
-    /// obs:  [B, obs_dim]
-    /// mask: [B, action_count]
+    /// Sample an action with masked categorical.
     struct ActionResult {
         torch::Tensor action;    // [B]   int64
         torch::Tensor log_prob;  // [B]
-        torch::Tensor value;     // [B]
         torch::Tensor entropy;   // [B]
     };
     ActionResult get_action(torch::Tensor obs, torch::Tensor legal_mask);
 
-    /// Evaluate stored actions (for PPO loss).
-    /// obs:     [B, obs_dim]
-    /// mask:    [B, action_count]
-    /// action:  [B]  int64
+    /// Evaluate previously-taken actions (for PPO loss computation).
     struct EvalResult {
         torch::Tensor log_prob;  // [B]
-        torch::Tensor value;     // [B]
         torch::Tensor entropy;   // [B]
     };
     EvalResult evaluate(torch::Tensor obs, torch::Tensor legal_mask,
@@ -55,10 +45,34 @@ private:
     torch::Tensor apply_mask(torch::Tensor logits, torch::Tensor mask);
 
     torch::nn::Sequential trunk_{nullptr};
-    torch::nn::Linear actor_head_{nullptr};
-    torch::nn::Linear critic_head_{nullptr};
+    torch::nn::Linear      head_{nullptr};
 };
 
-TORCH_MODULE(ActorCritic);
+TORCH_MODULE(Actor);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Critic  — independent value network
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Architecture:
+//   observation → [MLP trunk] → features → linear head → value [1]
+//
+// Completely separate parameters from the Actor.  This eliminates gradient
+// interference between the policy and value objectives — the value loss
+// cannot corrupt the policy's learned features, and vice versa.
+
+class CriticImpl : public torch::nn::Module {
+public:
+    CriticImpl(int obs_dim, int hidden_dim, int num_layers);
+
+    /// Scalar value estimate.  Shape: [B].
+    torch::Tensor forward(torch::Tensor obs);
+
+private:
+    torch::nn::Sequential trunk_{nullptr};
+    torch::nn::Linear      head_{nullptr};
+};
+
+TORCH_MODULE(Critic);
 
 } // namespace poker_ppo

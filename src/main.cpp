@@ -147,8 +147,9 @@ int main() {
     trainer.train();
 
     // ── save ─────────────────────────────────────────────────────────────
-    trainer.save("poker_ppo_model.pt");
-    std::cout << "\nModel saved to poker_ppo_model.pt\n";
+    trainer.save("poker_ppo_model");
+    std::cout << "\nModel saved to poker_ppo_model_actor.pt"
+              << " and poker_ppo_model_critic.pt\n";
 
     return 0;
 }
