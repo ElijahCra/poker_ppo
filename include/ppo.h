@@ -20,14 +20,9 @@ namespace poker_ppo {
 //   2. Create a PPOTrainer with your factory, BetConfig, and PPOConfig.
 //   3. Call train().  Optionally register a callback for logging.
 //
-// The trainer runs self-play: a single Actor and a single Critic play both
-// seats.  The Actor and Critic have fully independent parameters (no shared
-// trunk), eliminating gradient interference between the policy and value
-// objectives.
-//
+// The trainer runs self-play: the same ActorCritic network plays both seats.
 // Rewards stored in the buffer are always from the perspective of the acting
-// player (flipped sign when seat == 1).  GAE correctly handles the sign
-// inversion at player-switch boundaries (zero-sum).
+// player (flipped sign when seat == 1).
 
 class PPOTrainer {
 public:
@@ -57,13 +52,12 @@ public:
     /// Register a callback invoked after each PPO update.
     void set_log_callback(LogCallback cb) { log_cb_ = std::move(cb); }
 
-    /// Access the trained networks (e.g. for evaluation / saving).
-    Actor&  actor()  { return actor_; }
-    Critic& critic() { return critic_; }
+    /// Access the trained network (e.g. for evaluation / saving).
+    ActorCritic& network() { return network_; }
 
     /// Save / load model weights.
-    void save(const std::string& path_prefix);
-    void load(const std::string& path_prefix);
+    void save(const std::string& path);
+    void load(const std::string& path);
 
 private:
     void collect_rollout();
@@ -73,16 +67,15 @@ private:
     BetConfig    bet_cfg_;
     torch::Device device_;
 
-    Actor   actor_;
-    Critic  critic_;
+    ActorCritic  network_;
     std::unique_ptr<torch::optim::Adam> optimizer_;
     std::unique_ptr<VectorizedEnv>      vec_env_;
     std::unique_ptr<RolloutBuffer>      buffer_;
 
     // State carried between rollouts
-    torch::Tensor next_obs_;             // [num_envs, obs_dim]
-    torch::Tensor next_done_;            // [num_envs]
-    torch::Tensor next_legal_mask_;      // [num_envs, action_count]
+    torch::Tensor next_obs_;           // [num_envs, obs_dim]
+    torch::Tensor next_done_;          // [num_envs]
+    torch::Tensor next_legal_mask_;    // [num_envs, action_count]
     torch::Tensor next_current_player_;  // [num_envs]  int32
 
     int global_step_ = 0;
