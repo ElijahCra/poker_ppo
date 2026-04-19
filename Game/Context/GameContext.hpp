@@ -24,8 +24,10 @@ namespace Game {
 class GameContext {
 public:
 
-GameContext()
-{
+explicit GameContext(const GameConfig& cfg) : m_cfg(&cfg) {
+    cfg.validate();
+    players.reset(cfg);
+    betting.maxRaises = cfg.max_raises_per_round;
     addBlinds();
 }
 
@@ -39,11 +41,11 @@ GameContext()
 struct BettingData {
     uint32_t pot = 0;
     int raiseNum = 0;
-    std::vector<uint32_t> sequence;  // Action amounts in mbb
-    static constexpr int maxRaises = MAX_RAISES;
+    int maxRaises = 4;                // populated from GameConfig
+    std::vector<uint32_t> sequence;   // action amounts in mbb
 
     BettingData() noexcept {
-        sequence.reserve(16);  // Reserve space for typical sequence length
+        sequence.reserve(16);
     }
 
     [[nodiscard]] bool canRaise() const noexcept {
@@ -54,17 +56,21 @@ struct BettingData {
         pot = 0;
         raiseNum = 0;
         sequence.clear();
+        // maxRaises preserved across hands; set by GameContext from config.
     }
 };
 
 // Utility functions
 void reset(std::mt19937& rng) {
-    players.reset();
+    players.reset(*m_cfg);
     betting.reset();
+    betting.maxRaises = m_cfg->max_raises_per_round;
     round.reset();
-    cards.initialize(rng);
+    cards.initialize(rng, *m_cfg);
     addBlinds();
 }
+
+[[nodiscard]] const GameConfig& config() const noexcept { return *m_cfg; }
 
 // String infoset format
 static std::string actionToString(const Action& action) {
@@ -91,14 +97,13 @@ static std::string actionToString(const Action& action) {
 }
 void addBlinds()
 {
-    static constexpr uint32_t SMALL_BLIND = 500; //.5 bb
-    static constexpr uint32_t BIG_BLIND = 1000; // 1 bb
-    assert(players.stacks[0] >= BIG_BLIND);
-    assert(players.stacks[1] >= SMALL_BLIND);
-    betting.pot += 1500;
-    players.stacks[1] -= 500;
-    players.stacks[0] -= 1000;
-
+    const uint32_t sb = m_cfg->small_blind;
+    const uint32_t bb = m_cfg->big_blind;
+    assert(players.stacks[0] >= bb);
+    assert(players.stacks[1] >= sb);
+    betting.pot += sb + bb;
+    players.stacks[1] -= sb;
+    players.stacks[0] -= bb;
 }
 
 void setRoundStartingPlayer() noexcept
@@ -167,7 +172,7 @@ uint64_t getCardHash(const int player, int currentRound) const noexcept
     return cards.rawCards[4 + idx];
 }
 
-void initializeCards(std::mt19937& rng) { cards.initialize(rng); }
+void initializeCards(std::mt19937& rng) { cards.initialize(rng, *m_cfg); }
 
 void setCardHashFromDeck(int player, int currentRound) noexcept {
     players.setCardHash(player, currentRound,
@@ -184,6 +189,9 @@ PlayerData players;
 BettingData betting;
 RoundData round;
 CardData cards;
+
+private:
+const GameConfig* m_cfg;   // non-owning; lifetime managed by Game
 };
 
 }  // namespace Game

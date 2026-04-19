@@ -16,9 +16,6 @@ constexpr int CARD_SLOTS = 52;
 constexpr int FEAT_EXTRA = 10;  // my_stack + opp_stack + pot + cur_bet + raises + 4 round OH + seat
 constexpr int TOTAL_OBS  = CARD_SLOTS * 2 + FEAT_EXTRA;
 
-constexpr float INITIAL_STACK_F = static_cast<float>(::Game::INITIAL_STACK);
-constexpr float POT_SCALE       = 2.0f * INITIAL_STACK_F;
-
 } // namespace
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -37,19 +34,25 @@ QFRPokerEnvironment::QFRPokerEnvironment(const QFRConfig& qfr_cfg,
             "(2 + num_raise_slots)");
     }
     obs_dim_ = TOTAL_OBS;
-    allin_slot_ = qfr_cfg_.include_all_in_slot
-        ? 2 + static_cast<int>(qfr_cfg_.pot_fractions.size())
+
+    const auto& gcfg = qfr_cfg_.game;
+    allin_slot_ = gcfg.include_all_in_slot
+        ? 2 + static_cast<int>(gcfg.pot_fractions.size())
         : -1;
+
+    stack_norm_ = static_cast<float>(gcfg.initial_stack);
+    pot_norm_   = 2.0f * stack_norm_;
+    max_raises_norm_ = std::max<int>(1, gcfg.max_raises_per_round);
 
     game_betting_cfg_.config.strategy =
         ::Game::BettingConfig::BetSizeStrategy::FIXED_FRACTIONS;
-    game_betting_cfg_.config.potFractions      = qfr_cfg_.pot_fractions;
-    game_betting_cfg_.config.minBet            = qfr_cfg_.min_bet;
-    game_betting_cfg_.config.minRaise          = qfr_cfg_.min_raise;
-    game_betting_cfg_.config.maxRaisesPerRound = qfr_cfg_.max_raises_per_round;
-    game_betting_cfg_.config.allowAllIn        = qfr_cfg_.include_all_in_slot;
+    game_betting_cfg_.config.potFractions      = gcfg.pot_fractions;
+    game_betting_cfg_.config.minBet            = gcfg.min_bet;
+    game_betting_cfg_.config.minRaise          = gcfg.min_raise;
+    game_betting_cfg_.config.maxRaisesPerRound = gcfg.max_raises_per_round;
+    game_betting_cfg_.config.allowAllIn        = gcfg.include_all_in_slot;
 
-    game_ = std::make_unique<::Game::DiscreteGame>(rng_, game_betting_cfg_);
+    game_ = std::make_unique<::Game::DiscreteGame>(rng_, gcfg, game_betting_cfg_);
 
     action_table_.assign(A_, std::nullopt);
 }
@@ -94,7 +97,7 @@ StepResult QFRPokerEnvironment::step(int action_idx) {
 
     if (game_->isTerminal()) {
         // Reward for seat 0.  getUtility returns chips in mbb; normalise.
-        const float r = static_cast<float>(game_->getUtility(0)) / INITIAL_STACK_F;
+        const float r = static_cast<float>(game_->getUtility(0)) / stack_norm_;
         // obs/mask are unused after a terminal flag (PPO layer calls reset()).
         auto obs  = torch::zeros({obs_dim_});
         auto mask = torch::zeros({A_});
@@ -122,6 +125,7 @@ void QFRPokerEnvironment::rebuild_action_table() {
     const uint32_t pot = ctx.getPot();
     const uint32_t cb  = game_->getCurrentBet();
 
+    const auto& pot_fractions = qfr_cfg_.game.pot_fractions;
     const auto& available = game_->getActions();
     for (const auto& act : available) {
         std::visit([&]<typename T>(const T& a) {
@@ -134,9 +138,9 @@ void QFRPokerEnvironment::rebuild_action_table() {
             } else if constexpr (std::is_same_v<U, ::Game::Raise>) {
                 const uint32_t amt = a.amount;
                 bool matched = false;
-                for (size_t j = 0; j < qfr_cfg_.pot_fractions.size(); ++j) {
+                for (size_t j = 0; j < pot_fractions.size(); ++j) {
                     const uint32_t expected = cb + static_cast<uint32_t>(
-                        qfr_cfg_.pot_fractions[j] * pot);
+                        pot_fractions[j] * pot);
                     if (expected == amt) {
                         action_table_[2 + j] = act;
                         matched = true;
@@ -182,12 +186,12 @@ torch::Tensor QFRPokerEnvironment::compute_observation() const {
     }
 
     int off = 2 * CARD_SLOTS;
-    a[off++] = static_cast<float>(ctx.getStack(me))  / INITIAL_STACK_F;
-    a[off++] = static_cast<float>(ctx.getStack(opp)) / INITIAL_STACK_F;
-    a[off++] = static_cast<float>(ctx.getPot())      / POT_SCALE;
-    a[off++] = static_cast<float>(game_->getCurrentBet()) / INITIAL_STACK_F;
+    a[off++] = static_cast<float>(ctx.getStack(me))  / stack_norm_;
+    a[off++] = static_cast<float>(ctx.getStack(opp)) / stack_norm_;
+    a[off++] = static_cast<float>(ctx.getPot())      / pot_norm_;
+    a[off++] = static_cast<float>(game_->getCurrentBet()) / stack_norm_;
     a[off++] = static_cast<float>(ctx.getRaiseNum())
-             / static_cast<float>(::Game::MAX_RAISES);
+             / static_cast<float>(max_raises_norm_);
 
     const int round = ctx.getRoundNumber();
     for (int r = 0; r < 4; ++r) a[off++] = (r == round) ? 1.0f : 0.0f;

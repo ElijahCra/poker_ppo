@@ -11,6 +11,7 @@
 #include "BettingConfig.hpp"
 #include "Transitioner.hpp"
 #include "GameBase.hpp"
+#include "GameConfig.hpp"
 #include "GameState.hpp"
 #include "Context/GameContext.hpp"
 #include "ActionPolicy.hpp"
@@ -26,8 +27,12 @@ using ActionSet = typename ActionPolicy::ActionSet;
 
 static constexpr int PlayerNum = 2;
 
-explicit Game(std::mt19937& engine, BettingConfig config = {})
-    : m_rng(engine), m_betting_config(std::move(config)) {
+// Config is copied into the Game so GameContext can hold a stable pointer.
+explicit Game(std::mt19937& engine, GameConfig game_cfg = {}, BettingConfig betting_cfg = {})
+    : m_rng(engine),
+      m_game_config(std::move(game_cfg)),
+      m_betting_config(std::move(betting_cfg)),
+      m_context(m_game_config) {
     m_current_state = ChanceState{};
     m_available_actions = ActionPolicy::makeChanceActionSet();
     m_context.initializeCards(m_rng);
@@ -92,7 +97,8 @@ void reInitialize() {
 
 [[nodiscard]] int32_t getUtility(int player) const {
     if (const auto* terminal = std::get_if<TerminalState>(&m_current_state)) {
-        const auto contribution = static_cast<int32_t>(INITIAL_STACK - m_context.getStack(player));
+        const auto contribution = static_cast<int32_t>(
+            m_game_config.initial_stack - m_context.getStack(player));
         if (terminal->winner == player) {
             return static_cast<int32_t>(m_context.getPot()) - contribution;
         }
@@ -168,12 +174,15 @@ static BettingConfig makeNoLimitConfig(std::vector<double> preferredSizes = {0.5
     return config;
 }
 
+[[nodiscard]] const GameConfig& getGameConfig() const noexcept { return m_game_config; }
+
 private:
 std::mt19937& m_rng;
+GameConfig m_game_config;          // owned copy; referenced by m_context
+BettingConfig m_betting_config;
+GameContext m_context;             // must be declared after m_game_config
 GameState m_current_state;
 ActionSet m_available_actions;
-GameContext m_context;
-BettingConfig m_betting_config;
 
 [[nodiscard]] bool isValidAction(const Action& action) const noexcept {
     return ActionPolicy::isValidAction(action, m_available_actions);

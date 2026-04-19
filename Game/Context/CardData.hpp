@@ -16,15 +16,17 @@ struct CardData {
     // Layout: [0..1] p0 hole, [2..3] p1 hole, [4..6] flop, [7] turn, [8] river
     std::array<uint8_t, 9> rawCards{};
 
-    void initialize(std::mt19937& rng) {
+    void initialize(std::mt19937& rng, const GameConfig& cfg) {
         if (!init) {
+            // Static indexer is initialized once with the fixed {2,3,1,1}
+            // round structure. GameConfig::validate() ensures cfg matches.
             constexpr uint8_t cardsperround[]{2, 3, 1, 1};
             hand_indexer_init(4, cardsperround, &flopIndexer);
             init = true;
         }
-        // Create and shuffle deck
-        std::array<uint8_t, DECK_SIZE> deck{};
-        std::iota(deck.begin(), deck.end(), 0);
+        // Shuffle only the cards still in play; dealt IDs stay in [0..51]
+        // so the hand_indexer and TwoPlusTwo evaluator work unchanged.
+        std::vector<uint8_t> deck = cfg.dealable_cards();
         std::ranges::shuffle(deck, rng);
 
         for (int i = 0; i < 9; ++i) rawCards[i] = deck[i];

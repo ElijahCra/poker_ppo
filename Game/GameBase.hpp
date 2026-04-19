@@ -8,16 +8,18 @@
 #include <string>
 #include <variant>
 
+#include "GameConfig.hpp"
+
 namespace Game {
 
-// Game constants
-static constexpr int NUM_PLAYERS = 2;
-static constexpr int NUM_ROUNDS = 4;
-static constexpr int DECK_SIZE = 52;
-static constexpr int NUM_HOLE_CARDS = 2;
+// Structural constants — fixed at build time because arrays, blind layout,
+// and the static hand_indexer assume them. Runtime variation lives in
+// GameConfig (initial_stack, blinds, max_raises, excluded_cards, …).
+static constexpr int NUM_PLAYERS         = NUM_PLAYERS_FIXED;
+static constexpr int NUM_ROUNDS          = NUM_ROUNDS_FIXED;
+static constexpr int DECK_SIZE           = CARD_NAMESPACE_SIZE;  // card-ID space (always 52)
+static constexpr int NUM_HOLE_CARDS      = NUM_HOLE_CARDS_FIXED;
 static constexpr int NUM_COMMUNITY_CARDS = 5;
-static constexpr int MAX_RAISES = 4;
-static constexpr uint32_t INITIAL_STACK = 100'000; // 100bb = 100,000 mbb
 
 // Action types as structs
 struct Fold {

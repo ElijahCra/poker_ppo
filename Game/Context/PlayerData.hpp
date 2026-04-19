@@ -10,7 +10,7 @@ namespace Game {
 // Player data
 struct PlayerData {
     int currentPlayer = 0;  // Current player index
-    std::array<uint32_t, NUM_PLAYERS> stacks = {INITIAL_STACK, INITIAL_STACK};
+    std::array<uint32_t, NUM_PLAYERS> stacks{};   // populated by reset(cfg)
     std::array<InfoSetData, NUM_PLAYERS> infoSets{};  // Structured info sets for each player
 
 
@@ -49,9 +49,9 @@ struct PlayerData {
         return infoSets[player];
     }
 
-    void reset() noexcept {
+    void reset(const GameConfig& cfg) noexcept {
         currentPlayer = 0;
-        stacks.fill(INITIAL_STACK);
+        stacks.fill(cfg.initial_stack);
         for (auto& infoSet : infoSets) {
             infoSet.reset();
         }

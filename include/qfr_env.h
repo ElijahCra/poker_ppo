@@ -2,6 +2,7 @@
 
 #include "environment.h"
 #include "Game.hpp"
+#include "GameConfig.hpp"
 
 #include <atomic>
 #include <memory>
@@ -32,26 +33,17 @@ namespace poker_ppo {
 // millibigblinds as stored by QFR), normalised by INITIAL_STACK so it sits in
 // a reasonable range for the critic.  PPO handles the sign-flip for seat 1.
 
+// Wraps a Game::GameConfig (the poker variant) plus PPO-side knobs.
+// All poker-rule tuning lives in `game`; only per-run seeding and adapter
+// flags belong on QFRConfig itself.
 struct QFRConfig {
-    // Pot fractions used to build the fixed raise slots.  Each fraction `f`
-    // yields a raise to  currentBet + f * pot  (clamped/filtered by the QFR
-    // BettingConfig in the usual way).
-    std::vector<double> pot_fractions = {0.5, 0.75, 1.0, 1.5};
+    ::Game::GameConfig game{};    // deck, stacks, blinds, betting structure
 
-    // When true, adds a dedicated "all-in" slot at index 2 + pot_fractions.size().
-    bool include_all_in_slot = true;
-
-    uint32_t min_bet              = 1000;   // mbb
-    uint32_t min_raise            = 1000;   // mbb (over current bet)
-    int      max_raises_per_round = 4;
-
-    // Seed used as a base — each created env gets seed + instance_index.
+    // Seed used as a base — each created env gets seed ^ instance hash.
     uint64_t seed = 0x9E3779B97F4A7C15ull;
 
-    [[nodiscard]] int num_raise_slots() const {
-        return static_cast<int>(pot_fractions.size()) + (include_all_in_slot ? 1 : 0);
-    }
-    [[nodiscard]] int action_count() const { return 2 + num_raise_slots(); }
+    [[nodiscard]] int num_raise_slots() const { return game.num_raise_slots(); }
+    [[nodiscard]] int action_count()    const { return game.action_count(); }
 };
 
 class QFRPokerEnvironment : public IPokerEnvironment {
@@ -85,7 +77,10 @@ private:
 
     int obs_dim_ = 0;
     int A_       = 0;
-    int allin_slot_ = -1;  // -1 if disabled
+    int allin_slot_ = -1;        // -1 if disabled
+    float stack_norm_ = 1.0f;    // = game.initial_stack; observation scaling
+    float pot_norm_   = 1.0f;    // = 2 * initial_stack
+    int   max_raises_norm_ = 4;  // = game.max_raises_per_round (>=1 guarded)
 
     // PPO-action-index → QFR Action, or nullopt if illegal this state.
     std::vector<std::optional<::Game::Action>> action_table_;
