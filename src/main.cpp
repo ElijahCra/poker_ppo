@@ -71,6 +71,14 @@ void printGame(const ::Game::GameConfig& g) {
 
 int main(int argc, char** argv) {
     std::cout.setf(std::ios::unitbuf);  // flush stdout as it arrives (for PTY/log capture)
+
+    // Tiny MLP (3×256) at batch ≈ 32 does not benefit from Torch's intra-op
+    // pool — the sync overhead is net-negative, and it steals cores from
+    // the rollout worker threads. Force single-threaded so workers and the
+    // inference processor each get a dedicated core.
+    at::set_num_threads(1);
+    at::set_num_interop_threads(1);
+
     const std::string variant = (argc > 1) ? argv[1] : "nlhe_full_52";
 
     // ── Game variant: deck, stacks, blinds, betting structure ──────────

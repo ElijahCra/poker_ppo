@@ -1,4 +1,5 @@
 #include "ppo.h"
+#include "rollout_coro.h"
 #include <iostream>
 #include <algorithm>
 #include <numeric>
@@ -101,17 +102,26 @@ PPOTrainer::PPOTrainer(IPokerEnvironmentFactory& env_factory,
 
 // ─────────────────────────────────────────────────────────────────────────────
 void PPOTrainer::train() {
-    // Initial reset
-    next_obs_  = vec_env_->reset_all().to(device_);
-    next_done_ = torch::zeros({cfg_.num_envs}, device_);
-
-    // Build initial legal masks and player tracking
+    // Initial reset — carry state lives on CPU; the coroutine scheduler
+    // batches it to device once per inference call.
+    int D = vec_env_->obs_dim();
     int A = vec_env_->action_count();
-    next_legal_mask_ = torch::zeros({cfg_.num_envs, A}, device_);
-    next_current_player_ = torch::zeros({cfg_.num_envs},torch::TensorOptions().dtype(torch::kInt32).device(device_));
+    auto f_cpu   = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
+    auto i32_cpu = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU);
+
+    carry_obs_            = torch::zeros({cfg_.num_envs, D}, f_cpu);
+    carry_legal_mask_     = torch::zeros({cfg_.num_envs, A}, f_cpu);
+    carry_current_player_ = torch::zeros({cfg_.num_envs}, i32_cpu);
+    carry_done_           = torch::zeros({cfg_.num_envs}, f_cpu);
+
+    // reset_all() already resets every env; re-read each env's initial
+    // obs/mask/player into carry state.
+    vec_env_->reset_all();
     for (int i = 0; i < cfg_.num_envs; ++i) {
-        next_legal_mask_[i] = vec_env_->env(i).legal_action_mask().to(device_);
-        next_current_player_[i] = vec_env_->env(i).current_player();
+        carry_obs_[i]        = vec_env_->env(i).observation();
+        carry_legal_mask_[i] = vec_env_->env(i).legal_action_mask();
+        carry_current_player_.accessor<int32_t, 1>()[i] =
+            static_cast<int32_t>(vec_env_->env(i).current_player());
     }
 
     int total_updates = cfg_.num_updates();
@@ -149,58 +159,80 @@ void PPOTrainer::collect_rollout() {
 
     using clock = std::chrono::steady_clock;
     using ms    = std::chrono::duration<double, std::milli>;
-    double t_infer = 0, t_env = 0, t_transfer = 0;
 
-    for (int step = 0; step < cfg_.num_steps; ++step) {
-        auto s0 = clock::now();
-        auto ar = network_->get_action(next_obs_, next_legal_mask_);
+    // Reach back into VectorizedEnv for the raw env vector. We need per-env
+    // access so the coroutines can step individually.
+    std::vector<std::unique_ptr<IPokerEnvironment>> dummy_envs_unused;  // for signature
+    // (RolloutScheduler keeps a reference, so we need a stable vector. We'll
+    // vend one from VectorizedEnv via a small helper.)
 
-        // Convert actions to CPU ints (forces GPU sync)
-        auto actions_cpu = ar.action.to(torch::kCPU);
-        std::vector<int> actions(cfg_.num_envs);
-        for (int i = 0; i < cfg_.num_envs; ++i)
-            actions[i] = actions_cpu[i].item<int64_t>();
-        auto s1 = clock::now();
+    // Acquire the owning vector of envs from VectorizedEnv.
+    auto& envs = vec_env_->envs_mut();
 
-        // Step environments
-        auto [obs, rewards, dones, masks, players] = vec_env_->step(actions);
-        auto s2 = clock::now();
+    // Batch-inference tuning. min_batch ≤ num_envs so the processor fires
+    // even when not every coroutine has submitted yet; max_wait caps latency
+    // for the tail end of a step.
+    // Half-wave pipelining: firing on N/2 lets fast-stepping envs resubmit
+    // their next request while the processor is still running the forward
+    // on the slower half, overlapping env work with inference. Firing on N
+    // creates a full-wave barrier with zero overlap — worse despite fewer
+    // dispatches. If forward_ns > worker_busy_ns (we're forward-bound),
+    // consider dropping further (N/4) to pipeline more aggressively.
+    const std::size_t min_batch =
+        std::max<std::size_t>(1, static_cast<std::size_t>(cfg_.num_envs) / 4);
+    const auto max_wait = std::chrono::microseconds(500);
 
-        // Advance state (env output is CPU; move once here)
-        next_obs_            = obs.to(device_);
-        next_done_           = dones.to(device_);
-        next_legal_mask_     = masks.to(device_);
-        next_current_player_ = players.to(device_);
+    // Worker pool: each owns a shard of envs and resumes their coroutines
+    // in parallel. Overprovisioning past ~num_envs buys nothing (at most
+    // one coro per env can be ready at a time on a given shard). Defaults
+    // to 4 — tune based on core count and env-step cost.
+    const int num_workers = std::min(
+        cfg_.num_envs,
+        std::max(1, static_cast<int>(std::thread::hardware_concurrency()) / 2));
 
-        // Store in buffer (all tensors already on device)
-        buffer_->insert(step,
-                        next_obs_,
-                        ar.action,
-                        ar.log_prob,
-                        rewards.to(device_),
-                        next_done_,
-                        ar.value,
-                        next_legal_mask_,
-                        next_current_player_);
-        auto s3 = clock::now();
+    auto t0 = clock::now();
 
-        t_infer    += ms(s1 - s0).count();
-        t_env      += ms(s2 - s1).count();
-        t_transfer += ms(s3 - s2).count();
+    RolloutScheduler scheduler(
+        network_, device_,
+        envs,
+        *buffer_,
+        cfg_.num_steps,
+        vec_env_->obs_dim(),
+        vec_env_->action_count(),
+        carry_obs_, carry_legal_mask_, carry_current_player_, carry_done_,
+        min_batch, max_wait,
+        num_workers);
 
-        global_step_ += cfg_.num_envs;
-    }
+    scheduler.run();
 
-    // Bootstrap value
-    auto [_, next_value] = network_->forward(next_obs_);
-    buffer_->compute_returns(next_value, next_done_, next_current_player_,
+    auto t1 = clock::now();
+
+    scheduler.flush_to_buffer();
+
+    // GAE bootstrap tensors live on CPU in the scheduler; move once to device.
+    auto next_value  = scheduler.bootstrap_value().to(device_);
+    auto next_done   = scheduler.bootstrap_done().to(device_);
+    auto next_player = scheduler.bootstrap_player().to(device_);
+
+    buffer_->compute_returns(next_value, next_done, next_player,
                              cfg_.gamma, cfg_.gae_lambda);
 
+    auto t2 = clock::now();
+
+    global_step_ += cfg_.num_envs * cfg_.num_steps;
+
     if (update_idx_ % 10 == 0) {
+        const double fwd_ms  = scheduler.forward_ns() / 1e6;
+        const int    W       = scheduler.num_workers();
+        const double wait_ms = (W > 0)
+            ? (scheduler.worker_wait_ns() / 1e6) / static_cast<double>(W)
+            : 0.0;
         std::cout << "  rollout breakdown:"
-                  << " infer=" << t_infer << "ms"
-                  << " env=" << t_env << "ms"
-                  << " transfer=" << t_transfer << "ms\n";
+                  << " coro_run=" << ms(t1 - t0).count() << "ms"
+                  << " flush+gae=" << ms(t2 - t1).count() << "ms"
+                  << "  forward=" << fwd_ms << "ms"
+                  << "  worker_wait_avg=" << wait_ms << "ms"
+                  << " (W=" << W << ")\n";
     }
 }
 

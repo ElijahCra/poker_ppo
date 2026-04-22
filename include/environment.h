@@ -125,6 +125,10 @@ public:
     /// Access individual envs (e.g. for current_player queries).
     IPokerEnvironment& env(int i) { return *envs_[i]; }
 
+    /// Raw access to the owning vector of envs (for the coroutine rollout
+    /// scheduler, which needs to drive each env independently).
+    std::vector<std::unique_ptr<IPokerEnvironment>>& envs_mut() { return envs_; }
+
 private:
     std::vector<std::unique_ptr<IPokerEnvironment>> envs_;
 
