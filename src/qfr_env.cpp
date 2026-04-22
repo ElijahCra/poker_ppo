@@ -40,8 +40,13 @@ QFRPokerEnvironment::QFRPokerEnvironment(const QFRConfig& qfr_cfg,
         ? 2 + static_cast<int>(gcfg.pot_fractions.size())
         : -1;
 
-    stack_norm_ = static_cast<float>(gcfg.initial_stack);
-    pot_norm_   = 2.0f * stack_norm_;
+    // Obs features stay scaled by stack so they sit in roughly [0, 1].
+    stack_norm_  = static_cast<float>(gcfg.initial_stack);
+    pot_norm_    = 2.0f * stack_norm_;
+    // Reward is scaled separately so per-hand rewards land in O(0.1) range
+    // (≈ utility_in_mbb / 10·big_blind).  Avoids both vanishing gradients
+    // (stack-normalised) and mode collapse (big_blind-normalised).
+    reward_norm_ = 10.0f * static_cast<float>(gcfg.big_blind);
     max_raises_norm_ = std::max<int>(1, gcfg.max_raises_per_round);
 
     game_betting_cfg_.config.strategy =
@@ -97,7 +102,7 @@ StepResult QFRPokerEnvironment::step(int action_idx) {
 
     if (game_->isTerminal()) {
         // Reward for seat 0.  getUtility returns chips in mbb; normalise.
-        const float r = static_cast<float>(game_->getUtility(0)) / stack_norm_;
+        const float r = static_cast<float>(game_->getUtility(0)) / reward_norm_;
         // obs/mask are unused after a terminal flag (PPO layer calls reset()).
         auto obs  = torch::zeros({obs_dim_});
         auto mask = torch::zeros({A_});

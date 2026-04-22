@@ -13,6 +13,7 @@
 #include "qfr_env.h"
 #include "GameConfig.hpp"
 
+#include <iomanip>
 #include <iostream>
 #include <string>
 #include <string_view>
@@ -90,12 +91,17 @@ int main(int argc, char** argv) {
     ppo_cfg.total_timesteps = 200'000'000;
     ppo_cfg.num_envs        = 32;
     ppo_cfg.num_steps       = 128;
-    ppo_cfg.update_epochs   = 4;
+    ppo_cfg.update_epochs   = 8;         // more critic passes per rollout
     ppo_cfg.num_minibatches = 4;
-    ppo_cfg.learning_rate   = 2.5e-4f;
-    ppo_cfg.ent_coef        = 0.02f;
+    ppo_cfg.learning_rate   = 2.0e-4f;   // entropy bonus prevents collapse on its own
+    ppo_cfg.ent_coef        = 0.05f;
+    ppo_cfg.vf_coef         = 1.0f;      // critic gets a real share of trunk gradient
+    ppo_cfg.clip_coef       = 0.2f;      // standard PPO; gives policy room (was 0.1)
+    ppo_cfg.clip_vloss      = false;     // CRITICAL: with reward scale ≫ clip, clipped vloss
+                                         // becomes constant outside V_old±ε → zero critic gradient
     ppo_cfg.hidden_dim      = 256;
     ppo_cfg.num_layers      = 3;
+    ppo_cfg.anneal_lr       = false;
 
     // ── Trainer ─────────────────────────────────────────────────────────
     QFRPokerEnvironmentFactory factory(qfr_cfg);
@@ -131,8 +137,36 @@ int main(int argc, char** argv) {
     league.add_checkpoint(trainer.network(), 0, 0, "initial");
     league.set_anchor(0, 1200.0f);
 
+    // Second anchor: a *true* uniform-over-legal-actions baseline.  Built by
+    // zeroing the actor head so logits are constant → softmax over the legal
+    // mask is uniform.  Guards against "1200 → 1200 looks healthy because
+    // both checkpoints are equally bad" — any real progress should beat both.
+    {
+        ActorCritic uniform(obs_dim, action_count,
+                            ppo_cfg.hidden_dim, ppo_cfg.num_layers);
+        torch::NoGradGuard ng;
+        for (auto& kv : uniform->named_parameters()) {
+            if (kv.key().find("actor_head") != std::string::npos) {
+                kv.value().zero_();
+            }
+        }
+        const int uniform_idx =
+            league.add_checkpoint(uniform, 0, 0, "uniform");
+        league.set_anchor(uniform_idx, 1200.0f);
+    }
+
     // How often to snapshot a checkpoint and play it against the pool.
     const int snapshot_every = 200;   // updates
+
+    // Action labels for the histogram printout.
+    auto action_label = [&](int a) -> std::string {
+        if (a == 0) return "F";
+        if (a == 1) return "C";
+        const int raise_idx = a - 2;
+        const int n_pot     = static_cast<int>(qfr_cfg.game.pot_fractions.size());
+        if (raise_idx < n_pot) return "R" + std::to_string(raise_idx);
+        return "AI";
+    };
 
     trainer.set_log_callback([&](const PPOTrainer::UpdateStats& s) {
         if (s.update % 10 == 0) {
@@ -151,13 +185,40 @@ int main(int argc, char** argv) {
         // Snapshot and evaluate periodically.
         if (s.update > 0 && s.update % snapshot_every == 0) {
             const std::string label = "u" + std::to_string(s.update);
-            league.add_checkpoint(trainer.network(),
-                                  s.update, s.global_step, label);
+            const int latest_idx = league.add_checkpoint(
+                trainer.network(), s.update, s.global_step, label);
             league.evaluate_latest();
             std::cout << "\n[Elo league standings after update "
                       << s.update << "]\n";
             league.print_standings();
-            std::cout << "\n";
+
+            // Direct head-to-head diagnostics: latest vs each anchor.
+            // avg_reward_a is in scaled units (÷ 10·BB); ×10 → BB/hand.
+            auto vs_initial = league.play_match(latest_idx, 0);
+            auto vs_uniform = league.play_match(latest_idx, 1);
+            std::cout << std::fixed << std::setprecision(3)
+                      << "  vs initial:  win=" << vs_initial.win_rate_a
+                      << "  bb/hand="  << (vs_initial.avg_reward_a * 10.0f)
+                      << "\n"
+                      << "  vs uniform:  win=" << vs_uniform.win_rate_a
+                      << "  bb/hand="  << (vs_uniform.avg_reward_a * 10.0f)
+                      << "\n";
+
+            // Mode-collapse diagnostic: action histogram from the uniform match.
+            int64_t total = 0;
+            for (auto c : vs_uniform.action_counts_a) total += c;
+            std::cout << "  action mix (vs uniform):";
+            if (total > 0) {
+                std::cout << std::setprecision(1);
+                for (size_t a = 0; a < vs_uniform.action_counts_a.size(); ++a) {
+                    const float pct = 100.0f * static_cast<float>(vs_uniform.action_counts_a[a])
+                                      / static_cast<float>(total);
+                    std::cout << "  " << action_label(static_cast<int>(a))
+                              << "=" << pct << "%";
+                }
+            }
+            std::cout.unsetf(std::ios::fixed);
+            std::cout << "\n\n";
         }
     });
 

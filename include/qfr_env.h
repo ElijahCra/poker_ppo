@@ -78,8 +78,9 @@ private:
     int obs_dim_ = 0;
     int A_       = 0;
     int allin_slot_ = -1;        // -1 if disabled
-    float stack_norm_ = 1.0f;    // = game.initial_stack; observation scaling
-    float pot_norm_   = 1.0f;    // = 2 * initial_stack
+    float stack_norm_  = 1.0f;   // = game.initial_stack; observation scaling
+    float pot_norm_    = 1.0f;   // = 2 * initial_stack
+    float reward_norm_ = 1.0f;   // = 10 * big_blind; terminal-reward scaling
     int   max_raises_norm_ = 4;  // = game.max_raises_per_round (>=1 guarded)
 
     // PPO-action-index → QFR Action, or nullopt if illegal this state.

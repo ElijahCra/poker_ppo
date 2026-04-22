@@ -45,9 +45,16 @@ public:
     struct Config {
         float initial_rating      = 1200.0f;
         float k_factor            = 32.0f;  // max rating move per match
-        int   num_hands_per_match = 1000;   // higher = less noisy, slower
+        int   num_hands_per_match = 200000;  // higher = less noisy, slower
         int   num_parallel_envs   = 32;     // batched inference width
         int   max_checkpoints     = 20;     // prune oldest non-anchored
+        // Logistic scale (in *scaled-reward* units) used to map avg_reward_a
+        // to an Elo score in [0,1].  A score of 0.73 corresponds to A winning
+        // by `score_scale` per hand.  Default assumes reward_norm = 10·BB,
+        // so 0.5 scaled units ≈ 5 BB/hand → score 0.73.  WIN RATE IS NOT
+        // USED — for poker, hand-fraction wins ≠ chip-EV (a tight player
+        // can win <50% of hands while crushing on BB/hand).
+        float score_scale         = 0.5f;
     };
 
     struct Checkpoint {
@@ -61,6 +68,10 @@ public:
         float avg_reward_a = 0.0f;  // mean per-hand reward from A's perspective
         float win_rate_a   = 0.0f;  // (wins + 0.5*ties) / num_hands,  in [0,1]
         int   num_hands    = 0;
+        // Action counts for player A only, indexed by action id.
+        // Useful as a mode-collapse diagnostic: a near-degenerate policy
+        // shows >99% mass on a single index.
+        std::vector<int64_t> action_counts_a;
     };
 
     EloLeague(IPokerEnvironmentFactory& factory,
@@ -110,6 +121,8 @@ private:
     ActorCritic clone_network(const ActorCritic& src);
     MatchResult play_match_internal(ActorCritic& a, ActorCritic& b);
     void        update_ratings(int i, int j, float score_i);
+    // Map per-hand chip-EV (in scaled-reward units) to an Elo score in [0,1].
+    float       reward_to_score(float avg_reward_a) const;
 
     IPokerEnvironmentFactory& factory_;
     BetConfig                 bet_cfg_;

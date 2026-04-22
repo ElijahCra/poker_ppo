@@ -129,6 +129,7 @@ EloLeague::play_match_internal(ActorCritic& a, ActorCritic& b) {
     double total_reward_a = 0.0;
     int    wins_a = 0, losses_a = 0, ties_a = 0;
     int    hands_done = 0;
+    std::vector<int64_t> action_counts_a(action_count_, 0);
 
     // Temporary batched tensors reused each step.
     auto batched_obs_buf  = torch::zeros({P, obs_dim_},      device_);
@@ -163,6 +164,12 @@ EloLeague::play_match_internal(ActorCritic& a, ActorCritic& b) {
         run_batch(a, a_idxs);
         run_batch(b, b_idxs);
 
+        // Tally A's chosen actions for the histogram diagnostic.
+        for (int idx : a_idxs) {
+            const int act = actions[idx];
+            if (act >= 0 && act < action_count_) ++action_counts_a[act];
+        }
+
         // Step each env with its selected action.
         for (int i = 0; i < P; ++i) {
             if (hands_done >= target) break;
@@ -194,10 +201,11 @@ EloLeague::play_match_internal(ActorCritic& a, ActorCritic& b) {
     }
 
     MatchResult mr;
-    mr.num_hands    = hands_done;
-    mr.avg_reward_a = static_cast<float>(total_reward_a / hands_done);
-    mr.win_rate_a   = (static_cast<float>(wins_a) + 0.5f * ties_a) /
-                      static_cast<float>(hands_done);
+    mr.num_hands       = hands_done;
+    mr.avg_reward_a    = static_cast<float>(total_reward_a / hands_done);
+    mr.win_rate_a      = (static_cast<float>(wins_a) + 0.5f * ties_a) /
+                         static_cast<float>(hands_done);
+    mr.action_counts_a = std::move(action_counts_a);
     return mr;
 }
 
@@ -212,6 +220,15 @@ EloLeague::MatchResult EloLeague::play_match(int i, int j) {
 // ═════════════════════════════════════════════════════════════════════════════
 // Elo update
 // ═════════════════════════════════════════════════════════════════════════════
+
+float EloLeague::reward_to_score(float avg_reward_a) const {
+    // Logistic squash on chip-EV.  avg_reward_a is in the env's *scaled* reward
+    // units (mbb / reward_norm).  This is what Elo *should* see for poker —
+    // hand-fraction wins ignore the size of pots won/lost, so a tight player
+    // can win <50% of hands while crushing on bb/hand.
+    const float s = cfg_.score_scale > 0.0f ? cfg_.score_scale : 1.0f;
+    return 1.0f / (1.0f + std::exp(-avg_reward_a / s));
+}
 
 void EloLeague::update_ratings(int i, int j, float score_i) {
     const float ra = ckpts_[i].rating;
@@ -238,7 +255,7 @@ void EloLeague::run_tournament() {
     for (int i = 0; i < N; ++i) {
         for (int j = i + 1; j < N; ++j) {
             auto mr = play_match_internal(nets_[i], nets_[j]);
-            update_ratings(i, j, mr.win_rate_a);
+            update_ratings(i, j, reward_to_score(mr.avg_reward_a));
         }
     }
 }
@@ -250,7 +267,7 @@ void EloLeague::evaluate_latest() {
 
     for (int i = 0; i < latest; ++i) {
         auto mr = play_match_internal(nets_[latest], nets_[i]);
-        update_ratings(latest, i, mr.win_rate_a);
+        update_ratings(latest, i, reward_to_score(mr.avg_reward_a));
     }
 }
 
