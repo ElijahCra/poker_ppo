@@ -12,7 +12,8 @@ namespace poker_ppo {
 
 class RolloutBuffer {
 public:
-    RolloutBuffer(int num_steps, int num_envs, int obs_dim, int action_count);
+    RolloutBuffer(int num_steps, int num_envs, int obs_dim, int action_count,
+                  torch::Device device = torch::kCPU);
 
     /// Insert a single time-step across all envs.
     void insert(int step,

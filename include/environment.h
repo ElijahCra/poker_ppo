@@ -1,6 +1,7 @@
 #pragma once
 
 #include "types.h"
+#include <torch/torch.h>
 #include <memory>
 #include <vector>
 
@@ -126,6 +127,13 @@ public:
 
 private:
     std::vector<std::unique_ptr<IPokerEnvironment>> envs_;
+
+    // Pre-allocated CPU output tensors — reused every step to avoid heap allocs
+    torch::Tensor obs_buf_;      // [N, obs_dim]
+    torch::Tensor rewards_buf_;  // [N]
+    torch::Tensor dones_buf_;    // [N]
+    torch::Tensor masks_buf_;    // [N, A]
+    torch::Tensor players_buf_;  // [N]  int32
 };
 
 } // namespace poker_ppo

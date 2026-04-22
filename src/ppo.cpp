@@ -2,6 +2,7 @@
 #include <iostream>
 #include <algorithm>
 #include <numeric>
+#include <chrono>
 
 namespace poker_ppo {
 
@@ -14,6 +15,13 @@ VectorizedEnv::VectorizedEnv(IPokerEnvironmentFactory& factory,
     envs_.reserve(num_envs);
     for (int i = 0; i < num_envs; ++i)
         envs_.push_back(factory.create(cfg));
+
+    int N = num_envs, D = obs_dim(), A = action_count();
+    obs_buf_     = torch::zeros({N, D});
+    rewards_buf_ = torch::zeros({N});
+    dones_buf_   = torch::zeros({N});
+    masks_buf_   = torch::zeros({N, A});
+    players_buf_ = torch::zeros({N}, torch::kInt32);
 }
 
 torch::Tensor VectorizedEnv::reset_all() {
@@ -30,45 +38,33 @@ torch::Tensor VectorizedEnv::reset_all() {
 VectorizedEnv::BatchStepResult
 VectorizedEnv::step(const std::vector<int>& actions) {
     int N = num_envs();
-    int D = obs_dim();
-    int A = action_count();
-
-    auto obs     = torch::zeros({N, D});
-    auto rewards = torch::zeros({N});
-    auto dones   = torch::zeros({N});
-    auto masks   = torch::zeros({N, A});
-    auto players = torch::zeros({N}, torch::kInt32);
+    rewards_buf_.zero_();
+    dones_buf_.zero_();
 
     for (int i = 0; i < N; ++i) {
-        // Track which player is acting *before* the step
         int acting_player = envs_[i]->current_player();
-
         auto result = envs_[i]->step(actions[i]);
 
-        // Reward from player 1's perspective; flip for player 2 so the single
-        // network always sees "my reward" regardless of seat.
         float r = result.reward;
         if (acting_player == 1) r = -r;
 
-        // Auto-reset on done
         if (result.done) {
-            // Store terminal reward, then reset
-            rewards[i] = r;
-            dones[i]   = 1.0f;
-            auto reset_result  = envs_[i]->reset();
-            obs[i]    = reset_result.observation;
-            masks[i]  = reset_result.legal_action_mask;
-            players[i] = envs_[i]->current_player();
+            rewards_buf_[i] = r;
+            dones_buf_[i]   = 1.0f;
+            auto rr = envs_[i]->reset();
+            obs_buf_[i]     = rr.observation;
+            masks_buf_[i]   = rr.legal_action_mask;
+            players_buf_[i] = envs_[i]->current_player();
         } else {
-            obs[i]     = result.observation;
-            rewards[i] = r;
-            dones[i]   = 0.0f;
-            masks[i]   = result.legal_action_mask;
-            players[i] = envs_[i]->current_player();
+            obs_buf_[i]     = result.observation;
+            rewards_buf_[i] = r;
+            masks_buf_[i]   = result.legal_action_mask;
+            players_buf_[i] = envs_[i]->current_player();
         }
     }
 
-    return {obs, rewards, dones, masks, players};
+    return {obs_buf_.clone(), rewards_buf_.clone(),
+            dones_buf_.clone(), masks_buf_.clone(), players_buf_.clone()};
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -98,9 +94,9 @@ PPOTrainer::PPOTrainer(IPokerEnvironmentFactory& env_factory,
         network_->parameters(),
         torch::optim::AdamOptions(cfg_.learning_rate));
 
-    // Rollout buffer
+    // Rollout buffer (lives on device — avoids CPU round-trip each rollout)
     buffer_ = std::make_unique<RolloutBuffer>(
-        cfg_.num_steps, cfg_.num_envs, obs_dim, action_count);
+        cfg_.num_steps, cfg_.num_envs, obs_dim, action_count, device_);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -129,8 +125,20 @@ void PPOTrainer::train() {
                 static_cast<torch::optim::AdamOptions&>(pg.options()).lr(lr);
         }
 
+        using clock = std::chrono::steady_clock;
+        using ms    = std::chrono::duration<double, std::milli>;
+
+        auto t0 = clock::now();
         collect_rollout();
+        auto t1 = clock::now();
         update();
+        auto t2 = clock::now();
+
+        if (update_idx_ % 10 == 0) {
+            std::cout << "[update " << update_idx_ << "]"
+                      << "  rollout=" << ms(t1 - t0).count() << "ms"
+                      << "  update=" << ms(t2 - t1).count() << "ms\n";
+        }
     }
 }
 
@@ -139,43 +147,61 @@ void PPOTrainer::collect_rollout() {
     network_->eval();
     torch::NoGradGuard no_grad;
 
+    using clock = std::chrono::steady_clock;
+    using ms    = std::chrono::duration<double, std::milli>;
+    double t_infer = 0, t_env = 0, t_transfer = 0;
+
     for (int step = 0; step < cfg_.num_steps; ++step) {
+        auto s0 = clock::now();
         auto ar = network_->get_action(next_obs_, next_legal_mask_);
 
-        // Convert actions to CPU ints
+        // Convert actions to CPU ints (forces GPU sync)
         auto actions_cpu = ar.action.to(torch::kCPU);
         std::vector<int> actions(cfg_.num_envs);
         for (int i = 0; i < cfg_.num_envs; ++i)
             actions[i] = actions_cpu[i].item<int64_t>();
+        auto s1 = clock::now();
 
         // Step environments
         auto [obs, rewards, dones, masks, players] = vec_env_->step(actions);
+        auto s2 = clock::now();
 
-        // Store in buffer
-        buffer_->insert(step,
-                        next_obs_.cpu(),
-                        ar.action.cpu(),
-                        ar.log_prob.cpu(),
-                        rewards,
-                        next_done_.cpu(),
-                        ar.value.cpu(),
-                        next_legal_mask_.cpu(),
-                        next_current_player_.cpu());
-
-        // Advance state
-        next_obs_        = obs.to(device_);
-        next_done_       = dones.to(device_);
-        next_legal_mask_ = masks.to(device_);
+        // Advance state (env output is CPU; move once here)
+        next_obs_            = obs.to(device_);
+        next_done_           = dones.to(device_);
+        next_legal_mask_     = masks.to(device_);
         next_current_player_ = players.to(device_);
+
+        // Store in buffer (all tensors already on device)
+        buffer_->insert(step,
+                        next_obs_,
+                        ar.action,
+                        ar.log_prob,
+                        rewards.to(device_),
+                        next_done_,
+                        ar.value,
+                        next_legal_mask_,
+                        next_current_player_);
+        auto s3 = clock::now();
+
+        t_infer    += ms(s1 - s0).count();
+        t_env      += ms(s2 - s1).count();
+        t_transfer += ms(s3 - s2).count();
 
         global_step_ += cfg_.num_envs;
     }
 
     // Bootstrap value
     auto [_, next_value] = network_->forward(next_obs_);
-    buffer_->compute_returns(next_value.cpu(), next_done_.cpu(),
-                             next_current_player_.cpu(),
+    buffer_->compute_returns(next_value, next_done_, next_current_player_,
                              cfg_.gamma, cfg_.gae_lambda);
+
+    if (update_idx_ % 10 == 0) {
+        std::cout << "  rollout breakdown:"
+                  << " infer=" << t_infer << "ms"
+                  << " env=" << t_env << "ms"
+                  << " transfer=" << t_transfer << "ms\n";
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -185,22 +211,26 @@ void PPOTrainer::update() {
     auto batch = buffer_->flatten();
     int B = batch.obs.size(0);
 
-    // Move to device
-    auto b_obs     = batch.obs.to(device_);
-    auto b_actions = batch.actions.to(device_);
-    auto b_logp    = batch.log_probs.to(device_);
-    auto b_adv     = batch.advantages.to(device_);
-    auto b_ret     = batch.returns.to(device_);
-    auto b_val     = batch.values.to(device_);
-    auto b_masks   = batch.legal_masks.to(device_);
+    // Buffer already lives on device — no copy needed
+    auto& b_obs     = batch.obs;
+    auto& b_actions = batch.actions;
+    auto& b_logp    = batch.log_probs;
+    auto  b_adv     = batch.advantages;  // copy: normalisation mutates it
+    auto& b_ret     = batch.returns;
+    auto& b_val     = batch.values;
+    auto& b_masks   = batch.legal_masks;
 
-    float total_policy_loss = 0, total_value_loss = 0, total_entropy = 0;
-    float total_approx_kl = 0, total_clip_frac = 0;
-    int   num_updates = 0;
+    auto stat_opts = torch::TensorOptions().dtype(torch::kFloat32).device(device_);
+    auto total_policy_loss = torch::zeros({}, stat_opts);
+    auto total_value_loss  = torch::zeros({}, stat_opts);
+    auto total_entropy     = torch::zeros({}, stat_opts);
+    auto total_approx_kl   = torch::zeros({}, stat_opts);
+    auto total_clip_frac   = torch::zeros({}, stat_opts);
+    int  num_updates = 0;
 
     for (int epoch = 0; epoch < cfg_.update_epochs; ++epoch) {
         // Shuffle
-        auto indices = torch::randperm(B, torch::kInt64).to(device_);
+        auto indices = torch::randperm(B, torch::TensorOptions().dtype(torch::kInt64).device(device_));
 
         for (int start = 0; start < B; start += cfg_.minibatch_size()) {
             int end = std::min(start + cfg_.minibatch_size(), B);
@@ -260,18 +290,15 @@ void PPOTrainer::update() {
             torch::nn::utils::clip_grad_norm_(network_->parameters(), cfg_.max_grad_norm);
             optimizer_->step();
 
-            // ── stats ───────────────────────────────────────────────
-            total_policy_loss += pg_loss.item<float>();
-            total_value_loss  += v_loss.item<float>();
-            total_entropy     += entropy_loss.item<float>();
-
+            // ── stats (accumulate on device; .item() called once after loop) ──
             {
                 torch::NoGradGuard ng;
-                auto approx_kl = ((ratio - 1.0f) - logratio).mean();
-                total_approx_kl += approx_kl.item<float>();
-                auto clipped = ((ratio - 1.0f).abs() > cfg_.clip_coef)
-                               .to(torch::kFloat32).mean();
-                total_clip_frac += clipped.item<float>();
+                total_policy_loss += pg_loss.detach();
+                total_value_loss  += v_loss.detach();
+                total_entropy     += entropy_loss.detach();
+                total_approx_kl   += ((ratio.detach() - 1.0f) - logratio.detach()).mean();
+                total_clip_frac   += ((ratio.detach() - 1.0f).abs() > cfg_.clip_coef)
+                                     .to(torch::kFloat32).mean();
             }
             ++num_updates;
         }
@@ -297,14 +324,15 @@ void PPOTrainer::update() {
                          cfg_.num_updates();
             lr = cfg_.learning_rate * frac;
         }
+        // Single device→host sync for all stats
         log_cb_(UpdateStats{
             update_idx_,
             global_step_,
-            total_policy_loss / n,
-            total_value_loss  / n,
-            total_entropy     / n,
-            total_approx_kl   / n,
-            total_clip_frac   / n,
+            total_policy_loss.item<float>() / n,
+            total_value_loss.item<float>()  / n,
+            total_entropy.item<float>()     / n,
+            total_approx_kl.item<float>()   / n,
+            total_clip_frac.item<float>()   / n,
             explained_var,
             lr
         });

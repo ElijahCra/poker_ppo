@@ -3,12 +3,14 @@
 namespace poker_ppo {
 
 RolloutBuffer::RolloutBuffer(int num_steps, int num_envs,
-                             int obs_dim, int action_count)
+                             int obs_dim, int action_count,
+                             torch::Device device)
     : num_steps_(num_steps), num_envs_(num_envs),
       obs_dim_(obs_dim), action_count_(action_count)
 {
-    auto opts_f = torch::TensorOptions().dtype(torch::kFloat32);
-    auto opts_i = torch::TensorOptions().dtype(torch::kInt64);
+    auto opts_f = torch::TensorOptions().dtype(torch::kFloat32).device(device);
+    auto opts_i = torch::TensorOptions().dtype(torch::kInt64).device(device);
+    auto opts_i32 = torch::TensorOptions().dtype(torch::kInt32).device(device);
 
     obs_         = torch::zeros({num_steps, num_envs, obs_dim}, opts_f);
     actions_     = torch::zeros({num_steps, num_envs}, opts_i);
@@ -17,8 +19,7 @@ RolloutBuffer::RolloutBuffer(int num_steps, int num_envs,
     dones_       = torch::zeros({num_steps, num_envs}, opts_f);
     values_      = torch::zeros({num_steps, num_envs}, opts_f);
     legal_masks_ = torch::zeros({num_steps, num_envs, action_count}, opts_f);
-    current_players_ = torch::zeros({num_steps, num_envs},
-                                    torch::TensorOptions().dtype(torch::kInt32));
+    current_players_ = torch::zeros({num_steps, num_envs}, opts_i32);
     advantages_  = torch::zeros({num_steps, num_envs}, opts_f);
     returns_     = torch::zeros({num_steps, num_envs}, opts_f);
 }
@@ -49,7 +50,7 @@ void RolloutBuffer::compute_returns(torch::Tensor next_value,
     // ─────────────────────────────────────────────────────────────────────
     // Zero-sum GAE for alternating self-play
     // ─────────────────────────────────────────────────────────────────────
-    auto lastgaelam = torch::zeros({num_envs_});
+    auto lastgaelam = torch::zeros({num_envs_}, advantages_.options());
     for (int t = num_steps_ - 1; t >= 0; --t) {
         torch::Tensor next_nonterminal, next_values, next_p;
         if (t == num_steps_ - 1) {

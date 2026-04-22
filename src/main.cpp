@@ -13,8 +13,10 @@
 #include "qfr_env.h"
 #include "GameConfig.hpp"
 
+#include <future>
 #include <iomanip>
 #include <iostream>
+#include <mutex>
 #include <string>
 #include <string_view>
 
@@ -104,8 +106,14 @@ int main(int argc, char** argv) {
     ppo_cfg.anneal_lr       = false;
 
     // ── Trainer ─────────────────────────────────────────────────────────
+    // CPU beats CUDA for this config (3x256 MLP @ batch=32): kernel-launch
+    // overhead dominates compute on such a small network. Revisit if you
+    // scale the network up (hidden_dim ≥ 512) or num_envs (≥ 128).
+    torch::Device device = torch::kCPU;
+    std::cout << "Using device: CPU\n";
+
     QFRPokerEnvironmentFactory factory(qfr_cfg);
-    PPOTrainer trainer(factory, bet_cfg, ppo_cfg);
+    PPOTrainer trainer(factory, bet_cfg, ppo_cfg, device);
 
     // ── Elo league ──────────────────────────────────────────────────────
     // Query obs_dim and action_count from a throw-away env instance so the
@@ -130,7 +138,8 @@ int main(int argc, char** argv) {
                      action_count,
                      ppo_cfg.hidden_dim,
                      ppo_cfg.num_layers,
-                     elo_cfg);
+                     elo_cfg,
+                     device);
 
     // Anchor the untrained network at 1200 — every later rating reads as
     // "how much stronger than the initial random network".
@@ -168,8 +177,16 @@ int main(int argc, char** argv) {
         return "AI";
     };
 
+    // Elo evaluation runs in a background thread so it never stalls training.
+    // We hold at most one evaluation future at a time; the next snapshot waits
+    // for it only if the previous one hasn't finished yet (which is rare given
+    // snapshot_every=200 updates and evaluations taking a few seconds).
+    std::future<void> elo_future;
+    std::mutex        print_mutex;  // keep training + elo output from interleaving
+
     trainer.set_log_callback([&](const PPOTrainer::UpdateStats& s) {
         if (s.update % 10 == 0) {
+            std::lock_guard<std::mutex> lk(print_mutex);
             std::cout << "update=" << s.update
                       << "  step="   << s.global_step
                       << "  pg="     << s.policy_loss
@@ -184,41 +201,48 @@ int main(int argc, char** argv) {
 
         // Snapshot and evaluate periodically.
         if (s.update > 0 && s.update % snapshot_every == 0) {
+            // Wait for any still-running evaluation before touching the league.
+            if (elo_future.valid()) elo_future.wait();
+
+            // add_checkpoint is a deep copy — safe to do on the training thread.
             const std::string label = "u" + std::to_string(s.update);
             const int latest_idx = league.add_checkpoint(
                 trainer.network(), s.update, s.global_step, label);
-            league.evaluate_latest();
-            std::cout << "\n[Elo league standings after update "
-                      << s.update << "]\n";
-            league.print_standings();
 
-            // Direct head-to-head diagnostics: latest vs each anchor.
-            // avg_reward_a is in scaled units (÷ 10·BB); ×10 → BB/hand.
-            auto vs_initial = league.play_match(latest_idx, 0);
-            auto vs_uniform = league.play_match(latest_idx, 1);
-            std::cout << std::fixed << std::setprecision(3)
-                      << "  vs initial:  win=" << vs_initial.win_rate_a
-                      << "  bb/hand="  << (vs_initial.avg_reward_a * 10.0f)
-                      << "\n"
-                      << "  vs uniform:  win=" << vs_uniform.win_rate_a
-                      << "  bb/hand="  << (vs_uniform.avg_reward_a * 10.0f)
-                      << "\n";
+            // Fire the rest off in the background — training resumes immediately.
+            elo_future = std::async(std::launch::async,
+                [&, latest_idx, update = s.update]() {
+                    league.evaluate_latest();
 
-            // Mode-collapse diagnostic: action histogram from the uniform match.
-            int64_t total = 0;
-            for (auto c : vs_uniform.action_counts_a) total += c;
-            std::cout << "  action mix (vs uniform):";
-            if (total > 0) {
-                std::cout << std::setprecision(1);
-                for (size_t a = 0; a < vs_uniform.action_counts_a.size(); ++a) {
-                    const float pct = 100.0f * static_cast<float>(vs_uniform.action_counts_a[a])
-                                      / static_cast<float>(total);
-                    std::cout << "  " << action_label(static_cast<int>(a))
-                              << "=" << pct << "%";
-                }
-            }
-            std::cout.unsetf(std::ios::fixed);
-            std::cout << "\n\n";
+                    auto vs_initial = league.play_match(latest_idx, 0);
+                    auto vs_uniform = league.play_match(latest_idx, 1);
+
+                    // Mode-collapse diagnostic: action histogram from uniform match.
+                    int64_t total = 0;
+                    for (auto c : vs_uniform.action_counts_a) total += c;
+
+                    std::lock_guard<std::mutex> lk(print_mutex);
+                    std::cout << "\n[Elo standings after update " << update << "]\n";
+                    league.print_standings();
+                    std::cout << std::fixed << std::setprecision(3)
+                              << "  vs initial:  win=" << vs_initial.win_rate_a
+                              << "  bb/hand=" << (vs_initial.avg_reward_a * 10.0f) << "\n"
+                              << "  vs uniform:  win=" << vs_uniform.win_rate_a
+                              << "  bb/hand=" << (vs_uniform.avg_reward_a * 10.0f) << "\n";
+                    std::cout << "  action mix (vs uniform):";
+                    if (total > 0) {
+                        std::cout << std::setprecision(1);
+                        for (size_t a = 0; a < vs_uniform.action_counts_a.size(); ++a) {
+                            const float pct = 100.0f
+                                * static_cast<float>(vs_uniform.action_counts_a[a])
+                                / static_cast<float>(total);
+                            std::cout << "  " << action_label(static_cast<int>(a))
+                                      << "=" << pct << "%";
+                        }
+                    }
+                    std::cout.unsetf(std::ios::fixed);
+                    std::cout << "\n\n";
+                });
         }
     });
 
@@ -226,6 +250,9 @@ int main(int argc, char** argv) {
               << ppo_cfg.total_timesteps << " steps...\n\n";
 
     trainer.train();
+
+    // Drain any background Elo evaluation before the final tournament.
+    if (elo_future.valid()) elo_future.wait();
 
     // Final full round-robin for a sharper read-out at the end.
     std::cout << "\nRunning final round-robin tournament...\n";
