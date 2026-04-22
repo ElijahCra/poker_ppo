@@ -1,4 +1,5 @@
-//  main.cpp — PPO self-play training on the QFR heads-up NLHE engine.
+//  main.cpp — PPO self-play training on the QFR heads-up NLHE engine,
+//  with an Elo league for progress tracking.
 //
 //  First arg (optional) selects a named game variant:
 //      ./poker_ppo                   → full 52-card NLHE (default)
@@ -7,6 +8,7 @@
 //  Everything else (hyperparams, bet slots) is set inline below; the
 //  sweep harness will replace this with a richer config loader later.
 
+#include "elo_league.h"
 #include "ppo.h"
 #include "qfr_env.h"
 #include "GameConfig.hpp"
@@ -85,7 +87,7 @@ int main(int argc, char** argv) {
 
     // ── PPO hyper-parameters ────────────────────────────────────────────
     PPOConfig ppo_cfg;
-    ppo_cfg.total_timesteps = 2'000'000;
+    ppo_cfg.total_timesteps = 200'000'000;
     ppo_cfg.num_envs        = 32;
     ppo_cfg.num_steps       = 128;
     ppo_cfg.update_epochs   = 4;
@@ -99,7 +101,40 @@ int main(int argc, char** argv) {
     QFRPokerEnvironmentFactory factory(qfr_cfg);
     PPOTrainer trainer(factory, bet_cfg, ppo_cfg);
 
-    trainer.set_log_callback([](const PPOTrainer::UpdateStats& s) {
+    // ── Elo league ──────────────────────────────────────────────────────
+    // Query obs_dim and action_count from a throw-away env instance so the
+    // league's snapshot networks match the trainer's network architecture.
+    int obs_dim;
+    int action_count;
+    {
+        auto tmp     = factory.create(bet_cfg);
+        obs_dim      = tmp->obs_dim();
+        action_count = tmp->bet_config().action_count();
+    }
+
+    EloLeague::Config elo_cfg;
+    elo_cfg.num_hands_per_match = 1000;
+    elo_cfg.num_parallel_envs   = 32;
+    elo_cfg.k_factor            = 32.0f;
+    elo_cfg.initial_rating      = 1200.0f;
+    elo_cfg.max_checkpoints     = 15;
+
+    EloLeague league(factory, bet_cfg,
+                     obs_dim,
+                     action_count,
+                     ppo_cfg.hidden_dim,
+                     ppo_cfg.num_layers,
+                     elo_cfg);
+
+    // Anchor the untrained network at 1200 — every later rating reads as
+    // "how much stronger than the initial random network".
+    league.add_checkpoint(trainer.network(), 0, 0, "initial");
+    league.set_anchor(0, 1200.0f);
+
+    // How often to snapshot a checkpoint and play it against the pool.
+    const int snapshot_every = 200;   // updates
+
+    trainer.set_log_callback([&](const PPOTrainer::UpdateStats& s) {
         if (s.update % 10 == 0) {
             std::cout << "update=" << s.update
                       << "  step="   << s.global_step
@@ -112,12 +147,30 @@ int main(int argc, char** argv) {
                       << "  lr="     << s.learning_rate
                       << "\n";
         }
+
+        // Snapshot and evaluate periodically.
+        if (s.update > 0 && s.update % snapshot_every == 0) {
+            const std::string label = "u" + std::to_string(s.update);
+            league.add_checkpoint(trainer.network(),
+                                  s.update, s.global_step, label);
+            league.evaluate_latest();
+            std::cout << "\n[Elo league standings after update "
+                      << s.update << "]\n";
+            league.print_standings();
+            std::cout << "\n";
+        }
     });
 
     std::cout << "\nStarting training for "
               << ppo_cfg.total_timesteps << " steps...\n\n";
 
     trainer.train();
+
+    // Final full round-robin for a sharper read-out at the end.
+    std::cout << "\nRunning final round-robin tournament...\n";
+    league.run_tournament();
+    std::cout << "\n[Final Elo league standings]\n";
+    league.print_standings();
 
     const std::string model_path = "poker_ppo_model_" + qfr_cfg.game.name + ".pt";
     trainer.save(model_path);

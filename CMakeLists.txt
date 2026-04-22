@@ -15,6 +15,7 @@ add_library(poker_ppo_lib
     src/ppo.cpp
     src/rollout_buffer.cpp
     src/qfr_env.cpp
+    src/elo_league.cpp
 )
 target_include_directories(poker_ppo_lib PUBLIC
     include
