@@ -162,12 +162,21 @@ int main(int argc, char** argv) {
     ppo_cfg.num_steps       = 128;
     ppo_cfg.update_epochs   = 8;         // more critic passes per rollout
     ppo_cfg.num_minibatches = 4;
-    ppo_cfg.learning_rate   = 2.0e-4f;   // entropy bonus prevents collapse on its own
-    ppo_cfg.ent_coef        = 0.05f;
+    ppo_cfg.learning_rate   = 2.0e-4f;
+    ppo_cfg.ent_coef        = 0.01f;     // was 0.05 — too large for a 6-action IIG with
+                                         // near-zero advantages; pinned policy ~uniform
     ppo_cfg.vf_coef         = 1.0f;      // critic gets a real share of trunk gradient
     ppo_cfg.clip_coef       = 0.2f;      // standard PPO; gives policy room (was 0.1)
     ppo_cfg.clip_vloss      = false;     // CRITICAL: with reward scale ≫ clip, clipped vloss
                                          // becomes constant outside V_old±ε → zero critic gradient
+    // Rewards come from the env in mbb (±100k for a full-stack pot). Scale by
+    // 10× big_blind so terminal returns land roughly in [-10, 10] and typical
+    // hands around ±1-3 — well-conditioned for a small MLP. Scaling by the
+    // full stack drove returns to ~0.03 avg, putting the critic below its
+    // numerical noise floor (EV went strongly negative, advantages turned to
+    // garbage, policy learned in the wrong direction). Elo / league reporting
+    // still reads raw env reward, so bb/hand display is unchanged.
+    ppo_cfg.reward_scale    = 1.0f / (10.0f * static_cast<float>(qfr_cfg.game.big_blind));
     ppo_cfg.hidden_dim      = 256;
     ppo_cfg.num_layers      = 3;
     ppo_cfg.anneal_lr       = false;
@@ -176,7 +185,7 @@ int main(int argc, char** argv) {
     // CPU beats CUDA for this config (3x256 MLP @ batch=32): kernel-launch
     // overhead dominates compute on such a small network. Revisit if you
     // scale the network up (hidden_dim ≥ 512) or num_envs (≥ 128).
-    torch::Device device = torch::kCPU;
+    torch::Device device = torch::kCUDA;
     std::cout << "Using device: CPU\n";
 
     QFRPokerEnvironmentFactory factory(qfr_cfg);

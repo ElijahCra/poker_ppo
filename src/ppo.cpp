@@ -220,7 +220,8 @@ void PPOTrainer::collect_rollout_coroutine() {
         vec_env_->action_count(),
         carry_obs_, carry_legal_mask_, carry_current_player_, carry_done_,
         min_batch, max_wait,
-        num_workers);
+        num_workers,
+        cfg_.reward_scale);
 
     scheduler.run();
 
@@ -306,7 +307,7 @@ void PPOTrainer::collect_rollout_serial() {
 
             float r = res.reward;
             if (acting == 1) r = -r;
-            rew_acc[i] = r;
+            rew_acc[i] = r * cfg_.reward_scale;
 
             if (res.done) {
                 nd_acc[i] = 1.0f;
@@ -410,13 +411,14 @@ void PPOTrainer::collect_rollout_threadpool() {
         // Parallel env stepping. Each i lands in exactly one worker, so the
         // env, scratch tensors at slot [i], and accessors at [i] are touched
         // by one thread only — no env-level locks needed.
+        const float rscale = cfg_.reward_scale;
         step_pool_->parallel_for(N, [&](int i) {
             const int acting = cp_acc[i];
             auto res = envs[i]->step(static_cast<int>(a_acc[i]));
 
             float r = res.reward;
             if (acting == 1) r = -r;
-            rew_acc[i] = r;
+            rew_acc[i] = r * rscale;
 
             if (res.done) {
                 nd_acc[i] = 1.0f;

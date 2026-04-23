@@ -102,6 +102,13 @@ struct PPOConfig {
     bool   clip_vloss       = true;
     bool   norm_advantages  = true;
 
+    // Per-step reward multiplier applied before the reward enters the buffer.
+    // For NLHE with 100k-mbb stacks, set to 1/initial_stack so returns live in
+    // [-1, 1] — keeps the critic's target magnitude sane and prevents vf_coef
+    // from dominating the shared-trunk gradient. Elo / league reporting still
+    // reads the raw env reward, so display semantics are unchanged.
+    float  reward_scale     = 1.0f;
+
     // ── optimiser ───────────────────────────────────────────────────────
     float  learning_rate    = 2.5e-4f;
     bool   anneal_lr        = true;

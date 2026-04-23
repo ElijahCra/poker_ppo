@@ -398,13 +398,15 @@ public:
                      torch::Tensor& carry_done,
                      std::size_t min_batch,
                      std::chrono::microseconds max_wait,
-                     int num_workers)
+                     int num_workers,
+                     float reward_scale = 1.0f)
         : net_(net), device_(device),
           envs_(envs), buffer_(buffer),
           num_steps_(num_steps), num_envs_(static_cast<int>(envs.size())),
           obs_dim_(obs_dim), action_count_(action_count),
           carry_obs_(carry_obs), carry_mask_(carry_mask),
           carry_player_(carry_player), carry_done_(carry_done),
+          reward_scale_(reward_scale),
           num_workers_(std::max(1, num_workers)),
           workers_(std::max(1, num_workers)),
           processor_(net, device, min_batch, max_wait,
@@ -570,6 +572,7 @@ private:
             auto env_res = envs_[i]->step(static_cast<int>(action));
             float reward = env_res.reward;
             if (acting_player == 1) reward = -reward;
+            reward *= reward_scale_;
 
             torch::Tensor next_obs, next_mask;
             int32_t next_player;
@@ -639,6 +642,7 @@ private:
     torch::Tensor& carry_mask_;
     torch::Tensor& carry_player_;
     torch::Tensor& carry_done_;
+    float          reward_scale_;
 
     torch::Tensor obs_scratch_;
     torch::Tensor actions_scratch_;
