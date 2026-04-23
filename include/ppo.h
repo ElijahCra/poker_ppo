@@ -8,8 +8,13 @@
 #include <torch/torch.h>
 #include <functional>
 #include <memory>
+#include <string>
+#include <utility>
+#include <vector>
 
 namespace poker_ppo {
+
+class StepThreadPool;  // fwd-decl; full type lives in rollout_pool.h
 
 // ─────────────────────────────────────────────────────────────────────────────
 // PPOTrainer
@@ -37,6 +42,8 @@ public:
         float  clip_fraction;
         float  explained_variance;
         float  learning_rate;
+        double rollout_ms;   // wall time for the rollout-collection phase
+        double update_ms;    // wall time for the PPO update phase
     };
 
     using LogCallback = std::function<void(const UpdateStats&)>;
@@ -46,8 +53,59 @@ public:
                const PPOConfig& ppo_cfg,
                torch::Device device = torch::kCPU);
 
+    // Out-of-line so the implicit destructor doesn't need StepThreadPool's
+    // full definition at every PPOTrainer use site.
+    ~PPOTrainer();
+
+    /// Pluggable rollout-collection strategy. Pass any callable matching
+    /// this signature into set_rollout_fn() to swap how train() collects.
+    using RolloutFn = std::function<void(PPOTrainer&)>;
+
     /// Run the full training loop.
+    /// Uses the rollout function set via set_rollout_fn(); defaults to the
+    /// coroutine + worker-pool implementation if none has been set.
     void train();
+
+    /// Choose the rollout strategy used by train().
+    /// Convenience helpers for the three built-in strategies are below.
+    void set_rollout_fn(RolloutFn fn) { rollout_fn_ = std::move(fn); }
+
+    // ── Built-in rollout strategies ─────────────────────────────────────
+    // Each is a self-contained collect_* method that fills the buffer for
+    // one rollout. They are public so they can be wired into set_rollout_fn,
+    // benchmarked, or invoked manually.
+    void collect_rollout_serial();      // single-thread loop, matches b601e0e
+    void collect_rollout_coroutine();   // coroutine + worker-pool scheduler
+    void collect_rollout_threadpool();  // persistent thread pool, batched fwd
+
+    /// Aggregate rollout-time stats for one strategy.
+    struct BenchmarkResult {
+        struct Stats { double min_ms, median_ms, mean_ms, p95_ms, max_ms; };
+        int num_envs;
+        int num_steps;
+        int iters;
+        int samples;        // num_envs × num_steps
+        // Ordered list of (strategy_name, stats). Order matches input order
+        // for benchmark_strategies(); for benchmark_rollouts() the order is
+        // serial → coroutine → threadpool.
+        std::vector<std::pair<std::string, Stats>> by_strategy;
+
+        const Stats* find(const std::string& name) const {
+            for (const auto& [n, s] : by_strategy) if (n == name) return &s;
+            return nullptr;
+        }
+    };
+
+    /// A/B-time the three built-in strategies (serial, coroutine, threadpool).
+    /// Iterations are interleaved per round so each strategy faces a similar
+    /// env distribution. Does not call update() — measures rollout only.
+    BenchmarkResult benchmark_rollouts(int iters = 20, int warmup = 3,
+                                       bool verbose = true);
+
+    /// Generalised version: bench any user-supplied list of strategies.
+    BenchmarkResult benchmark_strategies(
+        const std::vector<std::pair<std::string, RolloutFn>>& strategies,
+        int iters = 20, int warmup = 3, bool verbose = true);
 
     /// Register a callback invoked after each PPO update.
     void set_log_callback(LogCallback cb) { log_cb_ = std::move(cb); }
@@ -60,8 +118,9 @@ public:
     void load(const std::string& path);
 
 private:
-    void collect_rollout();
-    void update();
+    void init_carry_state();         // resets envs and seeds carry_* tensors
+    UpdateStats update();            // PPO update; returns per-update stats
+    void ensure_step_pool();         // lazy-init for the threadpool strategy
 
     PPOConfig    cfg_;
     BetConfig    bet_cfg_;
@@ -83,6 +142,33 @@ private:
     int update_idx_  = 0;
 
     LogCallback log_cb_;
+
+    // Pluggable rollout strategy used by train(). Defaulted in train() if
+    // the caller hasn't installed one explicitly.
+    RolloutFn rollout_fn_;
+
+    // Persistent worker pool used by collect_rollout_threadpool(). Created
+    // on first call; reused across rollouts to avoid per-step thread spawn.
+    std::unique_ptr<StepThreadPool> step_pool_;
 };
+
+// ─────────────────────────────────────────────────────────────────────────────
+// scaling_benchmark
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Build a fresh PPOTrainer for each value in `env_counts` and run the 3-way
+// benchmark_rollouts() against it. Prints one summary table at the end so
+// you can see how each strategy scales with num_envs.
+//
+// `ppo_cfg` is taken by value because we mutate `num_envs` per row.
+// `num_steps` and the network shape stay constant across rows.
+
+void scaling_benchmark(IPokerEnvironmentFactory& factory,
+                       const BetConfig& bet_cfg,
+                       PPOConfig ppo_cfg,
+                       torch::Device device,
+                       const std::vector<int>& env_counts,
+                       int iters  = 10,
+                       int warmup = 2);
 
 } // namespace poker_ppo

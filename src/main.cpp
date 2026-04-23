@@ -9,6 +9,7 @@
 //  sweep harness will replace this with a richer config loader later.
 
 #include "elo_league.h"
+#include "metrics_logger.h"
 #include "ppo.h"
 #include "qfr_env.h"
 #include "GameConfig.hpp"
@@ -76,10 +77,68 @@ int main(int argc, char** argv) {
     // pool — the sync overhead is net-negative, and it steals cores from
     // the rollout worker threads. Force single-threaded so workers and the
     // inference processor each get a dedicated core.
-    at::set_num_threads(1);
-    at::set_num_interop_threads(1);
+    //at::set_num_threads(1);
+    //at::set_num_interop_threads(1);
 
-    const std::string variant = (argc > 1) ? argv[1] : "nlhe_full_52";
+    // ── CLI parse ──────────────────────────────────────────────────────
+    // Recognised forms:
+    //   ./poker_ppo                                    → train, default variant
+    //   ./poker_ppo <variant>                          → train, named variant
+    //   ./poker_ppo --benchmark [iters]                → A/B rollout bench
+    //   ./poker_ppo <variant> --benchmark [iters]
+    //   ./poker_ppo --scaling N1,N2,N3,... [iters]    → scaling sweep
+    //   ./poker_ppo <variant> --scaling 8,16,32 [iters]
+    //   ./poker_ppo --strategy {serial|coroutine|threadpool}  (training mode)
+    bool             benchmark_mode  = false;
+    bool             scaling_mode    = false;
+    int              benchmark_iters = 20;
+    std::vector<int> env_counts;
+    std::string      variant         = "nlhe_full_52";
+    std::string      strategy        = "coroutine";  // default training rollout
+
+    auto parse_int_list = [](std::string_view s) {
+        std::vector<int> out;
+        size_t start = 0;
+        while (start <= s.size()) {
+            size_t end = s.find(',', start);
+            if (end == std::string_view::npos) end = s.size();
+            if (end > start) {
+                try { out.push_back(std::stoi(std::string(s.substr(start, end - start)))); }
+                catch (...) {}
+            }
+            start = end + 1;
+        }
+        return out;
+    };
+
+    for (int i = 1; i < argc; ++i) {
+        std::string_view a = argv[i];
+        if (a == "--benchmark") {
+            benchmark_mode = true;
+            if (i + 1 < argc) {
+                try { benchmark_iters = std::stoi(argv[i + 1]); ++i; }
+                catch (...) { /* leave default */ }
+            }
+        } else if (a == "--scaling") {
+            scaling_mode = true;
+            if (i + 1 < argc) {
+                env_counts = parse_int_list(argv[i + 1]);
+                ++i;
+            }
+            if (i + 1 < argc) {
+                try { benchmark_iters = std::stoi(argv[i + 1]); ++i; }
+                catch (...) { /* leave default */ }
+            }
+        } else if (a == "--strategy") {
+            if (i + 1 < argc) { strategy = argv[i + 1]; ++i; }
+        } else {
+            variant = std::string(a);
+        }
+    }
+
+    if (scaling_mode && env_counts.empty()) {
+        env_counts = {8, 16, 32, 64, 128};  // sensible default sweep
+    }
 
     // ── Game variant: deck, stacks, blinds, betting structure ──────────
     QFRConfig qfr_cfg;
@@ -99,7 +158,7 @@ int main(int argc, char** argv) {
     // ── PPO hyper-parameters ────────────────────────────────────────────
     PPOConfig ppo_cfg;
     ppo_cfg.total_timesteps = 200'000'000;
-    ppo_cfg.num_envs        = 32;
+    ppo_cfg.num_envs        = 64;
     ppo_cfg.num_steps       = 128;
     ppo_cfg.update_epochs   = 8;         // more critic passes per rollout
     ppo_cfg.num_minibatches = 4;
@@ -121,7 +180,39 @@ int main(int argc, char** argv) {
     std::cout << "Using device: CPU\n";
 
     QFRPokerEnvironmentFactory factory(qfr_cfg);
+
+    if (scaling_mode) {
+        std::cout << "\n[scaling mode] sweep over num_envs={";
+        for (size_t i = 0; i < env_counts.size(); ++i) {
+            std::cout << env_counts[i] << (i + 1 < env_counts.size() ? "," : "");
+        }
+        std::cout << "}, iters=" << benchmark_iters << "\n\n";
+        scaling_benchmark(factory, bet_cfg, ppo_cfg, device,
+                          env_counts, benchmark_iters, /*warmup=*/2);
+        return 0;
+    }
+
     PPOTrainer trainer(factory, bet_cfg, ppo_cfg, device);
+
+    if (benchmark_mode) {
+        std::cout << "\n[benchmark mode] comparing serial / coroutine / threadpool\n";
+        trainer.benchmark_rollouts(benchmark_iters, /*warmup=*/3);
+        return 0;
+    }
+
+    // Pick the rollout strategy used by train().
+    if (strategy == "serial") {
+        trainer.set_rollout_fn([](PPOTrainer& t) { t.collect_rollout_serial(); });
+    } else if (strategy == "threadpool") {
+        trainer.set_rollout_fn([](PPOTrainer& t) { t.collect_rollout_threadpool(); });
+    } else if (strategy == "coroutine") {
+        trainer.set_rollout_fn([](PPOTrainer& t) { t.collect_rollout_coroutine(); });
+    } else {
+        std::cerr << "unknown --strategy '" << strategy
+                  << "' (expected serial|coroutine|threadpool)\n";
+        return 1;
+    }
+    std::cout << "Rollout strategy: " << strategy << "\n";
 
     // ── Elo league ──────────────────────────────────────────────────────
     // Query obs_dim and action_count from a throw-away env instance so the
@@ -173,7 +264,7 @@ int main(int argc, char** argv) {
     }
 
     // How often to snapshot a checkpoint and play it against the pool.
-    const int snapshot_every = 200;   // updates
+    constexpr int snapshot_every = 200;   // updates
 
     // Action labels for the histogram printout.
     auto action_label = [&](int a) -> std::string {
@@ -185,6 +276,13 @@ int main(int argc, char** argv) {
         return "AI";
     };
 
+    // ── Metrics logging ─────────────────────────────────────────────────
+    // CSVs land under runs/<timestamp>/ and are tailed by tools/plot_live.py.
+    MetricsLogger metrics(make_run_dir());
+    std::cout << "Metrics dir: " << metrics.run_dir() << "\n"
+              << "  (live plots: `python tools/plot_live.py "
+              << metrics.run_dir() << "`)\n";
+
     // Elo evaluation runs in a background thread so it never stalls training.
     // We hold at most one evaluation future at a time; the next snapshot waits
     // for it only if the previous one hasn't finished yet (which is rare given
@@ -193,6 +291,9 @@ int main(int argc, char** argv) {
     std::mutex        print_mutex;  // keep training + elo output from interleaving
 
     trainer.set_log_callback([&](const PPOTrainer::UpdateStats& s) {
+        // Per-update CSV row (cheap; cb fires once per update).
+        metrics.log_update(s);
+
         if (s.update % 10 == 0) {
             std::lock_guard<std::mutex> lk(print_mutex);
             std::cout << "update=" << s.update
@@ -219,11 +320,20 @@ int main(int argc, char** argv) {
 
             // Fire the rest off in the background — training resumes immediately.
             elo_future = std::async(std::launch::async,
-                [&, latest_idx, update = s.update]() {
+                [&, latest_idx, update = s.update, step = s.global_step]() {
                     league.evaluate_latest();
 
                     auto vs_initial = league.play_match(latest_idx, 0);
                     auto vs_uniform = league.play_match(latest_idx, 1);
+
+                    // Persist Elo + match summary to runs/<...>/elo.csv.
+                    const float latest_rating =
+                        league.checkpoints()[latest_idx].rating;
+                    metrics.log_elo(update, step, latest_rating,
+                                    vs_initial.win_rate_a,
+                                    vs_initial.avg_reward_a * 10.0f,
+                                    vs_uniform.win_rate_a,
+                                    vs_uniform.avg_reward_a * 10.0f);
 
                     // Mode-collapse diagnostic: action histogram from uniform match.
                     int64_t total = 0;
