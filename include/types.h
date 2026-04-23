@@ -109,6 +109,15 @@ struct PPOConfig {
     // reads the raw env reward, so display semantics are unchanged.
     float  reward_scale     = 1.0f;
 
+    // Running return normalization. When true, the trainer tracks an EMA of
+    // the per-rollout return std and divides the value loss by σ² so v_loss
+    // stays of order 1 regardless of reward magnitude. Equivalent to an
+    // adaptive vf_coef that reacts to the current scale of returns — critic
+    // keeps a healthy share of the shared-trunk gradient even when returns
+    // are numerically small.
+    bool   normalize_returns = true;
+    float  return_std_ema    = 0.99f;   // decay for running σ
+
     // ── optimiser ───────────────────────────────────────────────────────
     float  learning_rate    = 2.5e-4f;
     bool   anneal_lr        = true;

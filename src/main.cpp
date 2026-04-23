@@ -179,7 +179,7 @@ int main(int argc, char** argv) {
     ppo_cfg.reward_scale    = 1.0f / (10.0f * static_cast<float>(qfr_cfg.game.big_blind));
     ppo_cfg.hidden_dim      = 256;
     ppo_cfg.num_layers      = 3;
-    ppo_cfg.anneal_lr       = false;
+    ppo_cfg.anneal_lr       = true;
 
     // ── Trainer ─────────────────────────────────────────────────────────
     // CPU beats CUDA for this config (3x256 MLP @ batch=32): kernel-launch

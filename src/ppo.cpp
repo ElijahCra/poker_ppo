@@ -651,6 +651,21 @@ PPOTrainer::UpdateStats PPOTrainer::update() {
     auto total_clip_frac   = torch::zeros({}, stat_opts);
     int  num_updates = 0;
 
+    // EMA-update the running return std BEFORE the minibatch loop so every
+    // minibatch in this update uses the same scaling. Div by σ² makes v_loss
+    // of order 1 regardless of reward magnitude; Adam then gives the critic a
+    // healthy share of the shared-trunk gradient.
+    float vloss_scale = 1.0f;
+    if (cfg_.normalize_returns) {
+        torch::NoGradGuard ng;
+        const float batch_std = b_ret.std().item<float>();
+        if (std::isfinite(batch_std) && batch_std > 1e-8f) {
+            return_std_running_ = cfg_.return_std_ema * return_std_running_
+                                + (1.0f - cfg_.return_std_ema) * batch_std;
+        }
+        vloss_scale = 1.0f / (return_std_running_ * return_std_running_ + 1e-8f);
+    }
+
     for (int epoch = 0; epoch < cfg_.update_epochs; ++epoch) {
         // Shuffle
         auto indices = torch::randperm(B, torch::TensorOptions().dtype(torch::kInt64).device(device_));
@@ -699,6 +714,7 @@ PPOTrainer::UpdateStats PPOTrainer::update() {
             } else {
                 v_loss = 0.5f * (er.value - mb_ret).pow(2).mean();
             }
+            v_loss = v_loss * vloss_scale;
 
             // ── entropy bonus ───────────────────────────────────────
             auto entropy_loss = er.entropy.mean();
@@ -756,6 +772,7 @@ PPOTrainer::UpdateStats PPOTrainer::update() {
         total_clip_frac.item<float>()   / n,
         explained_var,
         lr,
+        return_std_running_,
         0.0,  // rollout_ms — set by train()
         0.0,  // update_ms  — set by train()
     };
