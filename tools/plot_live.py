@@ -186,9 +186,16 @@ def main() -> int:
         fig.tight_layout(rect=(0, 0, 1, 0.96))
 
         try:
-            plt.pause(args.refresh)
+            fig.canvas.draw_idle()  # Request a redraw without forcing focus
+            fig.canvas.flush_events()  # Process GUI events to keep the window responsive
         except KeyboardInterrupt:
             break
+        start_wait = time.time()
+        while time.time() - start_wait < 5:
+            if not plt.fignum_exists(fig.number):
+                break
+            fig.canvas.flush_events()
+            time.sleep(0.08)  # Small yield to prevent CPU pegging during wait
 
     return 0
 
