@@ -16,7 +16,7 @@ MetricsLogger::MetricsLogger(const std::string& run_dir) : run_dir_(run_dir) {
 
     metrics_ << "update,global_step,policy_loss,value_loss,entropy,"
                 "approx_kl,clip_fraction,explained_variance,learning_rate,"
-                "return_std,rollout_ms,update_ms\n";
+                "rollout_ms,update_ms\n";
     metrics_.flush();
 
     elo_     << "update,global_step,latest_rating,"
@@ -34,7 +34,6 @@ void MetricsLogger::log_update(const PPOTrainer::UpdateStats& s) {
              << s.entropy << ',' << s.approx_kl << ','
              << s.clip_fraction << ',' << s.explained_variance << ','
              << s.learning_rate << ','
-             << s.return_std << ','
              << s.rollout_ms << ',' << s.update_ms << '\n';
     metrics_.flush();
 }

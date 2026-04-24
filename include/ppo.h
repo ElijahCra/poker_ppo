@@ -42,7 +42,6 @@ public:
         float  clip_fraction;
         float  explained_variance;
         float  learning_rate;
-        float  return_std;   // running EMA of return std (1.0 when norm off)
         double rollout_ms;   // wall time for the rollout-collection phase
         double update_ms;    // wall time for the PPO update phase
     };
@@ -141,11 +140,6 @@ private:
 
     int global_step_ = 0;
     int update_idx_  = 0;
-
-    // EMA of per-rollout return std, used by the normalize_returns path to
-    // scale value loss by 1/σ². Initialised to 1 so the first update is
-    // effectively unnormalised, then adapts over ~1/(1-ema) ≈ 100 rollouts.
-    float return_std_running_ = 1.0f;
 
     LogCallback log_cb_;
 

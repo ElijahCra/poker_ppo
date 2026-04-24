@@ -169,14 +169,6 @@ int main(int argc, char** argv) {
     ppo_cfg.clip_coef       = 0.2f;      // standard PPO; gives policy room (was 0.1)
     ppo_cfg.clip_vloss      = false;     // CRITICAL: with reward scale ≫ clip, clipped vloss
                                          // becomes constant outside V_old±ε → zero critic gradient
-    // Rewards come from the env in mbb (±100k for a full-stack pot). Scale by
-    // 10× big_blind so terminal returns land roughly in [-10, 10] and typical
-    // hands around ±1-3 — well-conditioned for a small MLP. Scaling by the
-    // full stack drove returns to ~0.03 avg, putting the critic below its
-    // numerical noise floor (EV went strongly negative, advantages turned to
-    // garbage, policy learned in the wrong direction). Elo / league reporting
-    // still reads raw env reward, so bb/hand display is unchanged.
-    ppo_cfg.reward_scale    = 1.0f / (10.0f * static_cast<float>(qfr_cfg.game.big_blind));
     ppo_cfg.hidden_dim      = 256;
     ppo_cfg.num_layers      = 3;
     ppo_cfg.anneal_lr       = true;

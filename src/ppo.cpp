@@ -179,11 +179,7 @@ void PPOTrainer::collect_rollout_coroutine() {
     using clock = std::chrono::steady_clock;
     using ms    = std::chrono::duration<double, std::milli>;
 
-    // Reach back into VectorizedEnv for the raw env vector. We need per-env
-    // access so the coroutines can step individually.
-    std::vector<std::unique_ptr<IPokerEnvironment>> dummy_envs_unused;  // for signature
-    // (RolloutScheduler keeps a reference, so we need a stable vector. We'll
-    // vend one from VectorizedEnv via a small helper.)
+    buffer_->clear();
 
     // Acquire the owning vector of envs from VectorizedEnv.
     auto& envs = vec_env_->envs_mut();
@@ -191,23 +187,14 @@ void PPOTrainer::collect_rollout_coroutine() {
     // Batch-inference tuning. min_batch ≤ num_envs so the processor fires
     // even when not every coroutine has submitted yet; max_wait caps latency
     // for the tail end of a step.
-    // Half-wave pipelining: firing on N/2 lets fast-stepping envs resubmit
-    // their next request while the processor is still running the forward
-    // on the slower half, overlapping env work with inference. Firing on N
-    // creates a full-wave barrier with zero overlap — worse despite fewer
-    // dispatches. If forward_ns > worker_busy_ns (we're forward-bound),
-    // consider dropping further (N/4) to pipeline more aggressively.
     const std::size_t min_batch =
         std::max<std::size_t>(1, static_cast<std::size_t>(cfg_.num_envs) );
     const auto max_wait = std::chrono::microseconds(500);
 
     // Worker pool: each owns a shard of envs and resumes their coroutines
     // in parallel. Overprovisioning past ~num_envs buys nothing (at most
-    // one coro per env can be ready at a time on a given shard). Defaults
-    // to 4 — tune based on core count and env-step cost.
-    const int num_workers = std::min(
-        cfg_.num_envs, 4);
-        //std::max(1, static_cast<int>(std::thread::hardware_concurrency()) / 2));
+    // one coro per env can be ready at a time on a given shard).
+    const int num_workers = std::min(cfg_.num_envs, 4);
 
     auto t0 = clock::now();
 
@@ -220,22 +207,13 @@ void PPOTrainer::collect_rollout_coroutine() {
         vec_env_->action_count(),
         carry_obs_, carry_legal_mask_, carry_current_player_, carry_done_,
         min_batch, max_wait,
-        num_workers,
-        cfg_.reward_scale);
+        num_workers);
 
     scheduler.run();
 
     auto t1 = clock::now();
 
-    scheduler.flush_to_buffer();
-
-    // GAE bootstrap tensors live on CPU in the scheduler; move once to device.
-    auto next_value  = scheduler.bootstrap_value().to(device_);
-    auto next_done   = scheduler.bootstrap_done().to(device_);
-    auto next_player = scheduler.bootstrap_player().to(device_);
-
-    buffer_->compute_returns(next_value, next_done, next_player,
-                             cfg_.gamma, cfg_.gae_lambda);
+    buffer_->compute_returns(cfg_.gamma, cfg_.gae_lambda);
 
     auto t2 = clock::now();
 
@@ -249,7 +227,7 @@ void PPOTrainer::collect_rollout_coroutine() {
             : 0.0;
         std::cout << "  rollout breakdown:"
                   << " coro_run=" << ms(t1 - t0).count() << "ms"
-                  << " flush+gae=" << ms(t2 - t1).count() << "ms"
+                  << " gae=" << ms(t2 - t1).count() << "ms"
                   << "  forward=" << fwd_ms << "ms"
                   << "  worker_wait_avg=" << wait_ms << "ms"
                   << " (W=" << W << ")\n";
@@ -257,15 +235,13 @@ void PPOTrainer::collect_rollout_coroutine() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Serial rollout — single-thread loop matching commit b601e0e.
-// Adapted to current state shape: carry_* tensors live on CPU, RolloutBuffer
-// lives on device. We move per-step batches across the device boundary the
-// same way the old code did (cur_* held on device, scratch allocated CPU,
-// rewards/dones built CPU and pushed to device for buffer insert).
+// Serial rollout — single-thread loop with per-player buffer accumulation.
 // ─────────────────────────────────────────────────────────────────────────────
 void PPOTrainer::collect_rollout_serial() {
     network_->eval();
     torch::NoGradGuard no_grad;
+
+    buffer_->clear();
 
     auto& envs = vec_env_->envs_mut();
     const int N = cfg_.num_envs;
@@ -275,82 +251,84 @@ void PPOTrainer::collect_rollout_serial() {
     auto f_cpu   = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
     auto i32_cpu = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU);
 
+    // Per-env per-player rollout state. Seeded from carry_done_ so the first
+    // transition after a previous-rollout reset carries the new-episode marker.
+    std::vector<PlayerRolloutState> player_state(N);
+    for (int i = 0; i < N; ++i) {
+        const float d = carry_done_.accessor<float, 1>()[i];
+        player_state[i].next_done_flag[0] = d;
+        player_state[i].next_done_flag[1] = d;
+    }
+
     // Pull carry state onto device for the forward pass.
     auto cur_obs    = carry_obs_.to(device_);
     auto cur_mask   = carry_legal_mask_.to(device_);
-    auto cur_done   = carry_done_.to(device_);
     auto cur_player = carry_current_player_.to(device_);
 
     for (int step = 0; step < cfg_.num_steps; ++step) {
-        // Full-batch forward (the whole point of the old design).
         auto ar = network_->get_action(cur_obs, cur_mask);
 
-        auto actions_cpu = ar.action.to(torch::kCPU).contiguous();
-        auto a_acc       = actions_cpu.accessor<int64_t, 1>();
+        auto actions_cpu    = ar.action.to(torch::kCPU).contiguous();
+        auto logp_cpu       = ar.log_prob.to(torch::kCPU).contiguous();
+        auto value_cpu      = ar.value.to(torch::kCPU).contiguous();
+        auto cur_obs_cpu    = cur_obs.to(torch::kCPU).contiguous();
+        auto cur_mask_cpu   = cur_mask.to(torch::kCPU).contiguous();
         auto cur_player_cpu = cur_player.to(torch::kCPU).contiguous();
-        auto cp_acc      = cur_player_cpu.accessor<int32_t, 1>();
 
-        // Per-step CPU scratch for next state.
+        auto a_acc  = actions_cpu.accessor<int64_t, 1>();
+        auto lp_acc = logp_cpu.accessor<float, 1>();
+        auto v_acc  = value_cpu.accessor<float, 1>();
+        auto cp_acc = cur_player_cpu.accessor<int32_t, 1>();
+
         auto next_obs    = torch::zeros({N, D}, f_cpu);
         auto next_mask   = torch::zeros({N, A}, f_cpu);
-        auto next_done   = torch::zeros({N},    f_cpu);
         auto next_player = torch::zeros({N},    i32_cpu);
-        auto rewards     = torch::zeros({N},    f_cpu);
-
-        auto rew_acc    = rewards.accessor<float, 1>();
-        auto nd_acc     = next_done.accessor<float, 1>();
-        auto np_acc     = next_player.accessor<int32_t, 1>();
+        auto np_acc      = next_player.accessor<int32_t, 1>();
 
         for (int i = 0; i < N; ++i) {
             const int acting = cp_acc[i];
-            auto res = envs[i]->step(static_cast<int>(a_acc[i]));
 
-            float r = res.reward;
-            if (acting == 1) r = -r;
-            rew_acc[i] = r * cfg_.reward_scale;
+            // Close out acting's previous pending and record this step.
+            player_state[i].record_step(
+                acting, i, *buffer_,
+                cur_obs_cpu[i], cur_mask_cpu[i],
+                a_acc[i], lp_acc[i], v_acc[i]);
+
+            auto res = envs[i]->step(static_cast<int>(a_acc[i]));
+            player_state[i].step_reward(res.reward);
 
             if (res.done) {
-                nd_acc[i] = 1.0f;
+                player_state[i].flush_on_terminal(i, *buffer_);
                 auto rr = envs[i]->reset();
                 next_obs[i]  = rr.observation;
                 next_mask[i] = rr.legal_action_mask;
                 np_acc[i]    = static_cast<int32_t>(envs[i]->current_player());
             } else {
-                nd_acc[i] = 0.0f;
                 next_obs[i]  = res.observation;
                 next_mask[i] = res.legal_action_mask;
                 np_acc[i]    = static_cast<int32_t>(envs[i]->current_player());
             }
         }
 
-        // Store PRE-step transition. Buffer lives on device — push there.
-        buffer_->insert(step,
-                        cur_obs,
-                        ar.action,
-                        ar.log_prob,
-                        rewards.to(device_),
-                        cur_done,
-                        ar.value,
-                        cur_mask,
-                        cur_player.to(device_));
-
-        // Advance to next state on device.
         cur_obs    = next_obs.to(device_);
         cur_mask   = next_mask.to(device_);
-        cur_done   = next_done.to(device_);
         cur_player = next_player.to(device_);
     }
 
-    // Bootstrap V(s_T).
-    auto [_, next_value] = network_->forward(cur_obs);
-    buffer_->compute_returns(next_value, cur_done, cur_player,
-                             cfg_.gamma, cfg_.gae_lambda);
+    // Drain remaining pending transitions (treated as truncated in GAE).
+    for (int i = 0; i < N; ++i) {
+        player_state[i].flush_on_rollout_end(i, *buffer_);
+    }
 
-    // Persist back to carry state so subsequent rollouts continue from here.
+    buffer_->compute_returns(cfg_.gamma, cfg_.gae_lambda);
+
     carry_obs_            = cur_obs.to(torch::kCPU);
     carry_legal_mask_     = cur_mask.to(torch::kCPU);
-    carry_done_           = cur_done.to(torch::kCPU);
     carry_current_player_ = cur_player.to(torch::kCPU);
+    // Reset carry_done_ — per-player episode-boundary state is re-seeded at
+    // the next rollout's start from this tensor, and we've already flushed
+    // the pending transitions whose done flag it would have affected.
+    carry_done_.zero_();
 
     global_step_ += cfg_.num_envs * cfg_.num_steps;
 }
@@ -376,6 +354,8 @@ void PPOTrainer::collect_rollout_threadpool() {
 
     ensure_step_pool();
 
+    buffer_->clear();
+
     auto& envs = vec_env_->envs_mut();
     const int N = cfg_.num_envs;
     const int D = vec_env_->obs_dim();
@@ -384,9 +364,17 @@ void PPOTrainer::collect_rollout_threadpool() {
     auto f_cpu   = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
     auto i32_cpu = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU);
 
+    // Per-env per-player rollout state. Seeded from carry_done_ so the first
+    // transition after a previous-rollout reset carries the new-episode marker.
+    std::vector<PlayerRolloutState> player_state(N);
+    for (int i = 0; i < N; ++i) {
+        const float d = carry_done_.accessor<float, 1>()[i];
+        player_state[i].next_done_flag[0] = d;
+        player_state[i].next_done_flag[1] = d;
+    }
+
     auto cur_obs    = carry_obs_.to(device_);
     auto cur_mask   = carry_legal_mask_.to(device_);
-    auto cur_done   = carry_done_.to(device_);
     auto cur_player = carry_current_player_.to(device_);
 
     for (int step = 0; step < cfg_.num_steps; ++step) {
@@ -394,70 +382,66 @@ void PPOTrainer::collect_rollout_threadpool() {
         auto ar = network_->get_action(cur_obs, cur_mask);
 
         auto actions_cpu    = ar.action.to(torch::kCPU).contiguous();
+        auto logp_cpu       = ar.log_prob.to(torch::kCPU).contiguous();
+        auto value_cpu      = ar.value.to(torch::kCPU).contiguous();
+        auto cur_obs_cpu    = cur_obs.to(torch::kCPU).contiguous();
+        auto cur_mask_cpu   = cur_mask.to(torch::kCPU).contiguous();
         auto cur_player_cpu = cur_player.to(torch::kCPU).contiguous();
-        auto a_acc          = actions_cpu.accessor<int64_t, 1>();
-        auto cp_acc         = cur_player_cpu.accessor<int32_t, 1>();
+
+        auto a_acc  = actions_cpu.accessor<int64_t, 1>();
+        auto lp_acc = logp_cpu.accessor<float, 1>();
+        auto v_acc  = value_cpu.accessor<float, 1>();
+        auto cp_acc = cur_player_cpu.accessor<int32_t, 1>();
 
         auto next_obs    = torch::zeros({N, D}, f_cpu);
         auto next_mask   = torch::zeros({N, A}, f_cpu);
-        auto next_done   = torch::zeros({N},    f_cpu);
         auto next_player = torch::zeros({N},    i32_cpu);
-        auto rewards     = torch::zeros({N},    f_cpu);
-
-        auto rew_acc = rewards.accessor<float, 1>();
-        auto nd_acc  = next_done.accessor<float, 1>();
-        auto np_acc  = next_player.accessor<int32_t, 1>();
+        auto np_acc      = next_player.accessor<int32_t, 1>();
 
         // Parallel env stepping. Each i lands in exactly one worker, so the
-        // env, scratch tensors at slot [i], and accessors at [i] are touched
-        // by one thread only — no env-level locks needed.
-        const float rscale = cfg_.reward_scale;
+        // env, player_state[i], and next_* tensor slots at [i] are touched by
+        // one thread only. RolloutBuffer pushes at (player, i) are disjoint
+        // across i so they're also safe — no locks needed.
         step_pool_->parallel_for(N, [&](int i) {
             const int acting = cp_acc[i];
-            auto res = envs[i]->step(static_cast<int>(a_acc[i]));
 
-            float r = res.reward;
-            if (acting == 1) r = -r;
-            rew_acc[i] = r * rscale;
+            player_state[i].record_step(
+                acting, i, *buffer_,
+                cur_obs_cpu[i], cur_mask_cpu[i],
+                a_acc[i], lp_acc[i], v_acc[i]);
+
+            auto res = envs[i]->step(static_cast<int>(a_acc[i]));
+            player_state[i].step_reward(res.reward);
 
             if (res.done) {
-                nd_acc[i] = 1.0f;
+                player_state[i].flush_on_terminal(i, *buffer_);
                 auto rr = envs[i]->reset();
                 next_obs[i]  = rr.observation;
                 next_mask[i] = rr.legal_action_mask;
                 np_acc[i]    = static_cast<int32_t>(envs[i]->current_player());
             } else {
-                nd_acc[i] = 0.0f;
                 next_obs[i]  = res.observation;
                 next_mask[i] = res.legal_action_mask;
                 np_acc[i]    = static_cast<int32_t>(envs[i]->current_player());
             }
         });
 
-        buffer_->insert(step,
-                        cur_obs,
-                        ar.action,
-                        ar.log_prob,
-                        rewards.to(device_),
-                        cur_done,
-                        ar.value,
-                        cur_mask,
-                        cur_player.to(device_));
-
         cur_obs    = next_obs.to(device_);
         cur_mask   = next_mask.to(device_);
-        cur_done   = next_done.to(device_);
         cur_player = next_player.to(device_);
     }
 
-    auto [_, next_value] = network_->forward(cur_obs);
-    buffer_->compute_returns(next_value, cur_done, cur_player,
-                             cfg_.gamma, cfg_.gae_lambda);
+    // Drain remaining pending transitions (treated as truncated in GAE).
+    for (int i = 0; i < N; ++i) {
+        player_state[i].flush_on_rollout_end(i, *buffer_);
+    }
+
+    buffer_->compute_returns(cfg_.gamma, cfg_.gae_lambda);
 
     carry_obs_            = cur_obs.to(torch::kCPU);
     carry_legal_mask_     = cur_mask.to(torch::kCPU);
-    carry_done_           = cur_done.to(torch::kCPU);
     carry_current_player_ = cur_player.to(torch::kCPU);
+    carry_done_.zero_();
 
     global_step_ += cfg_.num_envs * cfg_.num_steps;
 }
@@ -651,21 +635,6 @@ PPOTrainer::UpdateStats PPOTrainer::update() {
     auto total_clip_frac   = torch::zeros({}, stat_opts);
     int  num_updates = 0;
 
-    // EMA-update the running return std BEFORE the minibatch loop so every
-    // minibatch in this update uses the same scaling. Div by σ² makes v_loss
-    // of order 1 regardless of reward magnitude; Adam then gives the critic a
-    // healthy share of the shared-trunk gradient.
-    float vloss_scale = 1.0f;
-    if (cfg_.normalize_returns) {
-        torch::NoGradGuard ng;
-        const float batch_std = b_ret.std().item<float>();
-        if (std::isfinite(batch_std) && batch_std > 1e-8f) {
-            return_std_running_ = cfg_.return_std_ema * return_std_running_
-                                + (1.0f - cfg_.return_std_ema) * batch_std;
-        }
-        vloss_scale = 1.0f / (return_std_running_ * return_std_running_ + 1e-8f);
-    }
-
     for (int epoch = 0; epoch < cfg_.update_epochs; ++epoch) {
         // Shuffle
         auto indices = torch::randperm(B, torch::TensorOptions().dtype(torch::kInt64).device(device_));
@@ -714,7 +683,6 @@ PPOTrainer::UpdateStats PPOTrainer::update() {
             } else {
                 v_loss = 0.5f * (er.value - mb_ret).pow(2).mean();
             }
-            v_loss = v_loss * vloss_scale;
 
             // ── entropy bonus ───────────────────────────────────────
             auto entropy_loss = er.entropy.mean();
@@ -772,7 +740,6 @@ PPOTrainer::UpdateStats PPOTrainer::update() {
         total_clip_frac.item<float>()   / n,
         explained_var,
         lr,
-        return_std_running_,
         0.0,  // rollout_ms — set by train()
         0.0,  // update_ms  — set by train()
     };

@@ -20,17 +20,10 @@
 //   │ resubmits  │  │ resubmits  │     │  resubmits   │
 //   └────────────┘  └────────────┘     └──────────────┘
 //
-//  Key invariants:
-//   - each env index is owned by exactly one worker ⇒ no env-level locks,
-//     no races on scratch[:, env_idx], carry_*[env_idx], bootstrap_*[env_idx]
-//   - the coroutine for env i only ever runs on one thread (its owner)
-//   - the processor runs on its own thread and exclusively owns the network
-//   - batched inference is preserved: all envs' submissions funnel through
-//     one global pending queue regardless of owning worker
-//
-//  Parallelism unlocked: env stepping (55 ms serial before) now runs on W
-//  cores concurrently; infer stays hidden behind it on the processor thread.
-//
+//  Each env's coroutine owns a PlayerRolloutState and directly pushes its
+//  transitions (per-player) into the shared RolloutBuffer. Per-(player, env)
+//  buffer slots are only ever written by the worker owning env — no locking
+//  required.
 
 #include "environment.h"
 #include "network.h"
@@ -398,17 +391,16 @@ public:
                      torch::Tensor& carry_done,
                      std::size_t min_batch,
                      std::chrono::microseconds max_wait,
-                     int num_workers,
-                     float reward_scale = 1.0f)
+                     int num_workers)
         : net_(net), device_(device),
           envs_(envs), buffer_(buffer),
           num_steps_(num_steps), num_envs_(static_cast<int>(envs.size())),
           obs_dim_(obs_dim), action_count_(action_count),
           carry_obs_(carry_obs), carry_mask_(carry_mask),
           carry_player_(carry_player), carry_done_(carry_done),
-          reward_scale_(reward_scale),
           num_workers_(std::max(1, num_workers)),
           workers_(std::max(1, num_workers)),
+          player_state_(num_envs_),
           processor_(net, device, min_batch, max_wait,
                      [this](std::vector<std::pair<std::coroutine_handle<>, int>> routed) {
                          // Partition by owning worker, then one push_batch per
@@ -425,23 +417,6 @@ public:
                          }
                      })
     {
-        auto f_cpu   = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
-        auto i_cpu   = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU);
-        auto i32_cpu = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU);
-
-        obs_scratch_         = torch::zeros({num_steps_, num_envs_, obs_dim_}, f_cpu);
-        actions_scratch_     = torch::zeros({num_steps_, num_envs_}, i_cpu);
-        log_probs_scratch_   = torch::zeros({num_steps_, num_envs_}, f_cpu);
-        rewards_scratch_     = torch::zeros({num_steps_, num_envs_}, f_cpu);
-        dones_scratch_       = torch::zeros({num_steps_, num_envs_}, f_cpu);
-        values_scratch_      = torch::zeros({num_steps_, num_envs_}, f_cpu);
-        legal_masks_scratch_ = torch::zeros({num_steps_, num_envs_, action_count_}, f_cpu);
-        players_scratch_     = torch::zeros({num_steps_, num_envs_}, i32_cpu);
-
-        bootstrap_value_  = torch::zeros({num_envs_}, f_cpu);
-        bootstrap_done_   = torch::zeros({num_envs_}, f_cpu);
-        bootstrap_player_ = torch::zeros({num_envs_}, i32_cpu);
-
         auto on_done = [this] {
             // Called on a worker thread after h.resume() has returned for a
             // coroutine that reached final_suspend. Safe to wake main here:
@@ -460,10 +435,6 @@ public:
         processor_.stop();
         for (auto& w : workers_) w.stop();
     }
-
-    const torch::Tensor& bootstrap_value()  const { return bootstrap_value_;  }
-    const torch::Tensor& bootstrap_done()   const { return bootstrap_done_;   }
-    const torch::Tensor& bootstrap_player() const { return bootstrap_player_; }
 
     // ── Instrumentation ─────────────────────────────────────────────────
     // Total ns the processor spent inside process() (forward + routing).
@@ -488,6 +459,10 @@ public:
         processor_.reset_forward_ns();
         for (auto& w : workers_) w.reset_wait_ns();
 
+        // Reset per-env player state each rollout. The buffer's `clear()` is
+        // invoked by the caller before run() so counts_ are already zeroed.
+        for (auto& s : player_state_) s = PlayerRolloutState{};
+
         active_.store(num_envs_, std::memory_order_release);
 
         std::vector<RolloutTask> tasks;
@@ -506,21 +481,6 @@ public:
             });
         }
         // Destroying `tasks` now is safe: all frames are at final_suspend.
-    }
-
-    // Bulk-copy scratch tensors into the RolloutBuffer (one insert per step).
-    void flush_to_buffer() {
-        for (int t = 0; t < num_steps_; ++t) {
-            buffer_.insert(t,
-                obs_scratch_[t].to(device_),
-                actions_scratch_[t].to(device_),
-                log_probs_scratch_[t].to(device_),
-                rewards_scratch_[t].to(device_),
-                dones_scratch_[t].to(device_),
-                values_scratch_[t].to(device_),
-                legal_masks_scratch_[t].to(device_),
-                players_scratch_[t].to(device_));
-        }
     }
 
     // Called by InferAwaiter::await_suspend on whichever thread happens to
@@ -547,14 +507,15 @@ private:
         torch::Tensor obs        = carry_obs_[i].clone();
         torch::Tensor legal_mask = carry_mask_[i].clone();
         int32_t       player     = carry_player_[i].item<int32_t>();
-        float         done_flag  = carry_done_[i].item<float>();
 
-        auto actions_a  = actions_scratch_.accessor<int64_t, 2>();
-        auto logp_a     = log_probs_scratch_.accessor<float, 2>();
-        auto rewards_a  = rewards_scratch_.accessor<float, 2>();
-        auto dones_a    = dones_scratch_.accessor<float, 2>();
-        auto values_a   = values_scratch_.accessor<float, 2>();
-        auto players_a  = players_scratch_.accessor<int32_t, 2>();
+        // Seed next_done_flag from carry_done_: if the previous rollout ended
+        // just after a reset, carry_done_[i]=1 and both players' next
+        // transitions carry the new-episode marker.
+        {
+            const float start_done = carry_done_[i].item<float>();
+            player_state_[i].next_done_flag[0] = start_done;
+            player_state_[i].next_done_flag[1] = start_done;
+        }
 
         for (int t = 0; t < num_steps_; ++t) {
             auto req = std::make_shared<InferRequest>();
@@ -564,64 +525,64 @@ private:
 
             auto& r = co_await InferAwaiter{this, req};
 
-            const int64_t action   = r.action;
-            const float   log_prob = r.log_prob;
-            const float   value    = r.value;
+            const int64_t action       = r.action;
+            const float   log_prob     = r.log_prob;
+            const float   value        = r.value;
             const int32_t acting_player = player;
 
+            // Close out acting_player's previous pending (with accumulated
+            // reward) and record this step as acting_player's new pending.
+            player_state_[i].record_step(
+                acting_player, i, buffer_,
+                obs, legal_mask, action, log_prob, value);
+
             auto env_res = envs_[i]->step(static_cast<int>(action));
-            float reward = env_res.reward;
-            if (acting_player == 1) reward = -reward;
-            reward *= reward_scale_;
+
+            // Env reward is in player-0's frame; step_reward propagates it
+            // to both players' accumulators with opposite signs.
+            player_state_[i].step_reward(env_res.reward);
 
             torch::Tensor next_obs, next_mask;
             int32_t next_player;
-            float   next_done_flag;
+            float   next_carry_done;
             if (env_res.done) {
+                // Episode terminated: flush both pending transitions with
+                // their accumulated rewards.
+                player_state_[i].flush_on_terminal(i, buffer_);
+
                 auto reset_res = envs_[i]->reset();
                 next_obs       = reset_res.observation;
                 next_mask      = reset_res.legal_action_mask;
                 next_player    = static_cast<int32_t>(envs_[i]->current_player());
-                next_done_flag = 1.0f;
+                next_carry_done = 1.0f;
             } else {
                 next_obs       = env_res.observation;
                 next_mask      = env_res.legal_action_mask;
                 next_player    = static_cast<int32_t>(envs_[i]->current_player());
-                next_done_flag = 0.0f;
+                next_carry_done = 0.0f;
             }
-
-            // Record PRE-step transition at (t, i). Only this worker writes
-            // to this slot, so no synchronisation is required.
-            obs_scratch_[t][i]         = obs;
-            legal_masks_scratch_[t][i] = legal_mask;
-            actions_a[t][i]  = action;
-            logp_a[t][i]     = log_prob;
-            rewards_a[t][i]  = reward;
-            dones_a[t][i]    = done_flag;
-            values_a[t][i]   = value;
-            players_a[t][i]  = acting_player;
 
             obs        = next_obs;
             legal_mask = next_mask;
             player     = next_player;
-            done_flag  = next_done_flag;
+            // carry_done for downstream carry_* persistence; intra-rollout
+            // boundary tracking lives inside PlayerRolloutState.
+            (void)next_carry_done;
         }
 
-        // Bootstrap V(s_T).
-        auto req = std::make_shared<InferRequest>();
-        req->obs        = obs;
-        req->legal_mask = legal_mask;
-        req->env_idx    = i;
-        auto& r = co_await InferAwaiter{this, req};
+        // End of rollout: flush any transition still pending. GAE treats
+        // each trajectory's last transition as truncated (no bootstrap).
+        player_state_[i].flush_on_rollout_end(i, buffer_);
 
-        bootstrap_value_.accessor<float, 1>()[i]    = r.value;
-        bootstrap_done_.accessor<float, 1>()[i]     = done_flag;
-        bootstrap_player_.accessor<int32_t, 1>()[i] = player;
-
+        // Persist carry state for the next rollout.
         carry_obs_[i]  = obs;
         carry_mask_[i] = legal_mask;
         carry_player_.accessor<int32_t, 1>()[i] = player;
-        carry_done_.accessor<float,   1>()[i]   = done_flag;
+        // We don't track the final done flag separately — it's rare that the
+        // rollout happens to end on a fresh reset (depends on episode length
+        // vs. num_steps) and the state machine inside PlayerRolloutState
+        // resets its next_done_flag at rollout start anyway.
+        carry_done_.accessor<float, 1>()[i] = 0.0f;
 
         // No completion signal here — the worker emits it after h.resume()
         // returns, guaranteeing the frame is fully suspended before main
@@ -642,24 +603,13 @@ private:
     torch::Tensor& carry_mask_;
     torch::Tensor& carry_player_;
     torch::Tensor& carry_done_;
-    float          reward_scale_;
-
-    torch::Tensor obs_scratch_;
-    torch::Tensor actions_scratch_;
-    torch::Tensor log_probs_scratch_;
-    torch::Tensor rewards_scratch_;
-    torch::Tensor dones_scratch_;
-    torch::Tensor values_scratch_;
-    torch::Tensor legal_masks_scratch_;
-    torch::Tensor players_scratch_;
 
     int                                               num_workers_;
     std::vector<Worker>                               workers_;
+    // One PlayerRolloutState per env; accessed only by the env's owning
+    // coroutine (which runs on its owning worker thread) — no locking.
+    std::vector<PlayerRolloutState>                   player_state_;
     BatchInferProcessor                               processor_;
-
-    torch::Tensor                                     bootstrap_value_;
-    torch::Tensor                                     bootstrap_done_;
-    torch::Tensor                                     bootstrap_player_;
 
     // Completion handshake.
     std::atomic<int>          active_{0};
