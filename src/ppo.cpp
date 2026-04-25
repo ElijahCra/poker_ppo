@@ -282,9 +282,6 @@ void PPOTrainer::ensure_step_pool() {
 // ─────────────────────────────────────────────────────────────────────────────
 // Threadpool rollout — full-batch forward on the main thread, env stepping
 // fanned out across a persistent worker pool with one parallel_for per step.
-// Cheaper synchronisation than the coroutine path (no per-step scheduler
-// teardown, no shared_ptr per request) but no inference/env overlap; well
-// suited when forward dominates and env work is tiny.
 // ─────────────────────────────────────────────────────────────────────────────
 void PPOTrainer::collect_rollout_threadpool() {
     network_->eval();

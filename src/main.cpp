@@ -208,7 +208,7 @@ int main(int argc, char** argv) {
     PPOTrainer trainer(factory, bet_cfg, ppo_cfg, device);
 
     if (benchmark_mode) {
-        std::cout << "\n[benchmark mode] comparing serial / coroutine / threadpool\n";
+        std::cout << "\n[benchmark mode] comparing serial / threadpool\n";
         trainer.benchmark_rollouts(benchmark_iters, /*warmup=*/3);
         return 0;
     }
@@ -220,7 +220,7 @@ int main(int argc, char** argv) {
         trainer.set_rollout_fn([](PPOTrainer& t) { t.collect_rollout_threadpool(); });
     } else {
         std::cerr << "unknown --strategy '" << strategy
-                  << "' (expected serial|coroutine|threadpool)\n";
+                  << "' (expected serial|threadpool)\n";
         return 1;
     }
     std::cout << "Rollout strategy: " << strategy << "\n";

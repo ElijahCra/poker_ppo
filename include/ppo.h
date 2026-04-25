@@ -129,7 +129,7 @@ private:
     std::unique_ptr<VectorizedEnv>      vec_env_;
     std::unique_ptr<RolloutBuffer>      buffer_;
 
-    // State carried between rollouts (CPU — consumed by the coroutine
+    // State carried between rollouts (CPU — consumed by the
     // scheduler, which does one batched transfer to device per inference).
     torch::Tensor carry_obs_;           // [num_envs, obs_dim]      float
     torch::Tensor carry_legal_mask_;    // [num_envs, action_count] float

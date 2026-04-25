@@ -125,6 +125,8 @@ public:
     /// Access individual envs (e.g. for current_player queries).
     IPokerEnvironment& env(int i) { return *envs_[i]; }
 
+    /// Raw access to the owning vector of envs
+    std::vector<std::unique_ptr<IPokerEnvironment>>& envs_mut() { return envs_; }
 
 private:
     std::vector<std::unique_ptr<IPokerEnvironment>> envs_;
