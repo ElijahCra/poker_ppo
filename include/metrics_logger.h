@@ -1,18 +1,23 @@
 #pragma once
 //
-//  metrics_logger.h — append per-update PPO metrics and per-snapshot Elo
-//  results to two CSVs inside a per-run directory.
+//  metrics_logger.h — append per-update PPO metrics and per-snapshot
+//  league-evaluation results to two CSVs inside a per-run directory.
 //
 //  The plot_live.py sidecar tails these files and re-renders matplotlib
 //  panels every couple of seconds, giving live training curves without
 //  pulling TensorBoard / wandb into the build.
 //
+//  league.csv is in *long* format (one row per (snapshot, anchor) pair)
+//  so anchors can be added or removed without changing the schema.
+//
 
+#include "league.h"
 #include "ppo.h"
 
 #include <fstream>
 #include <mutex>
 #include <string>
+#include <vector>
 
 namespace poker_ppo {
 
@@ -26,21 +31,19 @@ public:
     // High-frequency: one row per PPO update.
     void log_update(const PPOTrainer::UpdateStats& s);
 
-    // Sparse: one row per Elo evaluation snapshot.
-    void log_elo(int update, int global_step,
-                 float latest_rating,
-                 float vs_initial_winrate, float vs_initial_bbhand,
-                 float vs_uniform_winrate, float vs_uniform_bbhand);
+    // Sparse: one row per (snapshot, anchor) pair.  Long format, so adding a
+    // new anchor doesn't require a schema migration.
+    void log_league(int update, int global_step,
+                    const std::vector<League::MatchResult>& results);
 
     const std::string& run_dir() const { return run_dir_; }
 
 private:
     std::string   run_dir_;
     std::ofstream metrics_;
-    std::ofstream elo_;
-    // Elo logging fires from the elo_future thread; metric logging fires
-    // from the trainer thread. Serialise access so a partial-line interleave
-    // can't corrupt the file.
+    std::ofstream league_;
+    // Both CSVs may be written from different threads (e.g. background eval).
+    // Serialise so a partial-line interleave can't corrupt the file.
     std::mutex    mu_;
 };
 

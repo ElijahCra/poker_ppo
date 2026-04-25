@@ -4,10 +4,15 @@ Live-plot training metrics from a poker_ppo run directory.
 
 The C++ trainer appends rows to:
     <run_dir>/metrics.csv   — per-update PPO stats + wall timings
-    <run_dir>/elo.csv       — sparse, one row per Elo evaluation snapshot
+    <run_dir>/league.csv    — long-format, one row per (snapshot, anchor) pair
+                              with columns: update, global_step, anchor,
+                              num_hands, bb_per_hand, win_rate
 
 This script re-reads both files every REFRESH_SEC seconds and re-renders a
-3x3 grid of matplotlib panels. Close the figure window to exit.
+3x3 grid of matplotlib panels.  Panel 8 plots one bb/hand line per registered
+anchor (uniform, random_init, always_call, always_raise, pair_all_in, ...).
+
+Close the figure window to exit.
 
 Usage:
     python tools/plot_live.py runs/20260422_143012
@@ -106,7 +111,7 @@ def main() -> int:
         return 1
 
     metrics_path = os.path.join(run_dir, "metrics.csv")
-    elo_path     = os.path.join(run_dir, "elo.csv")
+    league_path  = os.path.join(run_dir, "league.csv")
 
     print(f"Watching {run_dir} (refresh {args.refresh:.1f}s — close window or Ctrl-C to stop)")
 
@@ -117,9 +122,22 @@ def main() -> int:
     except Exception:
         pass
 
+    # Stable, distinguishable colour per anchor across re-renders.  Anchors are
+    # discovered lazily: as the league.csv accumulates new anchor names, each
+    # gets the next colour in the matplotlib default cycle.
+    anchor_colors: dict[str, str] = {}
+    default_cycle = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+
+    def color_for(anchor: str) -> str:
+        if anchor not in anchor_colors:
+            anchor_colors[anchor] = default_cycle[
+                len(anchor_colors) % len(default_cycle)
+            ]
+        return anchor_colors[anchor]
+
     while plt.fignum_exists(fig.number):
         m = safe_read_csv(metrics_path)
-        e = safe_read_csv(elo_path)
+        l = safe_read_csv(league_path)
 
         for ax in axes.flat:
             ax.clear()
@@ -154,33 +172,39 @@ def main() -> int:
             axes.flat[7].set_title("Wall (ms / update)", fontsize=9)
             axes.flat[7].grid(alpha=0.3)
 
-        # Panel 8 (bottom-right): Elo + win-rates over time.
+        # Panel 8 (bottom-right): bb/hand vs each league anchor over time.
+        # league.csv is in long format — one row per (snapshot, anchor) pair —
+        # so we filter the trainer's "final" row (global_step = -1) and plot
+        # one line per anchor.
         ax = axes[2][2]
-        ax.set_title("Elo + match win-rates", fontsize=9)
+        ax.set_title("bb / hand vs anchors", fontsize=9)
         ax.set_xlabel("step", fontsize=8)
+        ax.set_ylabel("bb / hand (A's perspective)", fontsize=8)
         ax.grid(alpha=0.3)
         ax.tick_params(labelsize=7)
-        if not e.empty and "global_step" in e.columns:
-            ex = e["global_step"]
-            if "latest_rating" in e.columns:
-                ax.plot(ex, e["latest_rating"], "-o", lw=1.0, ms=3, label="elo")
-            ax.set_ylabel("elo", fontsize=8)
+        ax.axhline(0, color="black", lw=0.6, alpha=0.4)  # break-even reference
 
-            ax2 = ax.twinx()
-            if "vs_initial_winrate" in e.columns:
-                ax2.plot(ex, e["vs_initial_winrate"], "-s", color="tab:orange",
-                         lw=0.8, ms=2, label="vs init")
-            if "vs_uniform_winrate" in e.columns:
-                ax2.plot(ex, e["vs_uniform_winrate"], "-^", color="tab:green",
-                         lw=0.8, ms=2, label="vs unif")
-            ax2.set_ylim(0, 1)
-            ax2.set_ylabel("win rate", fontsize=8)
-            ax2.tick_params(labelsize=7)
-            ax.legend(fontsize=7, loc="upper left")
-            ax2.legend(fontsize=7, loc="lower right")
+        n_anchor_evals = 0
+        if (not l.empty
+                and {"global_step", "anchor", "bb_per_hand"}.issubset(l.columns)):
+            mid_run = l[l["global_step"] >= 0]
+            n_anchor_evals = len(mid_run)
+            for anchor_name, group in mid_run.sort_values("global_step").groupby("anchor"):
+                ax.plot(
+                    group["global_step"], group["bb_per_hand"],
+                    "-o", lw=1.0, ms=3,
+                    color=color_for(anchor_name),
+                    label=anchor_name,
+                )
+            if not mid_run.empty:
+                ax.legend(fontsize=7, loc="best", ncol=1, framealpha=0.85)
 
+        n_snapshots = (
+            l["global_step"].nunique() if (not l.empty and "global_step" in l.columns) else 0
+        )
         fig.suptitle(
-            f"{run_dir} — {len(m)} updates · {len(e)} elo evals",
+            f"{run_dir} — {len(m)} updates · {n_snapshots} league snapshots "
+            f"({n_anchor_evals} anchor evals)",
             fontsize=10,
         )
         fig.tight_layout(rect=(0, 0, 1, 0.96))

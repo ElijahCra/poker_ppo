@@ -113,6 +113,7 @@ struct StepResult {
 struct BetHistoryConfig {
     static constexpr int feat_per_action = 8;
 
+    bool enabled         = true; // master switch for the attention encoder
     int  max_history_len = 32;   // T — padded length of the action sequence
     int  attn_dim        = 64;   // D — token embedding & attention model dim
     int  attn_heads      = 4;    // H — multi-head attention heads (D % H == 0)
@@ -121,8 +122,11 @@ struct BetHistoryConfig {
 
     /// Total trailing block in the observation vector:
     ///   T (mask) + T * F (token features)   = T * (1 + F)
+    /// Returns 0 when the encoder is disabled — caller-side code that uses
+    /// this to size obs / split tensors then falls back to a "static-only"
+    /// layout automatically.
     [[nodiscard]] int history_block_dim() const {
-        return max_history_len * (1 + feat_per_action);
+        return enabled ? max_history_len * (1 + feat_per_action) : 0;
     }
 
     /// Convenience: full obs_dim given a static-feature width.

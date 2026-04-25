@@ -14,57 +14,65 @@ ActorCriticImpl::ActorCriticImpl(int obs_dim, int action_count,
                                  BetHistoryConfig hist)
     : hist_(hist)
 {
-    const int D = hist_.attn_dim;
-    const int H = hist_.attn_heads;
-    const int T = hist_.max_history_len;
-    const int F = BetHistoryConfig::feat_per_action;
-    const int FF = hist_.ffn_mult * D;
-
-    if (D <= 0 || H <= 0 || D % H != 0) {
-        throw std::invalid_argument(
-            "BetHistoryConfig: attn_dim must be a positive multiple of attn_heads");
-    }
     static_dim_ = obs_dim - hist_.history_block_dim();
     if (static_dim_ <= 0) {
         throw std::invalid_argument(
             "ActorCritic: obs_dim is smaller than the history block size");
     }
 
-    // ── attention encoder ───────────────────────────────────────────────
-    token_embed_ = register_module("token_embed", torch::nn::Linear(F, D));
+    // ── attention encoder (only when enabled) ───────────────────────────
+    // When disabled, the trunk takes the obs directly (no attention pool
+    // appended) and zero attention parameters are allocated.
+    int trunk_in_dim = static_dim_;
 
-    cls_token_ = register_parameter("cls_token", torch::zeros({1, 1, D}));
-    pos_embed_ = register_parameter("pos_embed", torch::zeros({1, T + 1, D}));
-    torch::nn::init::normal_(cls_token_, /*mean=*/0.0, /*std=*/0.02);
-    torch::nn::init::normal_(pos_embed_, /*mean=*/0.0, /*std=*/0.02);
+    if (hist_.enabled) {
+        const int D  = hist_.attn_dim;
+        const int H  = hist_.attn_heads;
+        const int T  = hist_.max_history_len;
+        const int F  = BetHistoryConfig::feat_per_action;
+        const int FF = hist_.ffn_mult * D;
 
-    attn_ln_.reserve(hist_.num_blocks);
-    qkv_proj_.reserve(hist_.num_blocks);
-    out_proj_.reserve(hist_.num_blocks);
-    ffn_ln_.reserve(hist_.num_blocks);
-    ffn1_.reserve(hist_.num_blocks);
-    ffn2_.reserve(hist_.num_blocks);
-    for (int b = 0; b < hist_.num_blocks; ++b) {
-        const std::string s = std::to_string(b);
-        attn_ln_.push_back(register_module(
-            "attn_ln_" + s, torch::nn::LayerNorm(torch::nn::LayerNormOptions({D}))));
-        qkv_proj_.push_back(register_module(
-            "qkv_proj_" + s, torch::nn::Linear(D, 3 * D)));
-        out_proj_.push_back(register_module(
-            "out_proj_" + s, torch::nn::Linear(D, D)));
-        ffn_ln_.push_back(register_module(
-            "ffn_ln_" + s, torch::nn::LayerNorm(torch::nn::LayerNormOptions({D}))));
-        ffn1_.push_back(register_module(
-            "ffn1_" + s, torch::nn::Linear(D, FF)));
-        ffn2_.push_back(register_module(
-            "ffn2_" + s, torch::nn::Linear(FF, D)));
+        if (D <= 0 || H <= 0 || D % H != 0) {
+            throw std::invalid_argument(
+                "BetHistoryConfig: attn_dim must be a positive multiple of attn_heads");
+        }
+
+        token_embed_ = register_module("token_embed", torch::nn::Linear(F, D));
+
+        cls_token_ = register_parameter("cls_token", torch::zeros({1, 1, D}));
+        pos_embed_ = register_parameter("pos_embed", torch::zeros({1, T + 1, D}));
+        torch::nn::init::normal_(cls_token_, /*mean=*/0.0, /*std=*/0.02);
+        torch::nn::init::normal_(pos_embed_, /*mean=*/0.0, /*std=*/0.02);
+
+        attn_ln_.reserve(hist_.num_blocks);
+        qkv_proj_.reserve(hist_.num_blocks);
+        out_proj_.reserve(hist_.num_blocks);
+        ffn_ln_.reserve(hist_.num_blocks);
+        ffn1_.reserve(hist_.num_blocks);
+        ffn2_.reserve(hist_.num_blocks);
+        for (int b = 0; b < hist_.num_blocks; ++b) {
+            const std::string s = std::to_string(b);
+            attn_ln_.push_back(register_module(
+                "attn_ln_" + s, torch::nn::LayerNorm(torch::nn::LayerNormOptions({D}))));
+            qkv_proj_.push_back(register_module(
+                "qkv_proj_" + s, torch::nn::Linear(D, 3 * D)));
+            out_proj_.push_back(register_module(
+                "out_proj_" + s, torch::nn::Linear(D, D)));
+            ffn_ln_.push_back(register_module(
+                "ffn_ln_" + s, torch::nn::LayerNorm(torch::nn::LayerNormOptions({D}))));
+            ffn1_.push_back(register_module(
+                "ffn1_" + s, torch::nn::Linear(D, FF)));
+            ffn2_.push_back(register_module(
+                "ffn2_" + s, torch::nn::Linear(FF, D)));
+        }
+
+        trunk_in_dim = static_dim_ + D;
     }
 
     // ── shared MLP trunk ────────────────────────────────────────────────
-    // The attention pool (D dims) is concatenated with the static features
-    // (S dims) before entering the trunk.
+    // Input width is static_dim (encoder off) or static_dim + D (encoder on).
     torch::nn::Sequential trunk;
-    int in_dim = static_dim_ + D;
+    int in_dim = trunk_in_dim;
     for (int i = 0; i < num_layers; ++i) {
         trunk->push_back(torch::nn::Linear(in_dim, hidden_dim));
         trunk->push_back(torch::nn::Tanh());
@@ -90,16 +98,18 @@ ActorCriticImpl::ActorCriticImpl(int obs_dim, int action_count,
     torch::nn::init::orthogonal_(critic_head_->weight, 1.0);
     torch::nn::init::constant_(critic_head_->bias, 0.0);
 
-    auto xavier_lin = [](torch::nn::Linear& lin) {
-        torch::nn::init::xavier_uniform_(lin->weight);
-        torch::nn::init::constant_(lin->bias, 0.0);
-    };
-    xavier_lin(token_embed_);
-    for (int b = 0; b < hist_.num_blocks; ++b) {
-        xavier_lin(qkv_proj_[b]);
-        xavier_lin(out_proj_[b]);
-        xavier_lin(ffn1_[b]);
-        xavier_lin(ffn2_[b]);
+    if (hist_.enabled) {
+        auto xavier_lin = [](torch::nn::Linear& lin) {
+            torch::nn::init::xavier_uniform_(lin->weight);
+            torch::nn::init::constant_(lin->bias, 0.0);
+        };
+        xavier_lin(token_embed_);
+        for (int b = 0; b < hist_.num_blocks; ++b) {
+            xavier_lin(qkv_proj_[b]);
+            xavier_lin(out_proj_[b]);
+            xavier_lin(ffn1_[b]);
+            xavier_lin(ffn2_[b]);
+        }
     }
 }
 
@@ -171,13 +181,19 @@ ActorCriticImpl::encode_history(const torch::Tensor& history_block) {
 // ─────────────────────────────────────────────────────────────────────────────
 std::pair<torch::Tensor, torch::Tensor>
 ActorCriticImpl::forward(torch::Tensor obs) {
-    // Split obs into [B, S] static and [B, T*(1+F)] history.
-    auto static_feats = obs.narrow(/*dim=*/1, /*start=*/0, /*length=*/static_dim_);
-    auto history_blk  = obs.narrow(/*dim=*/1, static_dim_, hist_.history_block_dim());
-
-    auto hist_pool = encode_history(history_blk);                      // [B, D]
-    auto features  = trunk_->forward(
-        torch::cat({static_feats, hist_pool}, /*dim=*/-1));            // [B, hidden]
+    torch::Tensor features;
+    if (hist_.enabled) {
+        // Split obs into [B, S] static and [B, T*(1+F)] history.
+        auto static_feats = obs.narrow(/*dim=*/1, /*start=*/0, /*length=*/static_dim_);
+        auto history_blk  = obs.narrow(/*dim=*/1, static_dim_,
+                                       hist_.history_block_dim());
+        auto hist_pool    = encode_history(history_blk);               // [B, D]
+        features = trunk_->forward(
+            torch::cat({static_feats, hist_pool}, /*dim=*/-1));        // [B, hidden]
+    } else {
+        // Encoder disabled: obs is already just the static features.
+        features = trunk_->forward(obs);
+    }
 
     auto logits = actor_head_->forward(features);
     auto value  = critic_head_->forward(features).squeeze(-1);

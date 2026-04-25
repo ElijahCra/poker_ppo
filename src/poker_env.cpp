@@ -231,9 +231,12 @@ torch::Tensor PokerEnvironment::compute_observation() const {
 
     a[off++] = static_cast<float>(me);
 
-    // Bet-history block: [T mask] + [T × F token features].
-    off = write_history_block(a, off, me);
-    (void)off;  // off is now obs_dim_.
+    // Bet-history block: [T mask] + [T × F token features].  Only emitted
+    // when the attention encoder is enabled — otherwise the obs ends here.
+    if (hist_cfg_.enabled) {
+        off = write_history_block(a, off, me);
+    }
+    (void)off;
 
     return obs;
 }

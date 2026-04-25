@@ -8,16 +8,15 @@
 //  Everything else (hyperparams, bet slots) is set inline below; the
 //  sweep harness will replace this with a richer config loader later.
 
-#include "elo_league.h"
+#include "league.h"
 #include "metrics_logger.h"
 #include "ppo.h"
 #include "poker_env.h"
 #include "GameConfig.hpp"
 
-#include <future>
+#include <chrono>
 #include <iomanip>
 #include <iostream>
-#include <mutex>
 #include <string>
 #include <string_view>
 
@@ -89,8 +88,10 @@ int main(int argc, char** argv) {
     //   ./poker_ppo --scaling N1,N2,N3,... [iters]    → scaling sweep
     //   ./poker_ppo <variant> --scaling 8,16,32 [iters]
     //   ./poker_ppo --strategy {serial|threadpool}  (training mode)
+    //   ./poker_ppo --no-attention                  → disable bet-history encoder
     bool             benchmark_mode  = false;
     bool             scaling_mode    = false;
+    bool             use_attention   = true;
     int              benchmark_iters = 20;
     std::vector<int> env_counts;
     std::string      variant         = "nlhe_full_52";
@@ -131,6 +132,10 @@ int main(int argc, char** argv) {
             }
         } else if (a == "--strategy") {
             if (i + 1 < argc) { strategy = argv[i + 1]; ++i; }
+        } else if (a == "--no-attention") {
+            use_attention = false;
+        } else if (a == "--attention") {
+            use_attention = true;
         } else {
             variant = std::string(a);
         }
@@ -177,6 +182,7 @@ int main(int argc, char** argv) {
     // T = max actions per hand the encoder sees (older actions are dropped).
     // 32 comfortably covers heads-up NLHE: 4 rounds × 4 raises × 2 players
     // = 32 raise slots, plus call/check fillers — truncation is rare.
+    ppo_cfg.hist.enabled         = false;   // --no-attention to disable
     ppo_cfg.hist.max_history_len = 32;
     ppo_cfg.hist.attn_dim        = 64;
     ppo_cfg.hist.attn_heads      = 4;
@@ -184,13 +190,16 @@ int main(int argc, char** argv) {
     ppo_cfg.hist.num_blocks      = 1;
     // Env must use the same layout so obs_dim aligns with the network split.
     poker_cfg.hist = ppo_cfg.hist;
+    std::cout << "Bet-history attention encoder: "
+              << (ppo_cfg.hist.enabled ? "ON" : "OFF") << "\n";
 
     // ── Trainer ─────────────────────────────────────────────────────────
     // CPU beats CUDA for this config (3x256 MLP @ batch=32): kernel-launch
     // overhead dominates compute on such a small network. Revisit if you
     // scale the network up (hidden_dim ≥ 512) or num_envs (≥ 128).
     torch::Device device = torch::cuda::is_available() ? torch::kCUDA : torch::mps::is_available() ? torch::kMPS : torch::kCPU;
-    std::cout << "Using device: CPU\n";
+    //torch::Device device = torch::kCPU;
+    std::cout << "Using device: "<<device<<"\n";
 
     PokerEnvironmentFactory factory(poker_cfg);
 
@@ -225,9 +234,9 @@ int main(int argc, char** argv) {
     }
     std::cout << "Rollout strategy: " << strategy << "\n";
 
-    // ── Elo league ──────────────────────────────────────────────────────
+    // ── League (anchor-relative bb/hand tracking) ──────────────────────
     // Query obs_dim and action_count from a throw-away env instance so the
-    // league's snapshot networks match the trainer's network architecture.
+    // league's helper networks match the trainer's network architecture.
     int obs_dim;
     int action_count;
     {
@@ -236,47 +245,31 @@ int main(int argc, char** argv) {
         action_count = tmp->bet_config().action_count();
     }
 
-    EloLeague::Config elo_cfg;
-    elo_cfg.num_hands_per_match = 1000;
-    elo_cfg.num_parallel_envs   = 32;
-    elo_cfg.k_factor            = 32.0f;
-    elo_cfg.initial_rating      = 1200.0f;
-    elo_cfg.max_checkpoints     = 15;
+    League::Config league_cfg;
+    league_cfg.num_hands_per_match = 1000;
+    league_cfg.num_parallel_envs   = 32;
+    // reward_norm in poker_env is 10 * big_blind; one scaled-reward unit thus
+    // corresponds to 10 BB.  Keep this in sync if you change the env's scale.
+    league_cfg.bb_per_unit_reward  = 10.0f;
 
-    EloLeague league(factory, bet_cfg,
-                     obs_dim,
-                     action_count,
-                     ppo_cfg.hidden_dim,
-                     ppo_cfg.num_layers,
-                     ppo_cfg.hist,
-                     elo_cfg,
-                     device);
+    League league(factory, bet_cfg,
+                  obs_dim,
+                  action_count,
+                  ppo_cfg.hidden_dim,
+                  ppo_cfg.num_layers,
+                  ppo_cfg.hist,
+                  league_cfg,
+                  device);
 
-    // Anchor the untrained network at 1200 — every later rating reads as
-    // "how much stronger than the initial random network".
-    league.add_checkpoint(trainer.network(), 0, 0, "initial");
-    league.set_anchor(0, 1200.0f);
+    // Five default anchors: uniform, random_init, always_call, always_raise,
+    // pair_caller.  See league.h for the policy of each.
+    league.add_default_anchors();
+    std::cout << "League anchors:";
+    for (const auto& a : league.anchors()) std::cout << "  " << a->name();
+    std::cout << "\n";
 
-    // Second anchor: a *true* uniform-over-legal-actions baseline.  Built by
-    // zeroing the actor head so logits are constant → softmax over the legal
-    // mask is uniform.  Guards against "1200 → 1200 looks healthy because
-    // both checkpoints are equally bad" — any real progress should beat both.
-    {
-        ActorCritic uniform(obs_dim, action_count,
-                            ppo_cfg.hidden_dim, ppo_cfg.num_layers,
-                            ppo_cfg.hist);
-        torch::NoGradGuard ng;
-        for (auto& kv : uniform->named_parameters()) {
-            if (kv.key().find("actor_head") != std::string::npos) {
-                kv.value().zero_();
-            }
-        }
-        const int uniform_idx =
-            league.add_checkpoint(uniform, 0, 0, "uniform");
-        league.set_anchor(uniform_idx, 1200.0f);
-    }
-
-    // How often to snapshot a checkpoint and play it against the pool.
+    // How often to evaluate against the anchors (synchronous so it doesn't
+    // contend with rollout/update wall-clock).
     constexpr int snapshot_every = 200;   // updates
 
     // Action labels for the histogram printout.
@@ -296,19 +289,11 @@ int main(int argc, char** argv) {
               << "  (live plots: `python tools/plot_live.py "
               << metrics.run_dir() << "`)\n";
 
-    // Elo evaluation runs in a background thread so it never stalls training.
-    // We hold at most one evaluation future at a time; the next snapshot waits
-    // for it only if the previous one hasn't finished yet (which is rare given
-    // snapshot_every=200 updates and evaluations taking a few seconds).
-    std::future<void> elo_future;
-    std::mutex        print_mutex;  // keep training + elo output from interleaving
-
     trainer.set_log_callback([&](const PPOTrainer::UpdateStats& s) {
         // Per-update CSV row (cheap; cb fires once per update).
         metrics.log_update(s);
 
         if (s.update % 10 == 0) {
-            std::lock_guard<std::mutex> lk(print_mutex);
             std::cout << "update=" << s.update
                       << "  step="   << s.global_step
                       << "  pg="     << s.policy_loss
@@ -321,59 +306,54 @@ int main(int argc, char** argv) {
                       << "\n";
         }
 
-        // Snapshot and evaluate periodically.
+        // Synchronous evaluation every `snapshot_every` updates.  Synchronous
+        // (rather than async) so the league's wall-clock cost is *not* added
+        // to the next rollout/update timing — it shows up only as the gap
+        // between consecutive [update K] log lines.
         if (s.update > 0 && s.update % snapshot_every == 0) {
-            // Wait for any still-running evaluation before touching the league.
-            if (elo_future.valid()) elo_future.wait();
+            using clock = std::chrono::steady_clock;
+            using ms    = std::chrono::duration<double, std::milli>;
 
-            // add_checkpoint is a deep copy — safe to do on the training thread.
-            const std::string label = "u" + std::to_string(s.update);
-            const int latest_idx = league.add_checkpoint(
-                trainer.network(), s.update, s.global_step, label);
+            auto t_eval0 = clock::now();
+            auto results = league.evaluate(trainer.network());
+            const double eval_ms = ms(clock::now() - t_eval0).count();
 
-            // Fire the rest off in the background — training resumes immediately.
-            elo_future = std::async(std::launch::async,
-                [&, latest_idx, update = s.update, step = s.global_step]() {
-                    league.evaluate_latest();
+            metrics.log_league(s.update, s.global_step, results);
 
-                    auto vs_initial = league.play_match(latest_idx, 0);
-                    auto vs_uniform = league.play_match(latest_idx, 1);
+            std::cout << "\n[league eval @ update " << s.update
+                      << "  duration=" << eval_ms << "ms]\n";
+            league.print_results(results);
 
-                    // Persist Elo + match summary to runs/<...>/elo.csv.
-                    const float latest_rating =
-                        league.checkpoints()[latest_idx].rating;
-                    metrics.log_elo(update, step, latest_rating,
-                                    vs_initial.win_rate_a,
-                                    vs_initial.avg_reward_a * 10.0f,
-                                    vs_uniform.win_rate_a,
-                                    vs_uniform.avg_reward_a * 10.0f);
-
-                    // Mode-collapse diagnostic: action histogram from uniform match.
+            // Action mix (vs uniform anchor — first registered) for visual
+            // mode-collapse check.
+            if (!results.empty()) {
+                int uniform_idx = -1;
+                for (size_t i = 0; i < results.size(); ++i) {
+                    if (results[i].anchor_name == "uniform") {
+                        uniform_idx = static_cast<int>(i);
+                        break;
+                    }
+                }
+                if (uniform_idx >= 0) {
+                    const auto& vs_u = results[uniform_idx];
                     int64_t total = 0;
-                    for (auto c : vs_uniform.action_counts_a) total += c;
-
-                    std::lock_guard<std::mutex> lk(print_mutex);
-                    std::cout << "\n[Elo standings after update " << update << "]\n";
-                    league.print_standings();
-                    std::cout << std::fixed << std::setprecision(3)
-                              << "  vs initial:  win=" << vs_initial.win_rate_a
-                              << "  bb/hand=" << (vs_initial.avg_reward_a * 10.0f) << "\n"
-                              << "  vs uniform:  win=" << vs_uniform.win_rate_a
-                              << "  bb/hand=" << (vs_uniform.avg_reward_a * 10.0f) << "\n";
-                    std::cout << "  action mix (vs uniform):";
+                    for (auto c : vs_u.action_counts_a) total += c;
                     if (total > 0) {
-                        std::cout << std::setprecision(1);
-                        for (size_t a = 0; a < vs_uniform.action_counts_a.size(); ++a) {
+                        std::cout << "  action mix (vs uniform):"
+                                  << std::fixed << std::setprecision(1);
+                        for (size_t a = 0; a < vs_u.action_counts_a.size(); ++a) {
                             const float pct = 100.0f
-                                * static_cast<float>(vs_uniform.action_counts_a[a])
+                                * static_cast<float>(vs_u.action_counts_a[a])
                                 / static_cast<float>(total);
                             std::cout << "  " << action_label(static_cast<int>(a))
                                       << "=" << pct << "%";
                         }
+                        std::cout.unsetf(std::ios::fixed);
+                        std::cout << "\n";
                     }
-                    std::cout.unsetf(std::ios::fixed);
-                    std::cout << "\n\n";
-                });
+                }
+            }
+            std::cout << "\n";
         }
     });
 
@@ -382,14 +362,11 @@ int main(int argc, char** argv) {
 
     trainer.train();
 
-    // Drain any background Elo evaluation before the final tournament.
-    if (elo_future.valid()) elo_future.wait();
-
-    // Final full round-robin for a sharper read-out at the end.
-    std::cout << "\nRunning final round-robin tournament...\n";
-    league.run_tournament();
-    std::cout << "\n[Final Elo league standings]\n";
-    league.print_standings();
+    // Final evaluation on the trained network.
+    std::cout << "\nFinal league evaluation...\n";
+    auto final_results = league.evaluate(trainer.network());
+    metrics.log_league(/*update=*/-1, /*step=*/-1, final_results);
+    league.print_results(final_results);
 
     const std::string model_path = "poker_ppo_model_" + poker_cfg.game.name + ".pt";
     trainer.save(model_path);

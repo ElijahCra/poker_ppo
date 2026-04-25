@@ -12,17 +12,16 @@ MetricsLogger::MetricsLogger(const std::string& run_dir) : run_dir_(run_dir) {
     std::filesystem::create_directories(run_dir_);
 
     metrics_.open(run_dir_ + "/metrics.csv");
-    elo_    .open(run_dir_ + "/elo.csv");
+    league_ .open(run_dir_ + "/league.csv");
 
     metrics_ << "update,global_step,policy_loss,value_loss,entropy,"
                 "approx_kl,clip_fraction,explained_variance,learning_rate,"
                 "rollout_ms,update_ms\n";
     metrics_.flush();
 
-    elo_     << "update,global_step,latest_rating,"
-                "vs_initial_winrate,vs_initial_bbhand,"
-                "vs_uniform_winrate,vs_uniform_bbhand\n";
-    elo_.flush();
+    // Long format: one row per (snapshot, anchor) pair.  pivot in plot_live.
+    league_ << "update,global_step,anchor,num_hands,bb_per_hand,win_rate\n";
+    league_.flush();
 }
 
 MetricsLogger::~MetricsLogger() = default;
@@ -38,15 +37,16 @@ void MetricsLogger::log_update(const PPOTrainer::UpdateStats& s) {
     metrics_.flush();
 }
 
-void MetricsLogger::log_elo(int update, int global_step,
-                            float latest_rating,
-                            float vs_initial_winrate, float vs_initial_bbhand,
-                            float vs_uniform_winrate, float vs_uniform_bbhand) {
+void MetricsLogger::log_league(int update, int global_step,
+                               const std::vector<League::MatchResult>& results) {
     std::lock_guard<std::mutex> lk(mu_);
-    elo_ << update << ',' << global_step << ',' << latest_rating << ','
-         << vs_initial_winrate << ',' << vs_initial_bbhand << ','
-         << vs_uniform_winrate << ',' << vs_uniform_bbhand << '\n';
-    elo_.flush();
+    for (const auto& r : results) {
+        league_ << update << ',' << global_step << ','
+                << r.anchor_name << ','
+                << r.num_hands << ',' << r.bb_per_hand_a << ','
+                << r.win_rate_a << '\n';
+    }
+    league_.flush();
 }
 
 std::string make_run_dir() {
