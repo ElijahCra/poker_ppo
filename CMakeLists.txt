@@ -38,7 +38,7 @@ add_library(poker_ppo_lib
     src/network.cpp
     src/ppo.cpp
     src/rollout_buffer.cpp
-    src/qfr_env.cpp
+    src/poker_env.cpp
     src/elo_league.cpp
     src/metrics_logger.cpp
 )

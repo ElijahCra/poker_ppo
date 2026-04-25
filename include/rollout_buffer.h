@@ -10,7 +10,7 @@ namespace poker_ppo {
 // RolloutBuffer  — per-player rollout storage for alternating self-play
 // ─────────────────────────────────────────────────────────────────────────────
 //
-// Faithful to OpenSpiel PPO (Timbers et al., App. G.5): every env transition
+// every env transition
 // is pushed into the buffer for the player who acted at that step, and each
 // (player, env) trajectory has vanilla GAE computed on it independently.
 //

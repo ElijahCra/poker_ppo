@@ -2,8 +2,8 @@
 // Created by Elijah Crain on 12/31/25.
 //
 
-#ifndef QFR_PLAYERDATA_HPP
-#define QFR_PLAYERDATA_HPP
+#ifndef POKER_PLAYERDATA_HPP
+#define POKER_PLAYERDATA_HPP
 
 namespace Game {
 
@@ -60,4 +60,4 @@ struct PlayerData {
 
 }
 
-#endif //QFR_PLAYERDATA_HPP
+#endif //POKER_PLAYERDATA_HPP

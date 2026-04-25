@@ -13,30 +13,30 @@
 namespace poker_ppo {
 
 // ─────────────────────────────────────────────────────────────────────────────
-// QFR environment adapter
+// Poker environment adapter
 // ─────────────────────────────────────────────────────────────────────────────
 //
-// Wraps Game::DiscreteGame (heads-up no-limit hold'em from the QFR project) in
+// Wraps Game::DiscreteGame (heads-up no-limit hold'em from the Poker project) in
 // the IPokerEnvironment interface used by PPO.
 //
 // Action space (indices into the PPO policy's categorical):
 //   0                       → Fold
 //   1                       → Check or Call (whichever is legal)
-//   2 .. 1+K                → K pot-fraction raises defined in QFRConfig
+//   2 .. 1+K                → K pot-fraction raises defined in PokerConfig
 //   2+K  (if allow_all_in)  → All-in raise (only exposed when distinct)
 //
 // The adapter auto-advances through ChanceState transitions (which in the
-// QFR implementation just flip the round marker; all cards are dealt at hand
+// Poker implementation just flip the round marker; all cards are dealt at hand
 // start).  PPO therefore only ever sees ActionState or terminal snapshots.
 //
 // Reward: the terminal reward is the utility delta for seat 0 (in "mbb" /
-// millibigblinds as stored by QFR), normalised by INITIAL_STACK so it sits in
+// millibigblinds as stored by Poker), normalised by INITIAL_STACK so it sits in
 // a reasonable range for the critic.  PPO handles the sign-flip for seat 1.
 
 // Wraps a Game::GameConfig (the poker variant) plus PPO-side knobs.
 // All poker-rule tuning lives in `game`; only per-run seeding and adapter
-// flags belong on QFRConfig itself.
-struct QFRConfig {
+// flags belong on PokerConfig itself.
+struct PokerConfig {
     ::Game::GameConfig game{};    // deck, stacks, blinds, betting structure
     BetHistoryConfig   hist{};    // attention-encoder layout (T, F, ...)
 
@@ -47,9 +47,9 @@ struct QFRConfig {
     [[nodiscard]] int action_count()    const { return game.action_count(); }
 };
 
-class QFRPokerEnvironment : public IPokerEnvironment {
+class PokerEnvironment : public IPokerEnvironment {
 public:
-    QFRPokerEnvironment(const QFRConfig& qfr_cfg,
+    PokerEnvironment(const PokerConfig& poker_cfg,
                         const BetConfig& bet_cfg,
                         uint64_t seed);
 
@@ -86,7 +86,7 @@ private:
     int write_history_block(torch::TensorAccessor<float, 1>& a, int dst_off,
                             int current_player) const;
 
-    QFRConfig qfr_cfg_;
+    PokerConfig poker_cfg_;
     BetConfig bet_cfg_;
     BetHistoryConfig hist_cfg_;
     std::mt19937 rng_;
@@ -102,21 +102,21 @@ private:
     float reward_norm_ = 1.0f;   // = 10 * big_blind; terminal-reward scaling
     int   max_raises_norm_ = 4;  // = game.max_raises_per_round (>=1 guarded)
 
-    // PPO-action-index → QFR Action, or nullopt if illegal this state.
+    // PPO-action-index → Poker Action, or nullopt if illegal this state.
     std::vector<std::optional<::Game::Action>> action_table_;
 
     // Hand-level bet history (cleared on reset, appended in step).
     std::vector<HistEntry> bet_history_;
 };
 
-class QFRPokerEnvironmentFactory : public IPokerEnvironmentFactory {
+class PokerEnvironmentFactory : public IPokerEnvironmentFactory {
 public:
-    explicit QFRPokerEnvironmentFactory(QFRConfig qfr_cfg);
+    explicit PokerEnvironmentFactory(PokerConfig poker_cfg);
 
     std::unique_ptr<IPokerEnvironment> create(const BetConfig& cfg) override;
 
 private:
-    QFRConfig qfr_cfg_;
+    PokerConfig poker_cfg_;
     std::atomic<uint64_t> instance_counter_{0};
 };
 

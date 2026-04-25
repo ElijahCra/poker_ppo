@@ -63,7 +63,6 @@ public:
 
     /// Run the full training loop.
     /// Uses the rollout function set via set_rollout_fn(); defaults to the
-    /// coroutine + worker-pool implementation if none has been set.
     void train();
 
     /// Choose the rollout strategy used by train().
@@ -75,7 +74,6 @@ public:
     // one rollout. They are public so they can be wired into set_rollout_fn,
     // benchmarked, or invoked manually.
     void collect_rollout_serial();      // single-thread loop, matches b601e0e
-    void collect_rollout_coroutine();   // coroutine + worker-pool scheduler
     void collect_rollout_threadpool();  // persistent thread pool, batched fwd
 
     /// Aggregate rollout-time stats for one strategy.
@@ -87,7 +85,7 @@ public:
         int samples;        // num_envs × num_steps
         // Ordered list of (strategy_name, stats). Order matches input order
         // for benchmark_strategies(); for benchmark_rollouts() the order is
-        // serial → coroutine → threadpool.
+        // serial -> threadpool.
         std::vector<std::pair<std::string, Stats>> by_strategy;
 
         const Stats* find(const std::string& name) const {
@@ -96,7 +94,7 @@ public:
         }
     };
 
-    /// A/B-time the three built-in strategies (serial, coroutine, threadpool).
+    /// A/B-time the three built-in strategies (serial, threadpool).
     /// Iterations are interleaved per round so each strategy faces a similar
     /// env distribution. Does not call update() — measures rollout only.
     BenchmarkResult benchmark_rollouts(int iters = 20, int warmup = 3,

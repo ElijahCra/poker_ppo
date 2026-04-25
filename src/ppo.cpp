@@ -1,5 +1,4 @@
 #include "ppo.h"
-#include "rollout_coro.h"
 #include "rollout_pool.h"
 #include <iostream>
 #include <iomanip>
@@ -170,69 +169,6 @@ void PPOTrainer::train() {
                       << "  rollout=" << stats.rollout_ms << "ms"
                       << "  update=" << stats.update_ms << "ms\n";
         }
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-void PPOTrainer::collect_rollout_coroutine() {
-    network_->eval();
-    torch::NoGradGuard no_grad;
-
-    using clock = std::chrono::steady_clock;
-    using ms    = std::chrono::duration<double, std::milli>;
-
-    buffer_->clear();
-
-    // Acquire the owning vector of envs from VectorizedEnv.
-    auto& envs = vec_env_->envs_mut();
-
-    // Batch-inference tuning. min_batch ≤ num_envs so the processor fires
-    // even when not every coroutine has submitted yet; max_wait caps latency
-    // for the tail end of a step.
-    const std::size_t min_batch =
-        std::max<std::size_t>(1, static_cast<std::size_t>(cfg_.num_envs) );
-    const auto max_wait = std::chrono::microseconds(500);
-
-    // Worker pool: each owns a shard of envs and resumes their coroutines
-    // in parallel. Overprovisioning past ~num_envs buys nothing (at most
-    // one coro per env can be ready at a time on a given shard).
-    const int num_workers = std::min(cfg_.num_envs, 4);
-
-    auto t0 = clock::now();
-
-    RolloutScheduler scheduler(
-        network_, device_,
-        envs,
-        *buffer_,
-        cfg_.num_steps,
-        vec_env_->obs_dim(),
-        vec_env_->action_count(),
-        carry_obs_, carry_legal_mask_, carry_current_player_, carry_done_,
-        min_batch, max_wait,
-        num_workers);
-
-    scheduler.run();
-
-    auto t1 = clock::now();
-
-    buffer_->compute_returns(cfg_.gamma, cfg_.gae_lambda);
-
-    auto t2 = clock::now();
-
-    global_step_ += cfg_.num_envs * cfg_.num_steps;
-
-    if (update_idx_ % 10 == 0) {
-        const double fwd_ms  = scheduler.forward_ns() / 1e6;
-        const int    W       = scheduler.num_workers();
-        const double wait_ms = (W > 0)
-            ? (scheduler.worker_wait_ns() / 1e6) / static_cast<double>(W)
-            : 0.0;
-        std::cout << "  rollout breakdown:"
-                  << " coro_run=" << ms(t1 - t0).count() << "ms"
-                  << " gae=" << ms(t2 - t1).count() << "ms"
-                  << "  forward=" << fwd_ms << "ms"
-                  << "  worker_wait_avg=" << wait_ms << "ms"
-                  << " (W=" << W << ")\n";
     }
 }
 
@@ -461,7 +397,6 @@ PPOTrainer::benchmark_strategies(
 
     init_carry_state();
 
-    // Suppress per-rollout breakdown logging from collect_rollout_coroutine.
     const int saved_update_idx = update_idx_;
     update_idx_ = 1;  // not a multiple of 10
 
@@ -546,7 +481,6 @@ PPOTrainer::BenchmarkResult
 PPOTrainer::benchmark_rollouts(int iters, int warmup, bool verbose) {
     return benchmark_strategies({
         {"serial",     [](PPOTrainer& t) { t.collect_rollout_serial();     }},
-        {"coroutine",  [](PPOTrainer& t) { t.collect_rollout_coroutine();  }},
         {"threadpool", [](PPOTrainer& t) { t.collect_rollout_threadpool(); }},
     }, iters, warmup, verbose);
 }

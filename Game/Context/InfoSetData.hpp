@@ -2,8 +2,8 @@
 // Created by Elijah Crain on 12/31/25.
 //
 
-#ifndef QFR_INFOSETDATA_HPP
-#define QFR_INFOSETDATA_HPP
+#ifndef POKER_INFOSETDATA_HPP
+#define POKER_INFOSETDATA_HPP
 #include "HashUtil.hpp"
 
 namespace Game {
@@ -100,4 +100,4 @@ struct InfoSetData {
 };
 }
 
-#endif //QFR_INFOSETDATA_HPP
+#endif //POKER_INFOSETDATA_HPP

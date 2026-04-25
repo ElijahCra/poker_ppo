@@ -2,8 +2,8 @@
 // Created by Elijah Crain on 12/31/25.
 //
 
-#ifndef QFR_ROUNDDATA_HPP
-#define QFR_ROUNDDATA_HPP
+#ifndef POKER_ROUNDDATA_HPP
+#define POKER_ROUNDDATA_HPP
 
 #include "../GameState.hpp"
 
@@ -30,4 +30,4 @@ struct RoundData {
 };
 }
 
-#endif //QFR_ROUNDDATA_HPP
+#endif //POKER_ROUNDDATA_HPP

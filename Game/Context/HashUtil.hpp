@@ -2,8 +2,8 @@
 // Created by Elijah Crain on 12/31/25.
 //
 
-#ifndef QFR_HASHUTIL_HPP
-#define QFR_HASHUTIL_HPP
+#ifndef POKER_HASHUTIL_HPP
+#define POKER_HASHUTIL_HPP
 #include <cstdint>
 #include <cstring>
 
@@ -26,4 +26,4 @@ inline uint64_t floatBits(float f) {
 }
 }  // namespace HashUtil
 
-#endif //QFR_HASHUTIL_HPP
+#endif //POKER_HASHUTIL_HPP

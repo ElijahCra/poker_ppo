@@ -1,4 +1,4 @@
-//  main.cpp — PPO self-play training on the QFR heads-up NLHE engine,
+//  main.cpp — PPO self-play training on the Poker heads-up NLHE engine,
 //  with an Elo league for progress tracking.
 //
 //  First arg (optional) selects a named game variant:
@@ -11,7 +11,7 @@
 #include "elo_league.h"
 #include "metrics_logger.h"
 #include "ppo.h"
-#include "qfr_env.h"
+#include "poker_env.h"
 #include "GameConfig.hpp"
 
 #include <future>
@@ -88,13 +88,13 @@ int main(int argc, char** argv) {
     //   ./poker_ppo <variant> --benchmark [iters]
     //   ./poker_ppo --scaling N1,N2,N3,... [iters]    → scaling sweep
     //   ./poker_ppo <variant> --scaling 8,16,32 [iters]
-    //   ./poker_ppo --strategy {serial|coroutine|threadpool}  (training mode)
+    //   ./poker_ppo --strategy {serial|threadpool}  (training mode)
     bool             benchmark_mode  = false;
     bool             scaling_mode    = false;
     int              benchmark_iters = 20;
     std::vector<int> env_counts;
     std::string      variant         = "nlhe_full_52";
-    std::string      strategy        = "coroutine";  // default training rollout
+    std::string      strategy        = "threadpool";  // default training rollout
 
     auto parse_int_list = [](std::string_view s) {
         std::vector<int> out;
@@ -141,19 +141,19 @@ int main(int argc, char** argv) {
     }
 
     // ── Game variant: deck, stacks, blinds, betting structure ──────────
-    QFRConfig qfr_cfg;
-    qfr_cfg.game = makeGameConfig(variant);
-    qfr_cfg.seed = 0x12345;
-    qfr_cfg.game.validate();
+    PokerConfig poker_cfg;
+    poker_cfg.game = makeGameConfig(variant);
+    poker_cfg.seed = 0x12345;
+    poker_cfg.game.validate();
 
     // ── BetConfig: must expose the same total action count to PPO ──────
     BetConfig bet_cfg;
-    bet_cfg.num_raise_sizes    = qfr_cfg.num_raise_slots();
+    bet_cfg.num_raise_sizes    = poker_cfg.num_raise_slots();
     bet_cfg.min_raise          = 1.0;      // unused by adapter
     bet_cfg.geometric_ratio    = 2.0;      // unused by adapter
-    bet_cfg.max_bets_per_round = qfr_cfg.game.max_raises_per_round;
+    bet_cfg.max_bets_per_round = poker_cfg.game.max_raises_per_round;
 
-    printGame(qfr_cfg.game);
+    printGame(poker_cfg.game);
 
     // ── PPO hyper-parameters ────────────────────────────────────────────
     PPOConfig ppo_cfg;
@@ -183,7 +183,7 @@ int main(int argc, char** argv) {
     ppo_cfg.hist.ffn_mult        = 4;
     ppo_cfg.hist.num_blocks      = 1;
     // Env must use the same layout so obs_dim aligns with the network split.
-    qfr_cfg.hist = ppo_cfg.hist;
+    poker_cfg.hist = ppo_cfg.hist;
 
     // ── Trainer ─────────────────────────────────────────────────────────
     // CPU beats CUDA for this config (3x256 MLP @ batch=32): kernel-launch
@@ -192,7 +192,7 @@ int main(int argc, char** argv) {
     torch::Device device = torch::cuda::is_available() ? torch::kCUDA : torch::mps::is_available() ? torch::kMPS : torch::kCPU;
     std::cout << "Using device: CPU\n";
 
-    QFRPokerEnvironmentFactory factory(qfr_cfg);
+    PokerEnvironmentFactory factory(poker_cfg);
 
     if (scaling_mode) {
         std::cout << "\n[scaling mode] sweep over num_envs={";
@@ -218,8 +218,6 @@ int main(int argc, char** argv) {
         trainer.set_rollout_fn([](PPOTrainer& t) { t.collect_rollout_serial(); });
     } else if (strategy == "threadpool") {
         trainer.set_rollout_fn([](PPOTrainer& t) { t.collect_rollout_threadpool(); });
-    } else if (strategy == "coroutine") {
-        trainer.set_rollout_fn([](PPOTrainer& t) { t.collect_rollout_coroutine(); });
     } else {
         std::cerr << "unknown --strategy '" << strategy
                   << "' (expected serial|coroutine|threadpool)\n";
@@ -286,7 +284,7 @@ int main(int argc, char** argv) {
         if (a == 0) return "F";
         if (a == 1) return "C";
         const int raise_idx = a - 2;
-        const int n_pot     = static_cast<int>(qfr_cfg.game.pot_fractions.size());
+        const int n_pot     = static_cast<int>(poker_cfg.game.pot_fractions.size());
         if (raise_idx < n_pot) return "R" + std::to_string(raise_idx);
         return "AI";
     };
@@ -393,7 +391,7 @@ int main(int argc, char** argv) {
     std::cout << "\n[Final Elo league standings]\n";
     league.print_standings();
 
-    const std::string model_path = "poker_ppo_model_" + qfr_cfg.game.name + ".pt";
+    const std::string model_path = "poker_ppo_model_" + poker_cfg.game.name + ".pt";
     trainer.save(model_path);
     std::cout << "\nModel saved to " << model_path << "\n";
     return 0;

@@ -1,4 +1,4 @@
-#include "qfr_env.h"
+#include "poker_env.h"
 
 #include "ActionPolicy.hpp"
 #include "BettingConfig.hpp"
@@ -19,25 +19,25 @@ constexpr int STATIC_OBS    = CARD_SLOTS * 2 + FEAT_EXTRA;
 } // namespace
 
 // ═════════════════════════════════════════════════════════════════════════════
-// QFRPokerEnvironment
+// PokerEnvironment
 // ═════════════════════════════════════════════════════════════════════════════
 
-QFRPokerEnvironment::QFRPokerEnvironment(const QFRConfig& qfr_cfg,
+PokerEnvironment::PokerEnvironment(const PokerConfig& poker_cfg,
                                          const BetConfig& bet_cfg,
                                          uint64_t seed)
-    : qfr_cfg_(qfr_cfg), bet_cfg_(bet_cfg), hist_cfg_(qfr_cfg.hist), rng_(seed)
+    : poker_cfg_(poker_cfg), bet_cfg_(bet_cfg), hist_cfg_(poker_cfg.hist), rng_(seed)
 {
-    A_ = qfr_cfg_.action_count();
+    A_ = poker_cfg_.action_count();
     if (A_ != bet_cfg_.action_count()) {
         throw std::invalid_argument(
-            "BetConfig.action_count() must equal QFRConfig.action_count() "
+            "BetConfig.action_count() must equal PokerConfig.action_count() "
             "(2 + num_raise_slots)");
     }
     static_obs_dim_ = STATIC_OBS;
     obs_dim_        = hist_cfg_.total_obs_dim(static_obs_dim_);
     bet_history_.reserve(hist_cfg_.max_history_len * 2);
 
-    const auto& gcfg = qfr_cfg_.game;
+    const auto& gcfg = poker_cfg_.game;
     allin_slot_ = gcfg.include_all_in_slot
         ? 2 + static_cast<int>(gcfg.pot_fractions.size())
         : -1;
@@ -64,23 +64,23 @@ QFRPokerEnvironment::QFRPokerEnvironment(const QFRConfig& qfr_cfg,
     action_table_.assign(A_, std::nullopt);
 }
 
-int QFRPokerEnvironment::current_player() const {
+int PokerEnvironment::current_player() const {
     return game_->getCurrentPlayer();
 }
 
-bool QFRPokerEnvironment::is_terminal() const {
+bool PokerEnvironment::is_terminal() const {
     return game_->isTerminal();
 }
 
-torch::Tensor QFRPokerEnvironment::observation() const {
+torch::Tensor PokerEnvironment::observation() const {
     return compute_observation();
 }
 
-torch::Tensor QFRPokerEnvironment::legal_action_mask() const {
+torch::Tensor PokerEnvironment::legal_action_mask() const {
     return compute_mask();
 }
 
-StepResult QFRPokerEnvironment::reset() {
+StepResult PokerEnvironment::reset() {
     game_->reInitialize();
     bet_history_.clear();
     auto_advance_chance();
@@ -88,7 +88,7 @@ StepResult QFRPokerEnvironment::reset() {
     return { compute_observation(), 0.0f, false, compute_mask() };
 }
 
-StepResult QFRPokerEnvironment::step(int action_idx) {
+StepResult PokerEnvironment::step(int action_idx) {
     if (action_idx < 0 || action_idx >= A_) {
         throw std::invalid_argument("action index out of range");
     }
@@ -144,13 +144,13 @@ StepResult QFRPokerEnvironment::step(int action_idx) {
 
 // ── internals ────────────────────────────────────────────────────────────────
 
-void QFRPokerEnvironment::auto_advance_chance() {
+void PokerEnvironment::auto_advance_chance() {
     while (!game_->isTerminal() && game_->getType() == "chance") {
         game_->transition(::Game::Chance{});
     }
 }
 
-void QFRPokerEnvironment::rebuild_action_table() {
+void PokerEnvironment::rebuild_action_table() {
     action_table_.assign(A_, std::nullopt);
     if (game_->isTerminal() || game_->getType() != "action") return;
 
@@ -158,7 +158,7 @@ void QFRPokerEnvironment::rebuild_action_table() {
     const uint32_t pot = ctx.getPot();
     const uint32_t cb  = game_->getCurrentBet();
 
-    const auto& pot_fractions = qfr_cfg_.game.pot_fractions;
+    const auto& pot_fractions = poker_cfg_.game.pot_fractions;
     const auto& available = game_->getActions();
     for (const auto& act : available) {
         std::visit([&]<typename T>(const T& a) {
@@ -190,7 +190,7 @@ void QFRPokerEnvironment::rebuild_action_table() {
     }
 }
 
-torch::Tensor QFRPokerEnvironment::compute_mask() const {
+torch::Tensor PokerEnvironment::compute_mask() const {
     auto mask = torch::zeros({A_});
     auto acc  = mask.accessor<float, 1>();
     for (int i = 0; i < A_; ++i) {
@@ -199,7 +199,7 @@ torch::Tensor QFRPokerEnvironment::compute_mask() const {
     return mask;
 }
 
-torch::Tensor QFRPokerEnvironment::compute_observation() const {
+torch::Tensor PokerEnvironment::compute_observation() const {
     auto obs = torch::zeros({obs_dim_});
     auto a   = obs.accessor<float, 1>();
 
@@ -238,7 +238,7 @@ torch::Tensor QFRPokerEnvironment::compute_observation() const {
     return obs;
 }
 
-int QFRPokerEnvironment::write_history_block(
+int PokerEnvironment::write_history_block(
     torch::TensorAccessor<float, 1>& a, int dst_off, int current_player) const
 {
     const int T = hist_cfg_.max_history_len;
@@ -278,17 +278,17 @@ int QFRPokerEnvironment::write_history_block(
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// QFRPokerEnvironmentFactory
+// PokerEnvironmentFactory
 // ═════════════════════════════════════════════════════════════════════════════
 
-QFRPokerEnvironmentFactory::QFRPokerEnvironmentFactory(QFRConfig qfr_cfg)
-    : qfr_cfg_(std::move(qfr_cfg)) {}
+PokerEnvironmentFactory::PokerEnvironmentFactory(PokerConfig poker_cfg)
+    : poker_cfg_(std::move(poker_cfg)) {}
 
 std::unique_ptr<IPokerEnvironment>
-QFRPokerEnvironmentFactory::create(const BetConfig& cfg) {
+PokerEnvironmentFactory::create(const BetConfig& cfg) {
     const uint64_t idx  = instance_counter_.fetch_add(1);
-    const uint64_t seed = qfr_cfg_.seed ^ (idx * 0xBF58476D1CE4E5B9ull);
-    return std::make_unique<QFRPokerEnvironment>(qfr_cfg_, cfg, seed);
+    const uint64_t seed = poker_cfg_.seed ^ (idx * 0xBF58476D1CE4E5B9ull);
+    return std::make_unique<PokerEnvironment>(poker_cfg_, cfg, seed);
 }
 
 } // namespace poker_ppo

@@ -11,7 +11,7 @@ namespace poker_ppo {
 //                bet-history attention encoder.
 // ─────────────────────────────────────────────────────────────────────────────
 //
-// Observation layout (built by QFRPokerEnvironment::compute_observation):
+// Observation layout (built by PokerEnvironment::compute_observation):
 //   [0          : S]                static features (cards, stacks, pot, ...)
 //   [S          : S + T]            history validity mask (1 = real, 0 = pad)
 //   [S + T      : S + T + T*F]      history tokens, row-major (T tokens × F)
