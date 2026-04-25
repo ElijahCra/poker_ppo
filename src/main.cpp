@@ -173,11 +173,23 @@ int main(int argc, char** argv) {
     ppo_cfg.num_layers      = 3;
     ppo_cfg.anneal_lr       = true;
 
+    // ── Bet-history attention encoder ──────────────────────────────────
+    // T = max actions per hand the encoder sees (older actions are dropped).
+    // 32 comfortably covers heads-up NLHE: 4 rounds × 4 raises × 2 players
+    // = 32 raise slots, plus call/check fillers — truncation is rare.
+    ppo_cfg.hist.max_history_len = 32;
+    ppo_cfg.hist.attn_dim        = 64;
+    ppo_cfg.hist.attn_heads      = 4;
+    ppo_cfg.hist.ffn_mult        = 4;
+    ppo_cfg.hist.num_blocks      = 1;
+    // Env must use the same layout so obs_dim aligns with the network split.
+    qfr_cfg.hist = ppo_cfg.hist;
+
     // ── Trainer ─────────────────────────────────────────────────────────
     // CPU beats CUDA for this config (3x256 MLP @ batch=32): kernel-launch
     // overhead dominates compute on such a small network. Revisit if you
     // scale the network up (hidden_dim ≥ 512) or num_envs (≥ 128).
-    torch::Device device = torch::kCUDA;
+    torch::Device device = torch::cuda::is_available() ? torch::kCUDA : torch::mps::is_available() ? torch::kMPS : torch::kCPU;
     std::cout << "Using device: CPU\n";
 
     QFRPokerEnvironmentFactory factory(qfr_cfg);
@@ -238,6 +250,7 @@ int main(int argc, char** argv) {
                      action_count,
                      ppo_cfg.hidden_dim,
                      ppo_cfg.num_layers,
+                     ppo_cfg.hist,
                      elo_cfg,
                      device);
 
@@ -252,7 +265,8 @@ int main(int argc, char** argv) {
     // both checkpoints are equally bad" — any real progress should beat both.
     {
         ActorCritic uniform(obs_dim, action_count,
-                            ppo_cfg.hidden_dim, ppo_cfg.num_layers);
+                            ppo_cfg.hidden_dim, ppo_cfg.num_layers,
+                            ppo_cfg.hist);
         torch::NoGradGuard ng;
         for (auto& kv : uniform->named_parameters()) {
             if (kv.key().find("actor_head") != std::string::npos) {

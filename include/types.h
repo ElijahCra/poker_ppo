@@ -88,6 +88,50 @@ struct StepResult {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Bet-history attention config
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// The environment exposes a *variable-length* sequence of past betting actions
+// (this hand) as a fixed-size, padded block at the tail of the observation
+// vector. The network slices that block back into a [T, F] token tensor and
+// runs a small Transformer encoder over it.
+//
+// A learnable CLS token is prepended to the sequence so attention has a
+// well-defined output even when the history is empty (preflop, before any
+// action). The CLS output is concatenated with the static features.
+//
+// Per-action features (F = 8):
+//   0  amount / initial_stack
+//   1  amount / (2 * initial_stack)        (≈ pot-scale)
+//   2  is_my_action  (1 if the *current* acting player made it)
+//   3  is_aggressive (1 = Raise, 0 = Call/Check/Fold)
+//   4  round one-hot[0]  (preflop)
+//   5  round one-hot[1]  (flop)
+//   6  round one-hot[2]  (turn)
+//   7  round one-hot[3]  (river)
+//
+struct BetHistoryConfig {
+    static constexpr int feat_per_action = 8;
+
+    int  max_history_len = 32;   // T — padded length of the action sequence
+    int  attn_dim        = 64;   // D — token embedding & attention model dim
+    int  attn_heads      = 4;    // H — multi-head attention heads (D % H == 0)
+    int  ffn_mult        = 4;    // FFN inner dim = ffn_mult * attn_dim
+    int  num_blocks      = 1;    // stacked attention blocks
+
+    /// Total trailing block in the observation vector:
+    ///   T (mask) + T * F (token features)   = T * (1 + F)
+    [[nodiscard]] int history_block_dim() const {
+        return max_history_len * (1 + feat_per_action);
+    }
+
+    /// Convenience: full obs_dim given a static-feature width.
+    [[nodiscard]] int total_obs_dim(int static_dim) const {
+        return static_dim + history_block_dim();
+    }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
 // PPO hyper-parameters
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -118,6 +162,7 @@ struct PPOConfig {
     // ── network ─────────────────────────────────────────────────────────
     int    hidden_dim       = 512;
     int    num_layers       = 3;
+    BetHistoryConfig hist;             // attention encoder over bet history
 
     // ── derived ─────────────────────────────────────────────────────────
     int batch_size()     const { return num_envs * num_steps; }

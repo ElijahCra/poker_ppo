@@ -80,6 +80,7 @@ public:
               int action_count,
               int hidden_dim,
               int num_layers,
+              BetHistoryConfig hist,
               Config cfg,
               torch::Device device = torch::kCPU);
 
@@ -131,6 +132,7 @@ private:
     int                       action_count_;
     int                       hidden_dim_;
     int                       num_layers_;
+    BetHistoryConfig          hist_;
     torch::Device             device_;
 
     std::vector<ActorCritic> nets_;       // parallel to ckpts_

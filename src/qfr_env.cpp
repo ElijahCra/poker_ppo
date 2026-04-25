@@ -12,9 +12,9 @@ namespace poker_ppo {
 
 namespace {
 
-constexpr int CARD_SLOTS = 52;
-constexpr int FEAT_EXTRA = 10;  // my_stack + opp_stack + pot + cur_bet + raises + 4 round OH + seat
-constexpr int TOTAL_OBS  = CARD_SLOTS * 2 + FEAT_EXTRA;
+constexpr int CARD_SLOTS    = 52;
+constexpr int FEAT_EXTRA    = 10;  // my_stack + opp_stack + pot + cur_bet + raises + 4 round OH + seat
+constexpr int STATIC_OBS    = CARD_SLOTS * 2 + FEAT_EXTRA;
 
 } // namespace
 
@@ -25,7 +25,7 @@ constexpr int TOTAL_OBS  = CARD_SLOTS * 2 + FEAT_EXTRA;
 QFRPokerEnvironment::QFRPokerEnvironment(const QFRConfig& qfr_cfg,
                                          const BetConfig& bet_cfg,
                                          uint64_t seed)
-    : qfr_cfg_(qfr_cfg), bet_cfg_(bet_cfg), rng_(seed)
+    : qfr_cfg_(qfr_cfg), bet_cfg_(bet_cfg), hist_cfg_(qfr_cfg.hist), rng_(seed)
 {
     A_ = qfr_cfg_.action_count();
     if (A_ != bet_cfg_.action_count()) {
@@ -33,7 +33,9 @@ QFRPokerEnvironment::QFRPokerEnvironment(const QFRConfig& qfr_cfg,
             "BetConfig.action_count() must equal QFRConfig.action_count() "
             "(2 + num_raise_slots)");
     }
-    obs_dim_ = TOTAL_OBS;
+    static_obs_dim_ = STATIC_OBS;
+    obs_dim_        = hist_cfg_.total_obs_dim(static_obs_dim_);
+    bet_history_.reserve(hist_cfg_.max_history_len * 2);
 
     const auto& gcfg = qfr_cfg_.game;
     allin_slot_ = gcfg.include_all_in_slot
@@ -80,6 +82,7 @@ torch::Tensor QFRPokerEnvironment::legal_action_mask() const {
 
 StepResult QFRPokerEnvironment::reset() {
     game_->reInitialize();
+    bet_history_.clear();
     auto_advance_chance();
     rebuild_action_table();
     return { compute_observation(), 0.0f, false, compute_mask() };
@@ -93,7 +96,33 @@ StepResult QFRPokerEnvironment::step(int action_idx) {
         throw std::invalid_argument("agent selected an illegal action");
     }
 
-    const int seat_before = game_->getCurrentPlayer();
+    const int seat_before  = game_->getCurrentPlayer();
+    const int round_before = game_->getContext().getRoundNumber();
+
+    // Record the action into the bet-history sequence *before* transitioning,
+    // so player and round reflect the state in which the action was taken.
+    {
+        HistEntry e{};
+        e.player = static_cast<uint8_t>(seat_before);
+        e.round  = static_cast<uint8_t>(round_before);
+
+        std::visit([&]<typename T>(const T& a) {
+            using U = std::decay_t<T>;
+            if constexpr (std::is_same_v<U, ::Game::Raise>) {
+                e.amount        = a.amount;
+                e.is_aggressive = true;
+            } else if constexpr (std::is_same_v<U, ::Game::Call>) {
+                e.amount        = a.amount;
+                e.is_aggressive = false;
+            } else {  // Fold or Check
+                e.amount        = 0;
+                e.is_aggressive = false;
+            }
+        }, *action_table_[action_idx]);
+
+        bet_history_.push_back(e);
+    }
+
     game_->transition(*action_table_[action_idx]);
 
     if (!game_->isTerminal()) {
@@ -106,7 +135,6 @@ StepResult QFRPokerEnvironment::step(int action_idx) {
         // obs/mask are unused after a terminal flag (PPO layer calls reset()).
         auto obs  = torch::zeros({obs_dim_});
         auto mask = torch::zeros({A_});
-        (void)seat_before;
         return { obs, r, true, mask };
     }
 
@@ -203,7 +231,50 @@ torch::Tensor QFRPokerEnvironment::compute_observation() const {
 
     a[off++] = static_cast<float>(me);
 
+    // Bet-history block: [T mask] + [T × F token features].
+    off = write_history_block(a, off, me);
+    (void)off;  // off is now obs_dim_.
+
     return obs;
+}
+
+int QFRPokerEnvironment::write_history_block(
+    torch::TensorAccessor<float, 1>& a, int dst_off, int current_player) const
+{
+    const int T = hist_cfg_.max_history_len;
+    const int F = BetHistoryConfig::feat_per_action;
+
+    // Truncate to the most-recent T actions if the hand has run longer.  In
+    // heads-up NLHE with max_raises_per_round=4 and 4 rounds this is unlikely
+    // to fire, but the env doesn't enforce a hard cap so we guard against it.
+    const int n_total = static_cast<int>(bet_history_.size());
+    const int n_keep  = std::min(n_total, T);
+    const int start   = n_total - n_keep;
+
+    // Mask block: [dst_off : dst_off + T]
+    const int mask_off = dst_off;
+    for (int i = 0; i < n_keep; ++i) a[mask_off + i] = 1.0f;
+    // (remaining slots already zero from torch::zeros)
+
+    // Token block: [dst_off + T : dst_off + T + T*F], row-major (token i, feat f)
+    const int tok_off = dst_off + T;
+    for (int i = 0; i < n_keep; ++i) {
+        const auto& e = bet_history_[start + i];
+        const int   base = tok_off + i * F;
+
+        const float amt = static_cast<float>(e.amount);
+        a[base + 0] = amt / stack_norm_;
+        a[base + 1] = amt / pot_norm_;
+        a[base + 2] = (static_cast<int>(e.player) == current_player) ? 1.0f : 0.0f;
+        a[base + 3] = e.is_aggressive ? 1.0f : 0.0f;
+        // round one-hot
+        a[base + 4] = (e.round == 0) ? 1.0f : 0.0f;
+        a[base + 5] = (e.round == 1) ? 1.0f : 0.0f;
+        a[base + 6] = (e.round == 2) ? 1.0f : 0.0f;
+        a[base + 7] = (e.round == 3) ? 1.0f : 0.0f;
+    }
+
+    return dst_off + T + T * F;
 }
 
 // ═════════════════════════════════════════════════════════════════════════════

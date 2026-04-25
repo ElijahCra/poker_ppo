@@ -38,6 +38,7 @@ namespace poker_ppo {
 // flags belong on QFRConfig itself.
 struct QFRConfig {
     ::Game::GameConfig game{};    // deck, stacks, blinds, betting structure
+    BetHistoryConfig   hist{};    // attention-encoder layout (T, F, ...)
 
     // Seed used as a base — each created env gets seed ^ instance hash.
     uint64_t seed = 0x9E3779B97F4A7C15ull;
@@ -64,20 +65,38 @@ public:
     bool is_terminal() const override;
 
 private:
+    // Per-action snapshot recorded each time the env applies a player action.
+    // Hand-level: cleared by reset(). Truncated to the most-recent
+    // `hist_cfg_.max_history_len` entries when serialised.
+    struct HistEntry {
+        uint32_t amount;        // chip delta added to pot (mbb)
+        uint8_t  player;        // 0 or 1 (seat that took the action)
+        uint8_t  round;         // 0..3
+        bool     is_aggressive; // true = Raise, false = Call/Check/Fold
+    };
+
     void auto_advance_chance();
     void rebuild_action_table();
     torch::Tensor compute_observation() const;
     torch::Tensor compute_mask() const;
 
+    /// Serialise `bet_history_` into a [T, F] tokens block + [T] mask, written
+    /// into `obs` at offset `dst_off`.  Layout: mask first, then tokens (row-
+    /// major).  Returns the new offset (= dst_off + T*(1+F)).
+    int write_history_block(torch::TensorAccessor<float, 1>& a, int dst_off,
+                            int current_player) const;
+
     QFRConfig qfr_cfg_;
     BetConfig bet_cfg_;
+    BetHistoryConfig hist_cfg_;
     std::mt19937 rng_;
     ::Game::BettingConfig game_betting_cfg_;
     std::unique_ptr<::Game::DiscreteGame> game_;
 
-    int obs_dim_ = 0;
-    int A_       = 0;
-    int allin_slot_ = -1;        // -1 if disabled
+    int obs_dim_       = 0;
+    int static_obs_dim_ = 0;     // obs_dim_ minus the history tail
+    int A_             = 0;
+    int allin_slot_    = -1;     // -1 if disabled
     float stack_norm_  = 1.0f;   // = game.initial_stack; observation scaling
     float pot_norm_    = 1.0f;   // = 2 * initial_stack
     float reward_norm_ = 1.0f;   // = 10 * big_blind; terminal-reward scaling
@@ -85,6 +104,9 @@ private:
 
     // PPO-action-index → QFR Action, or nullopt if illegal this state.
     std::vector<std::optional<::Game::Action>> action_table_;
+
+    // Hand-level bet history (cleared on reset, appended in step).
+    std::vector<HistEntry> bet_history_;
 };
 
 class QFRPokerEnvironmentFactory : public IPokerEnvironmentFactory {
