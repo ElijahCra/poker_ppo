@@ -11,19 +11,21 @@ constexpr float kNegInfMask = -1e9f;  // additive mask for masked-out keys
 // ─────────────────────────────────────────────────────────────────────────────
 ActorCriticImpl::ActorCriticImpl(int obs_dim, int action_count,
                                  int hidden_dim, int num_layers,
-                                 BetHistoryConfig hist)
-    : hist_(hist)
+                                 BetHistoryConfig    hist,
+                                 RoundSummaryConfig  round_summary)
+    : hist_(hist), round_summary_(round_summary)
 {
-    static_dim_ = obs_dim - hist_.history_block_dim();
+    static_dim_ = obs_dim - round_summary_.dim() - hist_.history_block_dim();
     if (static_dim_ <= 0) {
         throw std::invalid_argument(
-            "ActorCritic: obs_dim is smaller than the history block size");
+            "ActorCritic: obs_dim is smaller than the optional feature blocks");
     }
 
-    // ── attention encoder (only when enabled) ───────────────────────────
-    // When disabled, the trunk takes the obs directly (no attention pool
-    // appended) and zero attention parameters are allocated.
-    int trunk_in_dim = static_dim_;
+    // ── trunk input width ───────────────────────────────────────────────
+    // The static features are always passed in.  Round summary (when on) is
+    // concatenated directly — small enough to skip projection.  Attention
+    // pool (when on) contributes attn_dim more channels.
+    int trunk_in_dim = static_dim_ + round_summary_.dim();
 
     if (hist_.enabled) {
         const int D  = hist_.attn_dim;
@@ -181,19 +183,34 @@ ActorCriticImpl::encode_history(const torch::Tensor& history_block) {
 // ─────────────────────────────────────────────────────────────────────────────
 std::pair<torch::Tensor, torch::Tensor>
 ActorCriticImpl::forward(torch::Tensor obs) {
-    torch::Tensor features;
-    if (hist_.enabled) {
-        // Split obs into [B, S] static and [B, T*(1+F)] history.
-        auto static_feats = obs.narrow(/*dim=*/1, /*start=*/0, /*length=*/static_dim_);
-        auto history_blk  = obs.narrow(/*dim=*/1, static_dim_,
-                                       hist_.history_block_dim());
-        auto hist_pool    = encode_history(history_blk);               // [B, D]
-        features = trunk_->forward(
-            torch::cat({static_feats, hist_pool}, /*dim=*/-1));        // [B, hidden]
-    } else {
-        // Encoder disabled: obs is already just the static features.
-        features = trunk_->forward(obs);
+    // Walk the obs in [static | round_summary? | history?] order, only
+    // touching the blocks that are actually enabled.
+    int64_t off = 0;
+    auto static_feats = obs.narrow(/*dim=*/1, off, static_dim_);
+    off += static_dim_;
+
+    std::vector<torch::Tensor> parts;
+    parts.reserve(3);
+    parts.push_back(static_feats);
+
+    if (round_summary_.enabled) {
+        parts.push_back(obs.narrow(/*dim=*/1, off, round_summary_.dim()));
+        off += round_summary_.dim();
     }
+
+    if (hist_.enabled) {
+        auto history_blk = obs.narrow(/*dim=*/1, off, hist_.history_block_dim());
+        off += hist_.history_block_dim();
+        parts.push_back(encode_history(history_blk));                   // [B, D]
+    }
+    (void)off;
+
+    // Single concat avoids an extra trunk-forward branch and keeps the trunk
+    // input width consistent with what the ctor sized it for.
+    torch::Tensor trunk_in = (parts.size() == 1)
+        ? parts[0]
+        : torch::cat(parts, /*dim=*/-1);
+    auto features = trunk_->forward(trunk_in);
 
     auto logits = actor_head_->forward(features);
     auto value  = critic_head_->forward(features).squeeze(-1);

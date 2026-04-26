@@ -89,9 +89,11 @@ int main(int argc, char** argv) {
     //   ./poker_ppo <variant> --scaling 8,16,32 [iters]
     //   ./poker_ppo --strategy {serial|threadpool}  (training mode)
     //   ./poker_ppo --no-attention                  → disable bet-history encoder
+    //   ./poker_ppo --round-summary                 → enable per-round summary block
     bool             benchmark_mode  = false;
     bool             scaling_mode    = false;
     bool             use_attention   = true;
+    bool             use_round_summary = false;
     int              benchmark_iters = 20;
     std::vector<int> env_counts;
     std::string      variant         = "nlhe_full_52";
@@ -136,6 +138,10 @@ int main(int argc, char** argv) {
             use_attention = false;
         } else if (a == "--attention") {
             use_attention = true;
+        } else if (a == "--round-summary") {
+            use_round_summary = true;
+        } else if (a == "--no-round-summary") {
+            use_round_summary = false;
         } else {
             variant = std::string(a);
         }
@@ -154,8 +160,8 @@ int main(int argc, char** argv) {
     // ── BetConfig: must expose the same total action count to PPO ──────
     BetConfig bet_cfg;
     bet_cfg.num_raise_sizes    = poker_cfg.num_raise_slots();
-    bet_cfg.min_raise          = 1.0;      // unused by adapter
-    bet_cfg.geometric_ratio    = 2.0;      // unused by adapter
+    bet_cfg.min_raise          = 0.5;      // unused by adapter
+    bet_cfg.geometric_ratio    = 1.5;      // unused by adapter
     bet_cfg.max_bets_per_round = poker_cfg.game.max_raises_per_round;
 
     printGame(poker_cfg.game);
@@ -163,20 +169,20 @@ int main(int argc, char** argv) {
     // ── PPO hyper-parameters ────────────────────────────────────────────
     PPOConfig ppo_cfg;
     ppo_cfg.total_timesteps = 200'000'000;
-    ppo_cfg.num_envs        = 64;
+    ppo_cfg.num_envs        = 8;
     ppo_cfg.num_steps       = 128;
-    ppo_cfg.update_epochs   = 8;         // more critic passes per rollout
+    ppo_cfg.update_epochs   = 4;
     ppo_cfg.num_minibatches = 4;
-    ppo_cfg.learning_rate   = 2.0e-4f;
-    ppo_cfg.ent_coef        = 0.01f;     // was 0.05 — too large for a 6-action IIG with
-                                         // near-zero advantages; pinned policy ~uniform
-    ppo_cfg.vf_coef         = 1.0f;      // critic gets a real share of trunk gradient
-    ppo_cfg.clip_coef       = 0.2f;      // standard PPO; gives policy room (was 0.1)
-    ppo_cfg.clip_vloss      = false;     // CRITICAL: with reward scale ≫ clip, clipped vloss
-                                         // becomes constant outside V_old±ε → zero critic gradient
+    ppo_cfg.learning_rate   = 2.5e-4f;
+    ppo_cfg.ent_coef        = 0.05f;
+
+    ppo_cfg.vf_coef         = 0.5f;
+    ppo_cfg.clip_coef       = 0.1f;
+    ppo_cfg.clip_vloss      = false;
+
     ppo_cfg.hidden_dim      = 256;
     ppo_cfg.num_layers      = 3;
-    ppo_cfg.anneal_lr       = true;
+    ppo_cfg.anneal_lr       = false;
 
     // ── Bet-history attention encoder ──────────────────────────────────
     // T = max actions per hand the encoder sees (older actions are dropped).
@@ -188,17 +194,27 @@ int main(int argc, char** argv) {
     ppo_cfg.hist.attn_heads      = 4;
     ppo_cfg.hist.ffn_mult        = 4;
     ppo_cfg.hist.num_blocks      = 1;
+
+    // ── Round-summary feature block ────────────────────────────────────
+    // Cheap MLP-friendly alternative (or complement) to attention: 4 features
+    // × 4 rounds appended directly to the trunk input.  Toggle independently
+    // of --attention with --round-summary / --no-round-summary.
+    ppo_cfg.round_summary.enabled = true;
+
     // Env must use the same layout so obs_dim aligns with the network split.
-    poker_cfg.hist = ppo_cfg.hist;
+    poker_cfg.hist          = ppo_cfg.hist;
+    poker_cfg.round_summary = ppo_cfg.round_summary;
     std::cout << "Bet-history attention encoder: "
-              << (ppo_cfg.hist.enabled ? "ON" : "OFF") << "\n";
+              << (ppo_cfg.hist.enabled ? "ON" : "OFF") << "\n"
+              << "Round-summary block          : "
+              << (ppo_cfg.round_summary.enabled ? "ON" : "OFF") << "\n";
 
     // ── Trainer ─────────────────────────────────────────────────────────
     // CPU beats CUDA for this config (3x256 MLP @ batch=32): kernel-launch
     // overhead dominates compute on such a small network. Revisit if you
     // scale the network up (hidden_dim ≥ 512) or num_envs (≥ 128).
-    torch::Device device = torch::cuda::is_available() ? torch::kCUDA : torch::mps::is_available() ? torch::kMPS : torch::kCPU;
-    //torch::Device device = torch::kCPU;
+    //torch::Device device = torch::cuda::is_available() ? torch::kCUDA : torch::mps::is_available() ? torch::kMPS : torch::kCPU;
+    torch::Device device = torch::kCPU;
     std::cout << "Using device: "<<device<<"\n";
 
     PokerEnvironmentFactory factory(poker_cfg);
@@ -258,6 +274,7 @@ int main(int argc, char** argv) {
                   ppo_cfg.hidden_dim,
                   ppo_cfg.num_layers,
                   ppo_cfg.hist,
+                  ppo_cfg.round_summary,
                   league_cfg,
                   device);
 

@@ -43,7 +43,8 @@ class ActorCriticImpl : public torch::nn::Module {
 public:
     ActorCriticImpl(int obs_dim, int action_count,
                     int hidden_dim, int num_layers,
-                    BetHistoryConfig hist);
+                    BetHistoryConfig    hist,
+                    RoundSummaryConfig  round_summary = {});
 
     /// Forward pass.  Returns {logits, value}.
     /// logits are *unmasked* — call get_action() or evaluate() for masking.
@@ -79,9 +80,11 @@ private:
     /// Reads the trailing T*(1+F) entries of `obs`.
     torch::Tensor encode_history(const torch::Tensor& history_block);
 
-    // ── attention encoder ───────────────────────────────────────────────
-    BetHistoryConfig hist_;
-    int  static_dim_  = 0;   // obs_dim minus hist.history_block_dim()
+    // ── feature-block layout ────────────────────────────────────────────
+    // obs = [static | round_summary? | history?]   (each ? present iff enabled)
+    BetHistoryConfig    hist_;
+    RoundSummaryConfig  round_summary_;
+    int  static_dim_  = 0;   // obs_dim minus summary_dim minus hist.history_block_dim()
 
     torch::nn::Linear token_embed_{nullptr};   // F → D
 

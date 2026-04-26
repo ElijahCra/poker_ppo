@@ -25,7 +25,9 @@ constexpr int STATIC_OBS    = CARD_SLOTS * 2 + FEAT_EXTRA;
 PokerEnvironment::PokerEnvironment(const PokerConfig& poker_cfg,
                                          const BetConfig& bet_cfg,
                                          uint64_t seed)
-    : poker_cfg_(poker_cfg), bet_cfg_(bet_cfg), hist_cfg_(poker_cfg.hist), rng_(seed)
+    : poker_cfg_(poker_cfg), bet_cfg_(bet_cfg),
+      hist_cfg_(poker_cfg.hist), rs_cfg_(poker_cfg.round_summary),
+      rng_(seed)
 {
     A_ = poker_cfg_.action_count();
     if (A_ != bet_cfg_.action_count()) {
@@ -34,7 +36,8 @@ PokerEnvironment::PokerEnvironment(const PokerConfig& poker_cfg,
             "(2 + num_raise_slots)");
     }
     static_obs_dim_ = STATIC_OBS;
-    obs_dim_        = hist_cfg_.total_obs_dim(static_obs_dim_);
+    // Layout: [static] [round_summary?] [history?]
+    obs_dim_        = static_obs_dim_ + rs_cfg_.dim() + hist_cfg_.history_block_dim();
     bet_history_.reserve(hist_cfg_.max_history_len * 2);
 
     const auto& gcfg = poker_cfg_.game;
@@ -231,6 +234,13 @@ torch::Tensor PokerEnvironment::compute_observation() const {
 
     a[off++] = static_cast<float>(me);
 
+    // Round-summary block: 4 rounds × 4 features.  Sits between the static
+    // features and the attention-history block so each sub-block can be
+    // toggled independently without disturbing the others' offsets.
+    if (rs_cfg_.enabled) {
+        off = write_round_summary_block(a, off, me);
+    }
+
     // Bet-history block: [T mask] + [T × F token features].  Only emitted
     // when the attention encoder is enabled — otherwise the obs ends here.
     if (hist_cfg_.enabled) {
@@ -278,6 +288,43 @@ int PokerEnvironment::write_history_block(
     }
 
     return dst_off + T + T * F;
+}
+
+int PokerEnvironment::write_round_summary_block(
+    torch::TensorAccessor<float, 1>& a, int dst_off, int current_player) const
+{
+    constexpr int R = RoundSummaryConfig::num_rounds;
+    constexpr int F = RoundSummaryConfig::feat_per_round;
+
+    // Aggregate bet_history_ into per-round totals.  Cheap — bet_history_
+    // is bounded by max_raises_per_round × num_rounds × players + calls, so
+    // a few dozen entries at most.
+    uint32_t my_chips[R]      = {};
+    uint32_t opp_chips[R]     = {};
+    int      raises_in[R]     = {};
+    int      last_aggressor[R];
+    for (int r = 0; r < R; ++r) last_aggressor[r] = -1;
+
+    for (const auto& e : bet_history_) {
+        if (e.round >= R) continue;  // defensive
+        if (static_cast<int>(e.player) == current_player) my_chips[e.round]  += e.amount;
+        else                                              opp_chips[e.round] += e.amount;
+        if (e.is_aggressive) {
+            raises_in[e.round]++;
+            last_aggressor[e.round] = e.player;
+        }
+    }
+
+    const float raises_norm = static_cast<float>(max_raises_norm_);
+    for (int r = 0; r < R; ++r) {
+        const int base = dst_off + r * F;
+        a[base + 0] = static_cast<float>(my_chips[r])  / stack_norm_;
+        a[base + 1] = static_cast<float>(opp_chips[r]) / stack_norm_;
+        a[base + 2] = static_cast<float>(raises_in[r]) / raises_norm;
+        a[base + 3] = (last_aggressor[r] == current_player) ? 1.0f : 0.0f;
+    }
+
+    return dst_off + R * F;
 }
 
 // ═════════════════════════════════════════════════════════════════════════════

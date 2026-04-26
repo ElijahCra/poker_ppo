@@ -17,7 +17,8 @@ League::League(IPokerEnvironmentFactory& factory,
                int action_count,
                int hidden_dim,
                int num_layers,
-               BetHistoryConfig hist,
+               BetHistoryConfig    hist,
+               RoundSummaryConfig  round_summary,
                Config cfg,
                torch::Device device)
     : factory_(factory),
@@ -28,6 +29,7 @@ League::League(IPokerEnvironmentFactory& factory,
       hidden_dim_(hidden_dim),
       num_layers_(num_layers),
       hist_(hist),
+      round_summary_(round_summary),
       device_(device) {}
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -56,7 +58,8 @@ void League::add_default_anchors() {
 }
 
 ActorCritic League::clone_network(const ActorCritic& src) {
-    ActorCritic dst(obs_dim_, action_count_, hidden_dim_, num_layers_, hist_);
+    ActorCritic dst(obs_dim_, action_count_, hidden_dim_, num_layers_,
+                    hist_, round_summary_);
     dst->to(device_);
 
     torch::NoGradGuard ng;
@@ -79,7 +82,8 @@ ActorCritic League::clone_network(const ActorCritic& src) {
 }
 
 ActorCritic League::make_random_network() {
-    ActorCritic net(obs_dim_, action_count_, hidden_dim_, num_layers_, hist_);
+    ActorCritic net(obs_dim_, action_count_, hidden_dim_, num_layers_,
+                    hist_, round_summary_);
     net->to(device_);
     net->eval();
     return net;

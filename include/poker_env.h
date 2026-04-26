@@ -37,8 +37,9 @@ namespace poker_ppo {
 // All poker-rule tuning lives in `game`; only per-run seeding and adapter
 // flags belong on PokerConfig itself.
 struct PokerConfig {
-    ::Game::GameConfig game{};    // deck, stacks, blinds, betting structure
-    BetHistoryConfig   hist{};    // attention-encoder layout (T, F, ...)
+    ::Game::GameConfig  game{};           // deck, stacks, blinds, betting structure
+    BetHistoryConfig    hist{};           // attention-encoder layout (T, F, ...)
+    RoundSummaryConfig  round_summary{};  // per-round summary feature block
 
     // Seed used as a base — each created env gets seed ^ instance hash.
     uint64_t seed = 0x9E3779B97F4A7C15ull;
@@ -86,9 +87,16 @@ private:
     int write_history_block(torch::TensorAccessor<float, 1>& a, int dst_off,
                             int current_player) const;
 
-    PokerConfig poker_cfg_;
-    BetConfig bet_cfg_;
-    BetHistoryConfig hist_cfg_;
+    /// Write the per-round summary block (4 rounds × 4 features) at offset
+    /// `dst_off` and return the new offset.  Derived live from `bet_history_`
+    /// so it stays consistent with the attention encoder when both are on.
+    int write_round_summary_block(torch::TensorAccessor<float, 1>& a,
+                                  int dst_off, int current_player) const;
+
+    PokerConfig         poker_cfg_;
+    BetConfig           bet_cfg_;
+    BetHistoryConfig    hist_cfg_;
+    RoundSummaryConfig  rs_cfg_;
     std::mt19937 rng_;
     ::Game::BettingConfig game_betting_cfg_;
     std::unique_ptr<::Game::DiscreteGame> game_;

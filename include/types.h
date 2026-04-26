@@ -128,10 +128,34 @@ struct BetHistoryConfig {
     [[nodiscard]] int history_block_dim() const {
         return enabled ? max_history_len * (1 + feat_per_action) : 0;
     }
+};
 
-    /// Convenience: full obs_dim given a static-feature width.
-    [[nodiscard]] int total_obs_dim(int static_dim) const {
-        return static_dim + history_block_dim();
+// ─────────────────────────────────────────────────────────────────────────────
+// Round-summary feature block
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// A hand-engineered, fixed-size alternative (or complement) to the attention
+// encoder.  For each of the four betting rounds (preflop, flop, turn, river)
+// the env emits four features computed from the current hand's bet history:
+//
+//   0  my_chips_in     — chip delta I put in this round  / initial_stack
+//   1  opp_chips_in    — chip delta opponent put in      / initial_stack
+//   2  raises_count    — total raises this round         / max_raises_per_round
+//   3  i_am_aggressor  — 1 if I was the last to raise this round, else 0
+//
+// All features are computed from the acting player's perspective so the same
+// shared network can be used for both seats.  Block size = 4 rounds × 4 feats
+// = 16 floats (when enabled) appended to the obs immediately after the static
+// features and before the attention-history block.
+//
+struct RoundSummaryConfig {
+    static constexpr int feat_per_round = 4;
+    static constexpr int num_rounds     = 4;
+
+    bool enabled = false;        // off by default; flip on with --round-summary
+
+    [[nodiscard]] int dim() const {
+        return enabled ? num_rounds * feat_per_round : 0;
     }
 };
 
@@ -166,7 +190,8 @@ struct PPOConfig {
     // ── network ─────────────────────────────────────────────────────────
     int    hidden_dim       = 512;
     int    num_layers       = 3;
-    BetHistoryConfig hist;             // attention encoder over bet history
+    BetHistoryConfig    hist;          // attention encoder over bet history
+    RoundSummaryConfig  round_summary; // hand-engineered per-round features
 
     // ── derived ─────────────────────────────────────────────────────────
     int batch_size()     const { return num_envs * num_steps; }

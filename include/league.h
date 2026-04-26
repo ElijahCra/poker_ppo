@@ -63,14 +63,15 @@ public:
     };
 
     League(IPokerEnvironmentFactory& factory,
-           const BetConfig&  bet_cfg,
-           int               obs_dim,
-           int               action_count,
-           int               hidden_dim,
-           int               num_layers,
-           BetHistoryConfig  hist,
-           Config            cfg,
-           torch::Device     device = torch::kCPU);
+           const BetConfig&    bet_cfg,
+           int                 obs_dim,
+           int                 action_count,
+           int                 hidden_dim,
+           int                 num_layers,
+           BetHistoryConfig    hist,
+           RoundSummaryConfig  round_summary,
+           Config              cfg,
+           torch::Device       device = torch::kCPU);
 
     // ── anchor registration ─────────────────────────────────────────────
 
@@ -120,6 +121,7 @@ private:
     int                       hidden_dim_;
     int                       num_layers_;
     BetHistoryConfig          hist_;
+    RoundSummaryConfig        round_summary_;
     torch::Device             device_;
 
     std::vector<std::unique_ptr<IPolicy>> anchors_;

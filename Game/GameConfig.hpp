@@ -57,7 +57,7 @@ struct GameConfig {
     uint32_t min_raise     = 1000;
 
     // ─── Betting structure ──────────────────────────────────────────────
-    uint8_t              max_raises_per_round = 4;
+    uint8_t              max_raises_per_round = 6;
     std::vector<double>  pot_fractions        = {0.5, 1.0, 2.0};
     bool                 include_all_in_slot  = true;
 

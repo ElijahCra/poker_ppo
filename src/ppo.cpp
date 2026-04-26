@@ -92,7 +92,7 @@ PPOTrainer::PPOTrainer(IPokerEnvironmentFactory& env_factory,
     // Create network
     network_ = ActorCritic(obs_dim, action_count,
                            cfg_.hidden_dim, cfg_.num_layers,
-                           cfg_.hist);
+                           cfg_.hist, cfg_.round_summary);
     network_->to(device_);
 
     // Optimiser
