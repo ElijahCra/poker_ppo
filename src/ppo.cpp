@@ -39,37 +39,6 @@ torch::Tensor VectorizedEnv::reset_all() {
     return obs;
 }
 
-VectorizedEnv::BatchStepResult
-VectorizedEnv::step(const std::vector<int>& actions) {
-    int N = num_envs();
-    rewards_buf_.zero_();
-    dones_buf_.zero_();
-
-    for (int i = 0; i < N; ++i) {
-        int acting_player = envs_[i]->current_player();
-        auto result = envs_[i]->step(actions[i]);
-
-        float r = result.reward;
-        if (acting_player == 1) r = -r;
-
-        if (result.done) {
-            rewards_buf_[i] = r;
-            dones_buf_[i]   = 1.0f;
-            auto rr = envs_[i]->reset();
-            obs_buf_[i]     = rr.observation;
-            masks_buf_[i]   = rr.legal_action_mask;
-            players_buf_[i] = envs_[i]->current_player();
-        } else {
-            obs_buf_[i]     = result.observation;
-            rewards_buf_[i] = r;
-            masks_buf_[i]   = result.legal_action_mask;
-            players_buf_[i] = envs_[i]->current_player();
-        }
-    }
-
-    return {obs_buf_.clone(), rewards_buf_.clone(),
-            dones_buf_.clone(), masks_buf_.clone(), players_buf_.clone()};
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // build_bootstrap — assemble the [2, N] bootstrap_values / bootstrap_terminal
