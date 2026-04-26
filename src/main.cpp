@@ -178,11 +178,11 @@ int main(int argc, char** argv) {
 
     ppo_cfg.vf_coef         = 0.5f;
     ppo_cfg.clip_coef       = 0.1f;
-    ppo_cfg.clip_vloss      = false;
+    ppo_cfg.clip_vloss      = true;
 
     ppo_cfg.hidden_dim      = 256;
     ppo_cfg.num_layers      = 3;
-    ppo_cfg.anneal_lr       = false;
+    ppo_cfg.anneal_lr       = true;
 
     // ── Bet-history attention encoder ──────────────────────────────────
     // T = max actions per hand the encoder sees (older actions are dropped).
