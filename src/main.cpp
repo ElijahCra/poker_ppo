@@ -174,10 +174,10 @@ int main(int argc, char** argv) {
     ppo_cfg.update_epochs   = 4;
     ppo_cfg.num_minibatches = 4;
     ppo_cfg.learning_rate   = 2.5e-4f;
-    ppo_cfg.ent_coef        = 0.05f;
+    ppo_cfg.ent_coef        = 0.02f;
 
     ppo_cfg.vf_coef         = 0.5f;
-    ppo_cfg.clip_coef       = 0.1f;
+    ppo_cfg.clip_coef       = 0.2f;
     ppo_cfg.clip_vloss      = true;
 
     ppo_cfg.hidden_dim      = 256;
