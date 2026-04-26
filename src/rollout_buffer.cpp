@@ -61,7 +61,23 @@ void RolloutBuffer::push(int player, int env_idx,
     values_[player]   .accessor<float,   2>()[t][env_idx] = value;
 }
 
-void RolloutBuffer::compute_returns(float gamma, float lam) {
+void RolloutBuffer::compute_returns(
+    float gamma, float lam,
+    const torch::Tensor& bootstrap_values,
+    const torch::Tensor& bootstrap_terminal) {
+
+    TORCH_CHECK(bootstrap_values.dim() == 2 &&
+                bootstrap_values.size(0) == 2 &&
+                bootstrap_values.size(1) == num_envs_,
+                "bootstrap_values must be [2, num_envs]");
+    TORCH_CHECK(bootstrap_terminal.sizes() == bootstrap_values.sizes(),
+                "bootstrap_terminal shape must match bootstrap_values");
+
+    auto bv = bootstrap_values.to(torch::kCPU).contiguous();
+    auto bt = bootstrap_terminal.to(torch::kCPU).contiguous();
+    auto bv_a = bv.accessor<float, 2>();
+    auto bt_a = bt.accessor<float, 2>();
+
     for (int p = 0; p < 2; ++p) {
         advantages_[p].zero_();
         returns_[p].zero_();
@@ -78,9 +94,16 @@ void RolloutBuffer::compute_returns(float gamma, float lam) {
             for (int t = T - 1; t >= 0; --t) {
                 float next_nonterminal, next_value;
                 if (t == T - 1) {
-                    // Rollout-end truncation: treat the tail as terminal.
-                    next_nonterminal = 0.0f;
-                    next_value       = 0.0f;
+                    if (bt_a[p][e] > 0.5f) {
+                        // Tail was followed by an episode terminal — V_next = 0.
+                        next_nonterminal = 0.0f;
+                        next_value       = 0.0f;
+                    } else {
+                        // Tail was truncated by rollout-end — bootstrap from
+                        // the trainer-supplied V at the carry obs.
+                        next_nonterminal = 1.0f;
+                        next_value       = bv_a[p][e];
+                    }
                 } else {
                     next_nonterminal = 1.0f - dones_a[t + 1][e];
                     next_value       = values_a[t + 1][e];

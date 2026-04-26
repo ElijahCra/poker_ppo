@@ -71,6 +71,56 @@ VectorizedEnv::step(const std::vector<int>& actions) {
             dones_buf_.clone(), masks_buf_.clone(), players_buf_.clone()};
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// build_bootstrap — assemble the [2, N] bootstrap_values / bootstrap_terminal
+// tensors that compute_returns expects. Forwards `cur_obs` through the critic
+// to get V at the rollout-end state (from the next-acting player's view), and
+// uses zero-sum negation to derive V from the other player's view.
+// ─────────────────────────────────────────────────────────────────────────────
+namespace {
+
+struct BootstrapTensors {
+    torch::Tensor values;     // [2, N] float32, CPU
+    torch::Tensor terminal;   // [2, N] float32, CPU
+};
+
+BootstrapTensors build_bootstrap(
+    ActorCritic& network,
+    const torch::Tensor& cur_obs,           // [N, obs_dim] on device
+    const torch::Tensor& cur_player_cpu,    // [N] int32 on CPU
+    const std::vector<PlayerRolloutState>& player_state) {
+
+    const int N = static_cast<int>(cur_obs.size(0));
+    auto f_cpu = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
+
+    // Forward-pass for V at carry obs. NoGrad is assumed in scope at the
+    // call site (rollout collectors run under NoGradGuard).
+    auto fwd = network->forward(cur_obs);
+    auto V_carry = fwd.second.detach().to(torch::kCPU).contiguous();
+
+    auto values   = torch::zeros({2, N}, f_cpu);
+    auto terminal = torch::zeros({2, N}, f_cpu);
+
+    auto v_acc  = V_carry.accessor<float, 1>();
+    auto cp_acc = cur_player_cpu.accessor<int32_t, 1>();
+    auto bv_acc = values.accessor<float, 2>();
+    auto bt_acc = terminal.accessor<float, 2>();
+
+    for (int i = 0; i < N; ++i) {
+        const int next_actor = cp_acc[i];
+        const float v        = v_acc[i];
+        // V at carry obs is from the next-acting player's perspective; the
+        // other player's V is its zero-sum negation.
+        bv_acc[next_actor][i]     = v;
+        bv_acc[1 - next_actor][i] = -v;
+        bt_acc[0][i] = player_state[i].tail_was_terminal[0] ? 1.0f : 0.0f;
+        bt_acc[1][i] = player_state[i].tail_was_terminal[1] ? 1.0f : 0.0f;
+    }
+    return {values, terminal};
+}
+
+} // namespace
+
 // ═════════════════════════════════════════════════════════════════════════════
 // PPOTrainer
 // ═════════════════════════════════════════════════════════════════════════════
@@ -253,16 +303,20 @@ void PPOTrainer::collect_rollout_serial() {
         cur_player = next_player.to(device_);
     }
 
-    // Drain remaining pending transitions (treated as truncated in GAE).
+    // Drain remaining pending transitions; these are truncations, not
+    // terminals — compute_returns will bootstrap them from V(carry_obs).
     for (int i = 0; i < N; ++i) {
         player_state[i].flush_on_rollout_end(i, *buffer_);
     }
 
-    buffer_->compute_returns(cfg_.gamma, cfg_.gae_lambda);
+    auto cur_player_cpu = cur_player.to(torch::kCPU).contiguous();
+    auto bootstrap = build_bootstrap(network_, cur_obs, cur_player_cpu, player_state);
+    buffer_->compute_returns(cfg_.gamma, cfg_.gae_lambda,
+                             bootstrap.values, bootstrap.terminal);
 
     carry_obs_            = cur_obs.to(torch::kCPU);
     carry_legal_mask_     = cur_mask.to(torch::kCPU);
-    carry_current_player_ = cur_player.to(torch::kCPU);
+    carry_current_player_ = cur_player_cpu;
     // Reset carry_done_ — per-player episode-boundary state is re-seeded at
     // the next rollout's start from this tensor, and we've already flushed
     // the pending transitions whose done flag it would have affected.
@@ -366,16 +420,20 @@ void PPOTrainer::collect_rollout_threadpool() {
         cur_player = next_player.to(device_);
     }
 
-    // Drain remaining pending transitions (treated as truncated in GAE).
+    // Drain remaining pending transitions; these are truncations, not
+    // terminals — compute_returns will bootstrap them from V(carry_obs).
     for (int i = 0; i < N; ++i) {
         player_state[i].flush_on_rollout_end(i, *buffer_);
     }
 
-    buffer_->compute_returns(cfg_.gamma, cfg_.gae_lambda);
+    auto cur_player_cpu = cur_player.to(torch::kCPU).contiguous();
+    auto bootstrap = build_bootstrap(network_, cur_obs, cur_player_cpu, player_state);
+    buffer_->compute_returns(cfg_.gamma, cfg_.gae_lambda,
+                             bootstrap.values, bootstrap.terminal);
 
     carry_obs_            = cur_obs.to(torch::kCPU);
     carry_legal_mask_     = cur_mask.to(torch::kCPU);
-    carry_current_player_ = cur_player.to(torch::kCPU);
+    carry_current_player_ = cur_player_cpu;
     carry_done_.zero_();
 
     global_step_ += cfg_.num_envs * cfg_.num_steps;

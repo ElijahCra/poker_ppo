@@ -93,7 +93,7 @@ int main(int argc, char** argv) {
     bool             benchmark_mode  = false;
     bool             scaling_mode    = false;
     bool             use_attention   = true;
-    bool             use_round_summary = false;
+    bool             use_round_summary = true;
     int              benchmark_iters = 20;
     std::vector<int> env_counts;
     std::string      variant         = "nlhe_full_52";
@@ -178,9 +178,9 @@ int main(int argc, char** argv) {
 
     ppo_cfg.vf_coef         = 0.5f;
     ppo_cfg.clip_coef       = 0.2f;
-    ppo_cfg.clip_vloss      = true;
+    ppo_cfg.clip_vloss      = false;
 
-    ppo_cfg.hidden_dim      = 256;
+    ppo_cfg.hidden_dim      = 1024;
     ppo_cfg.num_layers      = 3;
     ppo_cfg.anneal_lr       = true;
 
@@ -199,7 +199,7 @@ int main(int argc, char** argv) {
     // Cheap MLP-friendly alternative (or complement) to attention: 4 features
     // × 4 rounds appended directly to the trunk input.  Toggle independently
     // of --attention with --round-summary / --no-round-summary.
-    ppo_cfg.round_summary.enabled = true;
+    ppo_cfg.round_summary.enabled = false;
 
     // Env must use the same layout so obs_dim aligns with the network split.
     poker_cfg.hist          = ppo_cfg.hist;

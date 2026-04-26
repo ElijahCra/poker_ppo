@@ -165,10 +165,10 @@ struct RoundSummaryConfig {
 
 struct PPOConfig {
     // ── core PPO ────────────────────────────────────────────────────────
-    float  gamma            = 0.9999f;
-    float  gae_lambda       = 0.995f;
+    float  gamma            = 1.0f;
+    float  gae_lambda       = 1.0f;
     float  clip_coef        = 0.1f;
-    float  ent_coef         = 0.05f;   // high entropy helps in IIGs (see paper)
+    float  ent_coef         = 0.01f;
     float  vf_coef          = 0.5f;
     float  max_grad_norm    = 0.5f;
     bool   clip_vloss       = true;

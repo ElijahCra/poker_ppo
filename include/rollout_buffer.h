@@ -44,10 +44,21 @@ public:
               float value,
               torch::Tensor mask);    // [action_count] CPU or device_
 
-    /// Compute GAE independently per (player, env_idx) trajectory. Trajectories
-    /// are truncated at the end of the rollout (no bootstrap past the last
-    /// recorded transition).
-    void compute_returns(float gamma, float gae_lambda);
+    /// Compute GAE independently per (player, env_idx) trajectory.
+    ///
+    /// For each (p, e) tail (the last recorded transition in the rollout),
+    /// `bootstrap_terminal[p][e]` selects the bootstrap behaviour:
+    ///   - 1.0  → tail was followed by an episode terminal; V_next = 0.
+    ///   - 0.0  → tail was truncated by rollout-end; V_next = bootstrap_values[p][e].
+    ///
+    /// Caller is expected to compute bootstrap_values from V(carry_obs) at
+    /// rollout-end (with zero-sum negation for the non-acting player) and
+    /// bootstrap_terminal from PlayerRolloutState::tail_was_terminal.
+    ///
+    /// Both tensors must be float32 [2, num_envs] on CPU.
+    void compute_returns(float gamma, float gae_lambda,
+                         const torch::Tensor& bootstrap_values,
+                         const torch::Tensor& bootstrap_terminal);
 
     /// Concatenate all valid transitions across both players and all envs.
     /// Returned tensors live on `device_`.
@@ -99,6 +110,10 @@ private:
 //   - next_done_flag[p]: the dones value to stamp on p's next recorded
 //     transition — flips to 1 after an episode terminates so the first
 //     transition of the new episode carries the episode-boundary marker.
+//   - tail_was_terminal[p]: tracks whether the most recently *pushed*
+//     transition for p was followed by an episode terminal (true) or merely
+//     by another action (false). Read by the trainer at rollout-end to pick
+//     the right bootstrap V for compute_returns.
 // ─────────────────────────────────────────────────────────────────────────────
 struct PlayerRolloutState {
     struct Pending {
@@ -112,8 +127,9 @@ struct PlayerRolloutState {
     };
 
     Pending pending[2];
-    float   accumulated[2]    = {0.0f, 0.0f};
-    float   next_done_flag[2] = {0.0f, 0.0f};
+    float   accumulated[2]      = {0.0f, 0.0f};
+    float   next_done_flag[2]   = {0.0f, 0.0f};
+    bool    tail_was_terminal[2] = {false, false};
 
     /// Called at each env step by the acting player. Closes out the previous
     /// pending (if any) into the buffer using accumulated[player] as its
@@ -128,6 +144,10 @@ struct PlayerRolloutState {
                      accumulated[player], p.done, p.value, p.mask);
             accumulated[player] = 0.0f;
             p.has = false;
+            // The transition we just pushed is followed by another action
+            // (the one we're about to set as new pending), so it is not
+            // terminal-followed.
+            tail_was_terminal[player] = false;
         }
         p.has      = true;
         p.obs      = std::move(obs);
@@ -160,15 +180,16 @@ struct PlayerRolloutState {
                          accumulated[p], pp.done, pp.value, pp.mask);
                 accumulated[p] = 0.0f;
                 pp.has = false;
+                tail_was_terminal[p] = true;
             }
         }
         next_done_flag[0] = 1.0f;
         next_done_flag[1] = 1.0f;
     }
 
-    /// Call at rollout end to drain any still-pending transitions. These are
-    /// flushed with their recorded done flag; compute_returns treats the last
-    /// transition of each trajectory as truncated (no bootstrap).
+    /// Call at rollout end to drain any still-pending transitions. These tails
+    /// are truncated (not terminal); the trainer reads tail_was_terminal[p]
+    /// to pick the right bootstrap V for compute_returns.
     void flush_on_rollout_end(int env_idx, RolloutBuffer& buf) {
         for (int p = 0; p < 2; ++p) {
             Pending& pp = pending[p];
@@ -178,6 +199,7 @@ struct PlayerRolloutState {
                          accumulated[p], pp.done, pp.value, pp.mask);
                 accumulated[p] = 0.0f;
                 pp.has = false;
+                tail_was_terminal[p] = false;
             }
         }
     }
