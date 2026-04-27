@@ -169,20 +169,20 @@ int main(int argc, char** argv) {
     // ── PPO hyper-parameters ────────────────────────────────────────────
     PPOConfig ppo_cfg;
     ppo_cfg.total_timesteps = 200'000'000;
-    ppo_cfg.num_envs        = 8;
+    ppo_cfg.num_envs        = 64;
     ppo_cfg.num_steps       = 128;
     ppo_cfg.update_epochs   = 4;
     ppo_cfg.num_minibatches = 4;
     ppo_cfg.learning_rate   = 2.5e-4f;
-    ppo_cfg.ent_coef        = 0.01f;
+    ppo_cfg.ent_coef        = 0.05f;
 
     ppo_cfg.vf_coef         = 0.5f;
-    ppo_cfg.clip_coef       = 0.2f;
+    ppo_cfg.clip_coef       = 0.1f;
     ppo_cfg.clip_vloss      = false;
 
-    ppo_cfg.hidden_dim      = 1024;
-    ppo_cfg.num_layers      = 3;
-    ppo_cfg.anneal_lr       = true;
+    ppo_cfg.hidden_dim      = 128;
+    ppo_cfg.num_layers      = 2;
+    ppo_cfg.anneal_lr       = false;
 
     // ── Bet-history attention encoder ──────────────────────────────────
     // T = max actions per hand the encoder sees (older actions are dropped).
@@ -199,7 +199,7 @@ int main(int argc, char** argv) {
     // Cheap MLP-friendly alternative (or complement) to attention: 4 features
     // × 4 rounds appended directly to the trunk input.  Toggle independently
     // of --attention with --round-summary / --no-round-summary.
-    ppo_cfg.round_summary.enabled = false;
+    ppo_cfg.round_summary.enabled = true;
 
     // Env must use the same layout so obs_dim aligns with the network split.
     poker_cfg.hist          = ppo_cfg.hist;

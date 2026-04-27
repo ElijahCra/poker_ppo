@@ -8,23 +8,23 @@ namespace {
 constexpr float kNegInfMask = -1e9f;  // additive mask for masked-out keys
 } // namespace
 
-// ─────────────────────────────────────────────────────────────────────────────
-ActorCriticImpl::ActorCriticImpl(int obs_dim, int action_count,
-                                 int hidden_dim, int num_layers,
-                                 BetHistoryConfig    hist,
-                                 RoundSummaryConfig  round_summary)
+// ═════════════════════════════════════════════════════════════════════════════
+// TowerImpl
+// ═════════════════════════════════════════════════════════════════════════════
+
+TowerImpl::TowerImpl(int obs_dim, int output_dim,
+                     int hidden_dim, int num_layers,
+                     float head_init_std,
+                     BetHistoryConfig    hist,
+                     RoundSummaryConfig  round_summary)
     : hist_(hist), round_summary_(round_summary)
 {
     static_dim_ = obs_dim - round_summary_.dim() - hist_.history_block_dim();
     if (static_dim_ <= 0) {
         throw std::invalid_argument(
-            "ActorCritic: obs_dim is smaller than the optional feature blocks");
+            "Tower: obs_dim is smaller than the optional feature blocks");
     }
 
-    // ── trunk input width ───────────────────────────────────────────────
-    // The static features are always passed in.  Round summary (when on) is
-    // concatenated directly — small enough to skip projection.  Attention
-    // pool (when on) contributes attn_dim more channels.
     int trunk_in_dim = static_dim_ + round_summary_.dim();
 
     if (hist_.enabled) {
@@ -71,8 +71,7 @@ ActorCriticImpl::ActorCriticImpl(int obs_dim, int action_count,
         trunk_in_dim = static_dim_ + D;
     }
 
-    // ── shared MLP trunk ────────────────────────────────────────────────
-    // Input width is static_dim (encoder off) or static_dim + D (encoder on).
+    // ── trunk + head ────────────────────────────────────────────────────
     torch::nn::Sequential trunk;
     int in_dim = trunk_in_dim;
     for (int i = 0; i < num_layers; ++i) {
@@ -81,24 +80,17 @@ ActorCriticImpl::ActorCriticImpl(int obs_dim, int action_count,
         in_dim = hidden_dim;
     }
     trunk_ = register_module("trunk", trunk);
+    head_  = register_module("head",  torch::nn::Linear(hidden_dim, output_dim));
 
-    // Actor and critic heads
-    actor_head_  = register_module("actor_head",
-                                   torch::nn::Linear(hidden_dim, action_count));
-    critic_head_ = register_module("critic_head",
-                                   torch::nn::Linear(hidden_dim, 1));
-
-    // ── init: orthogonal for trunk/heads, xavier for attention ──────────
+    // ── init: orthogonal for trunk/head, xavier for attention ───────────
     for (auto& m : trunk_->modules(/*include_self=*/false)) {
         if (auto* lin = m->as<torch::nn::Linear>()) {
             torch::nn::init::orthogonal_(lin->weight, std::sqrt(2.0));
             torch::nn::init::constant_(lin->bias, 0.0);
         }
     }
-    torch::nn::init::orthogonal_(actor_head_->weight, 0.01);
-    torch::nn::init::constant_(actor_head_->bias, 0.0);
-    torch::nn::init::orthogonal_(critic_head_->weight, 1.0);
-    torch::nn::init::constant_(critic_head_->bias, 0.0);
+    torch::nn::init::orthogonal_(head_->weight, head_init_std);
+    torch::nn::init::constant_(head_->bias, 0.0);
 
     if (hist_.enabled) {
         auto xavier_lin = [](torch::nn::Linear& lin) {
@@ -117,7 +109,7 @@ ActorCriticImpl::ActorCriticImpl(int obs_dim, int action_count,
 
 // ─────────────────────────────────────────────────────────────────────────────
 torch::Tensor
-ActorCriticImpl::encode_history(const torch::Tensor& history_block) {
+TowerImpl::encode_history(const torch::Tensor& history_block) {
     // history_block: [B, T*(1+F)]
     const int T = hist_.max_history_len;
     const int F = BetHistoryConfig::feat_per_action;
@@ -126,31 +118,25 @@ ActorCriticImpl::encode_history(const torch::Tensor& history_block) {
     const int d_head = D / H;
     const int64_t B = history_block.size(0);
 
-    // Slice into mask [B, T] and tokens [B, T, F].
     auto mask   = history_block.narrow(/*dim=*/1, /*start=*/0, /*length=*/T);
     auto tokens = history_block.narrow(1, T, T * F).reshape({B, T, F});
 
     auto x = token_embed_->forward(tokens);  // [B, T, D]
 
-    // Prepend CLS token (always-valid) and matching mask entry.
     auto cls = cls_token_.expand({B, 1, D});
     x = torch::cat({cls, x}, /*dim=*/1);                            // [B, T+1, D]
-    auto cls_mask = torch::ones({B, 1}, mask.options());
+    auto cls_mask  = torch::ones({B, 1}, mask.options());
     auto attn_mask = torch::cat({cls_mask, mask}, /*dim=*/1);        // [B, T+1]
 
-    x = x + pos_embed_;  // broadcast [1, T+1, D] over batch
+    x = x + pos_embed_;
 
-    // Pre-computed additive mask for keys: 0 where valid, -inf where padded.
-    // Shape [B, 1, 1, T+1] so it broadcasts over (heads, queries).
     auto add_mask = (1.0 - attn_mask).unsqueeze(1).unsqueeze(1) * kNegInfMask;
 
     const int64_t L = T + 1;
     for (int b = 0; b < hist_.num_blocks; ++b) {
-        // ── multi-head self-attention (pre-norm + residual) ─────────────
         auto h = attn_ln_[b]->forward(x);
         auto qkv = qkv_proj_[b]->forward(h);          // [B, L, 3D]
         auto qkv_split = qkv.chunk(3, /*dim=*/-1);
-        // [B, H, L, d_head]
         auto reshape_heads = [&](torch::Tensor t) {
             return t.reshape({B, L, H, d_head}).transpose(1, 2).contiguous();
         };
@@ -159,16 +145,15 @@ ActorCriticImpl::encode_history(const torch::Tensor& history_block) {
         auto v = reshape_heads(qkv_split[2]);
 
         auto scores = torch::matmul(q, k.transpose(-2, -1))
-                    / std::sqrt(static_cast<double>(d_head));         // [B, H, L, L]
+                    / std::sqrt(static_cast<double>(d_head));
         scores = scores + add_mask;
         auto attn = torch::softmax(scores, /*dim=*/-1);
 
-        auto out = torch::matmul(attn, v);                            // [B, H, L, d_h]
-        out = out.transpose(1, 2).contiguous().reshape({B, L, D});    // [B, L, D]
+        auto out = torch::matmul(attn, v);
+        out = out.transpose(1, 2).contiguous().reshape({B, L, D});
         out = out_proj_[b]->forward(out);
         x = x + out;
 
-        // ── feed-forward (pre-norm + residual) ──────────────────────────
         auto fh = ffn_ln_[b]->forward(x);
         auto ff = ffn1_[b]->forward(fh);
         ff = torch::gelu(ff);
@@ -176,15 +161,11 @@ ActorCriticImpl::encode_history(const torch::Tensor& history_block) {
         x = x + ff;
     }
 
-    // CLS output is the pooled history representation.
     return x.select(/*dim=*/1, /*index=*/0);   // [B, D]
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-std::pair<torch::Tensor, torch::Tensor>
-ActorCriticImpl::forward(torch::Tensor obs) {
-    // Walk the obs in [static | round_summary? | history?] order, only
-    // touching the blocks that are actually enabled.
+torch::Tensor TowerImpl::forward(torch::Tensor obs) {
     int64_t off = 0;
     auto static_feats = obs.narrow(/*dim=*/1, off, static_dim_);
     off += static_dim_;
@@ -194,33 +175,61 @@ ActorCriticImpl::forward(torch::Tensor obs) {
     parts.push_back(static_feats);
 
     if (round_summary_.enabled) {
-        parts.push_back(obs.narrow(/*dim=*/1, off, round_summary_.dim()));
+        parts.push_back(obs.narrow(1, off, round_summary_.dim()));
         off += round_summary_.dim();
     }
 
     if (hist_.enabled) {
-        auto history_blk = obs.narrow(/*dim=*/1, off, hist_.history_block_dim());
+        auto history_blk = obs.narrow(1, off, hist_.history_block_dim());
         off += hist_.history_block_dim();
-        parts.push_back(encode_history(history_blk));                   // [B, D]
+        parts.push_back(encode_history(history_blk));
     }
     (void)off;
 
-    // Single concat avoids an extra trunk-forward branch and keeps the trunk
-    // input width consistent with what the ctor sized it for.
     torch::Tensor trunk_in = (parts.size() == 1)
         ? parts[0]
         : torch::cat(parts, /*dim=*/-1);
     auto features = trunk_->forward(trunk_in);
+    return head_->forward(features);
+}
 
-    auto logits = actor_head_->forward(features);
-    auto value  = critic_head_->forward(features).squeeze(-1);
+// ═════════════════════════════════════════════════════════════════════════════
+// ActorCriticImpl
+// ═════════════════════════════════════════════════════════════════════════════
+
+ActorCriticImpl::ActorCriticImpl(int obs_dim, int action_count,
+                                 int hidden_dim, int num_layers,
+                                 BetHistoryConfig    hist,
+                                 RoundSummaryConfig  round_summary)
+{
+    actor_  = register_module("actor",
+                              Tower(obs_dim, action_count,
+                                    hidden_dim, num_layers,
+                                    /*head_init_std=*/0.01f,
+                                    hist, round_summary));
+    critic_ = register_module("critic",
+                              Tower(obs_dim, /*output_dim=*/1,
+                                    hidden_dim, num_layers,
+                                    /*head_init_std=*/1.0f,
+                                    hist, round_summary));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+std::pair<torch::Tensor, torch::Tensor>
+ActorCriticImpl::forward(torch::Tensor obs) {
+    auto logits = actor_->forward(obs);
+    auto value  = critic_->forward(obs).squeeze(-1);
     return {logits, value};
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+torch::Tensor ActorCriticImpl::get_value(torch::Tensor obs) {
+    return critic_->forward(std::move(obs)).squeeze(-1);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 torch::Tensor
 ActorCriticImpl::apply_mask(torch::Tensor logits, torch::Tensor mask) {
-    // mask: 1 = legal, 0 = illegal
     return logits + (1.0f - mask) * (-1e8f);
 }
 

@@ -62,10 +62,9 @@ BootstrapTensors build_bootstrap(
     const int N = static_cast<int>(cur_obs.size(0));
     auto f_cpu = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
 
-    // Forward-pass for V at carry obs. NoGrad is assumed in scope at the
-    // call site (rollout collectors run under NoGradGuard).
-    auto fwd = network->forward(cur_obs);
-    auto V_carry = fwd.second.detach().to(torch::kCPU).contiguous();
+    // Critic-only forward for V at carry obs. NoGrad is assumed in scope at
+    // the call site (rollout collectors run under NoGradGuard).
+    auto V_carry = network->get_value(cur_obs).detach().to(torch::kCPU).contiguous();
 
     auto values   = torch::zeros({2, N}, f_cpu);
     auto terminal = torch::zeros({2, N}, f_cpu);

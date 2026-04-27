@@ -215,7 +215,7 @@ def main() -> int:
         except KeyboardInterrupt:
             break
         start_wait = time.time()
-        while time.time() - start_wait < 5:
+        while time.time() - start_wait < 0.1:
             if not plt.fignum_exists(fig.number):
                 break
             fig.canvas.flush_events()
