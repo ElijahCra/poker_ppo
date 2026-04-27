@@ -210,8 +210,18 @@ int main(int argc, char** argv) {
     ppo_cfg.opp_pool.enabled        = true;
     ppo_cfg.opp_pool.max_size       = 20;
     ppo_cfg.opp_pool.snapshot_every = 200;   // updates between snapshots
-    ppo_cfg.opp_pool.warmup_updates = 200;   // start sampling after this
+    // Warmup gates BOTH the first snapshot and the first sampling. Setting
+    // this too low fills the pool with barely-trained snapshots, which dilutes
+    // the gradient signal (most outcomes vs a near-random opponent are
+    // uninformative). 1000 ≈ 8M env steps of pure self-play before the pool
+    // takes its first snapshot.
+    ppo_cfg.opp_pool.warmup_updates = 1000;
     ppo_cfg.opp_pool.p_use_pool     = 0.5f;  // fraction of envs vs pool
+    // Cap on distinct snapshots used per rollout. Higher = more opponent
+    // diversity within a rollout, but pool inference cost scales linearly.
+    // 1 keeps wall time roughly constant in pool size; raise to 2-4 if the
+    // gradient signal looks too narrow.
+    ppo_cfg.opp_pool.max_unique_per_rollout = 1;
 
     // Env must use the same layout so obs_dim aligns with the network split.
     poker_cfg.hist          = ppo_cfg.hist;
@@ -226,7 +236,8 @@ int main(int argc, char** argv) {
         std::cout << "  (size=" << ppo_cfg.opp_pool.max_size
                   << ", snapshot_every=" << ppo_cfg.opp_pool.snapshot_every
                   << ", warmup=" << ppo_cfg.opp_pool.warmup_updates
-                  << ", p_use_pool=" << ppo_cfg.opp_pool.p_use_pool << ")";
+                  << ", p_use_pool=" << ppo_cfg.opp_pool.p_use_pool
+                  << ", max_unique=" << ppo_cfg.opp_pool.max_unique_per_rollout << ")";
     }
     std::cout << "\n";
 

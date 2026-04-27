@@ -32,6 +32,7 @@
 #include <cstdint>
 #include <deque>
 #include <random>
+#include <vector>
 
 namespace poker_ppo {
 
@@ -58,6 +59,10 @@ public:
 
     /// Sample one of the live snapshots' IDs uniformly. Returns 0 if empty.
     SnapshotId sample_id();
+
+    /// Sample up to `n` distinct snapshot IDs without replacement. Returns at
+    /// most `min(n, size())` IDs in random order; empty vector if pool is empty.
+    std::vector<SnapshotId> sample_ids(int n);
 
     /// Is `id` currently in the pool?
     bool has_id(SnapshotId id) const;

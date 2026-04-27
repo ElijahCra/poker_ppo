@@ -128,7 +128,8 @@ private:
 
     // Opponent-pool helpers. No-ops when cfg_.opp_pool.enabled == false.
     void maybe_snapshot();           // called by train() each update
-    void roll_episode_assignment(int env_idx);  // re-sample learner_seat / opp_idx
+    void prepare_rollout_pool_ids(); // called at the start of each rollout
+    void roll_episode_assignment(int env_idx);  // re-sample learner_seat / opp_id
     void apply_pool_overrides(
         const torch::Tensor& cur_obs,        // [N, D] device
         const torch::Tensor& cur_mask,       // [N, A] device
@@ -176,6 +177,10 @@ private:
     std::unique_ptr<OpponentPool> opp_pool_;
     std::vector<int>              learner_seat_;
     std::vector<uint64_t>         opp_id_;
+    // Pool IDs eligible for assignment in the *current* rollout. Sampled at
+    // rollout start, sized at most cfg_.opp_pool.max_unique_per_rollout. Empty
+    // means "fall back to full-pool sampling" (warmup, disabled, etc.).
+    std::vector<uint64_t>         rollout_pool_ids_;
     std::mt19937                  episode_rng_;
 };
 

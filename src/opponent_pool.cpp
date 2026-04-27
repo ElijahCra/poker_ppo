@@ -1,6 +1,7 @@
 #include "opponent_pool.h"
 
 #include <algorithm>
+#include <numeric>
 
 namespace poker_ppo {
 
@@ -58,6 +59,23 @@ OpponentPool::SnapshotId OpponentPool::sample_id() {
     std::uniform_int_distribution<int> ui(
         0, static_cast<int>(snapshots_.size()) - 1);
     return snapshots_[ui(rng_)].id;
+}
+
+std::vector<OpponentPool::SnapshotId> OpponentPool::sample_ids(int n) {
+    std::vector<SnapshotId> out;
+    if (snapshots_.empty() || n <= 0) return out;
+
+    const int K = static_cast<int>(snapshots_.size());
+    n = std::min(n, K);
+    std::vector<int> indices(K);
+    std::iota(indices.begin(), indices.end(), 0);
+    std::shuffle(indices.begin(), indices.end(), rng_);
+
+    out.reserve(n);
+    for (int i = 0; i < n; ++i) {
+        out.push_back(snapshots_[indices[i]].id);
+    }
+    return out;
 }
 
 bool OpponentPool::has_id(SnapshotId id) const {

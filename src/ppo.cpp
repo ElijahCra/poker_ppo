@@ -186,8 +186,21 @@ void PPOTrainer::maybe_snapshot() {
     const auto& pcfg = cfg_.opp_pool;
     if (pcfg.snapshot_every <= 0) return;
     if (update_idx_ <= 0) return;
+    // Don't start filling the pool until warmup completes — early-training
+    // snapshots are barely-distinguishable-from-random and dilute the
+    // gradient signal once we sample from them.
+    if (update_idx_ < pcfg.warmup_updates) return;
     if (update_idx_ % pcfg.snapshot_every != 0) return;
     opp_pool_->add_snapshot(network_);
+}
+
+void PPOTrainer::prepare_rollout_pool_ids() {
+    rollout_pool_ids_.clear();
+    if (!opp_pool_ || opp_pool_->empty()) return;
+    if (update_idx_ < cfg_.opp_pool.warmup_updates) return;
+
+    const int n = std::max(1, cfg_.opp_pool.max_unique_per_rollout);
+    rollout_pool_ids_ = opp_pool_->sample_ids(n);
 }
 
 void PPOTrainer::roll_episode_assignment(int env_idx) {
@@ -205,7 +218,17 @@ void PPOTrainer::roll_episode_assignment(int env_idx) {
     // seat the learner plays to avoid biasing the training distribution.
     std::uniform_int_distribution<int> ui_seat(0, 1);
     learner_seat_[env_idx] = ui_seat(episode_rng_);
-    opp_id_[env_idx]       = opp_pool_->sample_id();
+
+    // Restrict to the rollout's pre-sampled pool IDs when available, so we
+    // bound the number of distinct pool snapshots used per rollout (and
+    // therefore the number of mini-forwards in apply_pool_overrides).
+    if (!rollout_pool_ids_.empty()) {
+        std::uniform_int_distribution<size_t> ui(
+            0, rollout_pool_ids_.size() - 1);
+        opp_id_[env_idx] = rollout_pool_ids_[ui(episode_rng_)];
+    } else {
+        opp_id_[env_idx] = opp_pool_->sample_id();
+    }
 }
 
 void PPOTrainer::apply_pool_overrides(
@@ -314,6 +337,7 @@ void PPOTrainer::collect_rollout_serial() {
     torch::NoGradGuard no_grad;
 
     buffer_->clear();
+    prepare_rollout_pool_ids();
 
     auto& envs = vec_env_->envs_mut();
     const int N = cfg_.num_envs;
@@ -447,6 +471,7 @@ void PPOTrainer::collect_rollout_threadpool() {
     ensure_step_pool();
 
     buffer_->clear();
+    prepare_rollout_pool_ids();
 
     auto& envs = vec_env_->envs_mut();
     const int N = cfg_.num_envs;

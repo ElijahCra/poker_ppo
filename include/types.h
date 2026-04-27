@@ -175,6 +175,12 @@ struct OpponentPoolConfig {
     int    snapshot_every  = 200;
     int    warmup_updates  = 200;
     float  p_use_pool      = 0.5f;
+    // Cap on distinct pool snapshots used in any single rollout. Lower values
+    // make pool inference cheap (one batched forward per step instead of one
+    // per snapshot) at the cost of less opponent diversity within a rollout —
+    // diversity recovers across rollouts as we re-sample at each rollout
+    // start. Default 1 keeps wall time roughly constant in pool size.
+    int    max_unique_per_rollout = 1;
     uint64_t seed          = 0;   // 0 → random_device
 };
 
