@@ -178,11 +178,17 @@ struct PlayerRolloutState {
                 buf.push(p, env_idx,
                          pp.obs, pp.action, pp.log_prob,
                          accumulated[p], pp.done, pp.value, pp.mask);
-                accumulated[p] = 0.0f;
                 pp.has = false;
                 tail_was_terminal[p] = true;
             }
         }
+        // Reset accumulators unconditionally on episode boundary. Covers
+        // (a) the SB-fold walk where one seat never acted in this hand and
+        // (b) opponent-pool rollouts where we deliberately skip recording
+        // the non-learner seat — its accumulated reward must not leak into
+        // the next episode (where seat assignments may have flipped).
+        accumulated[0] = 0.0f;
+        accumulated[1] = 0.0f;
         next_done_flag[0] = 1.0f;
         next_done_flag[1] = 1.0f;
     }

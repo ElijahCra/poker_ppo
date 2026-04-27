@@ -160,6 +160,25 @@ struct RoundSummaryConfig {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Opponent pool — frozen past-policy snapshots for self-play stabilisation.
+// Empty / disabled by default: full self-play. When enabled, every
+// `snapshot_every` updates the trainer copies the live network into a FIFO
+// pool of size `max_size`. During rollouts, each env independently rolls a
+// per-episode opponent: with probability `p_use_pool` it draws a pool member
+// to play the non-learner seat; otherwise it stays in current-vs-current
+// self-play. Pool snapshots only start being sampled once `warmup_updates`
+// have elapsed, so the pool isn't filled with cold-start garbage.
+// ─────────────────────────────────────────────────────────────────────────────
+struct OpponentPoolConfig {
+    bool   enabled         = false;
+    int    max_size        = 20;
+    int    snapshot_every  = 200;
+    int    warmup_updates  = 200;
+    float  p_use_pool      = 0.5f;
+    uint64_t seed          = 0;   // 0 → random_device
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
 // PPO hyper-parameters
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -192,6 +211,9 @@ struct PPOConfig {
     int    num_layers       = 3;
     BetHistoryConfig    hist;          // attention encoder over bet history
     RoundSummaryConfig  round_summary; // hand-engineered per-round features
+
+    // ── opponent pool (self-play stabilisation) ─────────────────────────
+    OpponentPoolConfig  opp_pool;
 
     // ── derived ─────────────────────────────────────────────────────────
     int batch_size()     const { return num_envs * num_steps; }

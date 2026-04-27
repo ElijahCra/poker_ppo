@@ -1,0 +1,28 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cmake --build . --target poker_ppo_lib)",
+      "Read(//mnt/c/Users/Elijah/CLionProjects/poker_ppo/**)",
+      "Bash(/usr/bin/gmake poker_ppo_lib)",
+      "Bash(ls /mnt/)",
+      "Bash(wsl.exe --status)",
+      "Bash(wsl.exe -d Ubuntu -- bash -c \"cd /mnt/c/Users/Elijah/CLionProjects/poker_ppo/cmake-build-debug && /usr/bin/gmake poker_ppo_lib 2>&1 | tail -100\")",
+      "Bash(wsl.exe -d Ubuntu -- bash -c \"cd /mnt/c/Users/Elijah/CLionProjects/poker_ppo/cmake-build-debug && /usr/bin/gmake poker_ppo 2>&1 | tail -40\")",
+      "Bash(wsl.exe -d Ubuntu -- bash -c \"cd /mnt/c/Users/Elijah/CLionProjects/poker_ppo/cmake-build-debug && /usr/bin/gmake poker_ppo 2>&1 | tail -30\")",
+      "Bash(wsl.exe -d Ubuntu -- bash -c \"cd /mnt/c/Users/Elijah/CLionProjects/poker_ppo/cmake-build-debug && /usr/bin/gmake poker_ppo 2>&1 | tail -50\")",
+      "Bash(wsl.exe -d Ubuntu -- bash -c \"cd /mnt/c/Users/Elijah/CLionProjects/poker_ppo/cmake-build-debug && /usr/bin/gmake poker_ppo 2>&1 | tail -10\")",
+      "Bash(wsl.exe -d Ubuntu -- bash -c \"cd /mnt/c/Users/Elijah/CLionProjects/poker_ppo/cmake-build-debug && /usr/bin/gmake poker_ppo 2>&1 | tail -5\")",
+      "Bash(wsl.exe -d Ubuntu -- bash -c \"cd /mnt/c/Users/Elijah/CLionProjects/poker_ppo/cmake-build-debug && /usr/bin/gmake poker_ppo 2>&1 | tail -20\")",
+      "Bash(wsl.exe -d Ubuntu -- bash -c \"cd /mnt/c/Users/Elijah/CLionProjects/poker_ppo/cmake-build-debug && /usr/bin/gmake poker_ppo 2>&1 | tail -15\")",
+      "Bash(wsl.exe -d Ubuntu -- bash -c \"cd /mnt/c/Users/Elijah/CLionProjects/poker_ppo/cmake-build-debug && /usr/bin/gmake poker_ppo 2>&1 | tail -8\")",
+      "Bash(pdftotext -layout \"C:/Users/Elijah/Downloads/PPO.pdf\" \"C:/Users/Elijah/Downloads/PPO.txt\")",
+      "Bash(grep -oE '\"text\":\"[^\"]{0,3000}\"' \"C:\\\\Users\\\\Elijah\\\\.claude\\\\projects\\\\C--Users-Elijah-CLionProjects-poker-ppo\\\\8ac95bd0-6d06-4f57-83bf-58220f9bbb8b.jsonl\")",
+      "Bash(grep -oE '\"text\":\"[^\"]{3000,}\"' \"C:\\\\Users\\\\Elijah\\\\.claude\\\\projects\\\\C--Users-Elijah-CLionProjects-poker-ppo\\\\8ac95bd0-6d06-4f57-83bf-58220f9bbb8b.jsonl\")",
+      "Bash(ls /c/Python*)",
+      "Read(//c/Users/Elijah/AppData/Local/Programs/**)",
+      "Bash(/c/Python313/python.exe -c ' *)",
+      "Bash(cmake --build cmake-build-debug --target poker_ppo)",
+      "Bash(cmake --build C:/Users/Elijah/CLionProjects/poker_ppo/cmake-build-release --target poker_ppo_lib)"
+    ]
+  }
+}

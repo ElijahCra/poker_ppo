@@ -8,6 +8,7 @@
 #include <torch/torch.h>
 #include <functional>
 #include <memory>
+#include <random>
 #include <string>
 #include <utility>
 #include <vector>
@@ -15,6 +16,7 @@
 namespace poker_ppo {
 
 class StepThreadPool;  // fwd-decl; full type lives in rollout_pool.h
+class OpponentPool;    // fwd-decl; full type lives in opponent_pool.h
 
 // ─────────────────────────────────────────────────────────────────────────────
 // PPOTrainer
@@ -111,6 +113,10 @@ public:
     /// Access the trained network (e.g. for evaluation / saving).
     ActorCritic& network() { return network_; }
 
+    /// Number of snapshots currently in the opponent pool. 0 if disabled or
+    /// not yet warmed up.
+    int opponent_pool_size() const;
+
     /// Save / load model weights.
     void save(const std::string& path);
     void load(const std::string& path);
@@ -119,6 +125,15 @@ private:
     void init_carry_state();         // resets envs and seeds carry_* tensors
     UpdateStats update();            // PPO update; returns per-update stats
     void ensure_step_pool();         // lazy-init for the threadpool strategy
+
+    // Opponent-pool helpers. No-ops when cfg_.opp_pool.enabled == false.
+    void maybe_snapshot();           // called by train() each update
+    void roll_episode_assignment(int env_idx);  // re-sample learner_seat / opp_idx
+    void apply_pool_overrides(
+        const torch::Tensor& cur_obs,        // [N, D] device
+        const torch::Tensor& cur_mask,       // [N, A] device
+        const torch::Tensor& cur_player_cpu, // [N] int32 CPU
+        torch::Tensor& actions_cpu);         // [N] int64 CPU — modified in place
 
     PPOConfig    cfg_;
     BetConfig    bet_cfg_;
@@ -148,6 +163,20 @@ private:
     // Persistent worker pool used by collect_rollout_threadpool(). Created
     // on first call; reused across rollouts to avoid per-step thread spawn.
     std::unique_ptr<StepThreadPool> step_pool_;
+
+    // ── Opponent pool (self-play stabilisation) ─────────────────────────
+    // opp_pool_ is null when cfg_.opp_pool.enabled == false. learner_seat_
+    // and opp_id_ are sized num_envs and re-rolled at episode boundaries:
+    //   learner_seat_[i] ∈ {0, 1}    — which seat is the live policy
+    //   opp_id_[i]                   — 0: pure self-play (no override)
+    //                                  else: SnapshotId of the pool member
+    //                                  that plays the non-learner seat
+    // Stale IDs (snapshot dropped between sample and use) fall through to
+    // live policy via OpponentPool::has_id().
+    std::unique_ptr<OpponentPool> opp_pool_;
+    std::vector<int>              learner_seat_;
+    std::vector<uint64_t>         opp_id_;
+    std::mt19937                  episode_rng_;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────

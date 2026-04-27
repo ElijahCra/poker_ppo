@@ -173,16 +173,16 @@ int main(int argc, char** argv) {
     ppo_cfg.num_steps       = 128;
     ppo_cfg.update_epochs   = 4;
     ppo_cfg.num_minibatches = 4;
-    ppo_cfg.learning_rate   = 2.5e-4f;
-    ppo_cfg.ent_coef        = 0.05f;
+    ppo_cfg.learning_rate   = 3.0e-4f;
+    ppo_cfg.ent_coef        = 0.02f;
 
     ppo_cfg.vf_coef         = 0.5f;
-    ppo_cfg.clip_coef       = 0.1f;
+    ppo_cfg.clip_coef       = 0.2f;
     ppo_cfg.clip_vloss      = false;
 
-    ppo_cfg.hidden_dim      = 128;
+    ppo_cfg.hidden_dim      = 256;
     ppo_cfg.num_layers      = 2;
-    ppo_cfg.anneal_lr       = false;
+    ppo_cfg.anneal_lr       = true;
 
     // ── Bet-history attention encoder ──────────────────────────────────
     // T = max actions per hand the encoder sees (older actions are dropped).
@@ -201,20 +201,41 @@ int main(int argc, char** argv) {
     // of --attention with --round-summary / --no-round-summary.
     ppo_cfg.round_summary.enabled = true;
 
+    // ── Opponent pool (self-play stabilisation) ────────────────────────
+    // Without this, pure self-play cycles: policy collapses to exploit its
+    // current self, then diverges into a different collapsed mode. Symptoms
+    // are entropy oscillation and regression vs fixed anchors mid-training.
+    // With it, ~p_use_pool of envs play against a uniformly-sampled past
+    // snapshot, forcing the live policy to be robust against past selves.
+    ppo_cfg.opp_pool.enabled        = true;
+    ppo_cfg.opp_pool.max_size       = 20;
+    ppo_cfg.opp_pool.snapshot_every = 200;   // updates between snapshots
+    ppo_cfg.opp_pool.warmup_updates = 200;   // start sampling after this
+    ppo_cfg.opp_pool.p_use_pool     = 0.5f;  // fraction of envs vs pool
+
     // Env must use the same layout so obs_dim aligns with the network split.
     poker_cfg.hist          = ppo_cfg.hist;
     poker_cfg.round_summary = ppo_cfg.round_summary;
     std::cout << "Bet-history attention encoder: "
               << (ppo_cfg.hist.enabled ? "ON" : "OFF") << "\n"
               << "Round-summary block          : "
-              << (ppo_cfg.round_summary.enabled ? "ON" : "OFF") << "\n";
+              << (ppo_cfg.round_summary.enabled ? "ON" : "OFF") << "\n"
+              << "Opponent pool                : "
+              << (ppo_cfg.opp_pool.enabled ? "ON" : "OFF");
+    if (ppo_cfg.opp_pool.enabled) {
+        std::cout << "  (size=" << ppo_cfg.opp_pool.max_size
+                  << ", snapshot_every=" << ppo_cfg.opp_pool.snapshot_every
+                  << ", warmup=" << ppo_cfg.opp_pool.warmup_updates
+                  << ", p_use_pool=" << ppo_cfg.opp_pool.p_use_pool << ")";
+    }
+    std::cout << "\n";
 
     // ── Trainer ─────────────────────────────────────────────────────────
     // CPU beats CUDA for this config (3x256 MLP @ batch=32): kernel-launch
     // overhead dominates compute on such a small network. Revisit if you
     // scale the network up (hidden_dim ≥ 512) or num_envs (≥ 128).
-    //torch::Device device = torch::cuda::is_available() ? torch::kCUDA : torch::mps::is_available() ? torch::kMPS : torch::kCPU;
-    torch::Device device = torch::kCPU;
+    torch::Device device = torch::cuda::is_available() ? torch::kCUDA : torch::mps::is_available() ? torch::kMPS : torch::kCPU;
+    //torch::Device device = torch::kCPU;
     std::cout << "Using device: "<<device<<"\n";
 
     PokerEnvironmentFactory factory(poker_cfg);

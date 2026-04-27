@@ -41,6 +41,7 @@ add_library(poker_ppo_lib
     src/poker_env.cpp
     src/league.cpp
     src/metrics_logger.cpp
+    src/opponent_pool.cpp
 )
 target_include_directories(poker_ppo_lib PUBLIC
     include

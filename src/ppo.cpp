@@ -1,4 +1,5 @@
 #include "ppo.h"
+#include "opponent_pool.h"
 #include "rollout_pool.h"
 #include <iostream>
 #include <iomanip>
@@ -7,6 +8,7 @@
 #include <numeric>
 #include <chrono>
 #include <thread>
+#include <unordered_map>
 
 namespace poker_ppo {
 
@@ -98,7 +100,10 @@ PPOTrainer::PPOTrainer(IPokerEnvironmentFactory& env_factory,
                        const PPOConfig& ppo_cfg,
                        torch::Device device)
     : cfg_(ppo_cfg), bet_cfg_(bet_cfg), device_(device),
-      network_(nullptr)
+      network_(nullptr),
+      episode_rng_(cfg_.opp_pool.seed
+                   ? cfg_.opp_pool.seed
+                   : std::random_device{}())
 {
     // Create vectorized environment
     vec_env_ = std::make_unique<VectorizedEnv>(
@@ -121,9 +126,29 @@ PPOTrainer::PPOTrainer(IPokerEnvironmentFactory& env_factory,
     // Rollout buffer (lives on device — avoids CPU round-trip each rollout)
     buffer_ = std::make_unique<RolloutBuffer>(
         cfg_.num_steps, cfg_.num_envs, obs_dim, action_count, device_);
+
+    // Opponent pool: derived seed so its RNG and the trainer's episode_rng_
+    // don't produce the same stream when both are user-seeded.
+    if (cfg_.opp_pool.enabled) {
+        const uint64_t pool_seed = cfg_.opp_pool.seed
+            ? cfg_.opp_pool.seed ^ 0x9E3779B97F4A7C15ULL
+            : 0;
+        opp_pool_ = std::make_unique<OpponentPool>(
+            obs_dim, action_count,
+            cfg_.hidden_dim, cfg_.num_layers,
+            cfg_.hist, cfg_.round_summary,
+            device_, cfg_.opp_pool.max_size, pool_seed);
+    }
+
+    learner_seat_.assign(cfg_.num_envs, 0);
+    opp_id_.assign(cfg_.num_envs, 0);
 }
 
 PPOTrainer::~PPOTrainer() = default;
+
+int PPOTrainer::opponent_pool_size() const {
+    return opp_pool_ ? opp_pool_->size() : 0;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 void PPOTrainer::init_carry_state() {
@@ -143,6 +168,88 @@ void PPOTrainer::init_carry_state() {
         carry_legal_mask_[i] = vec_env_->env(i).legal_action_mask();
         carry_current_player_.accessor<int32_t, 1>()[i] =
             static_cast<int32_t>(vec_env_->env(i).current_player());
+    }
+
+    // Per-env opponent assignment. Both vectors stay all-zero until pool
+    // warmup; first roll happens at the first episode boundary inside a
+    // rollout (or here, for envs that skip warmup).
+    learner_seat_.assign(cfg_.num_envs, 0);
+    opp_id_.assign(cfg_.num_envs, 0);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Opponent-pool helpers — all no-op when the pool is disabled.
+// ─────────────────────────────────────────────────────────────────────────────
+
+void PPOTrainer::maybe_snapshot() {
+    if (!opp_pool_) return;
+    const auto& pcfg = cfg_.opp_pool;
+    if (pcfg.snapshot_every <= 0) return;
+    if (update_idx_ <= 0) return;
+    if (update_idx_ % pcfg.snapshot_every != 0) return;
+    opp_pool_->add_snapshot(network_);
+}
+
+void PPOTrainer::roll_episode_assignment(int env_idx) {
+    // Default: pure self-play (no pool override).
+    learner_seat_[env_idx] = 0;
+    opp_id_[env_idx]       = 0;
+
+    if (!opp_pool_ || opp_pool_->empty()) return;
+    if (update_idx_ < cfg_.opp_pool.warmup_updates) return;
+
+    std::uniform_real_distribution<float> u01(0.0f, 1.0f);
+    if (u01(episode_rng_) >= cfg_.opp_pool.p_use_pool) return;
+
+    // Heads-up NLHE is positionally asymmetric (BB / SB), so balance which
+    // seat the learner plays to avoid biasing the training distribution.
+    std::uniform_int_distribution<int> ui_seat(0, 1);
+    learner_seat_[env_idx] = ui_seat(episode_rng_);
+    opp_id_[env_idx]       = opp_pool_->sample_id();
+}
+
+void PPOTrainer::apply_pool_overrides(
+    const torch::Tensor& cur_obs,
+    const torch::Tensor& cur_mask,
+    const torch::Tensor& cur_player_cpu,
+    torch::Tensor& actions_cpu) {
+    if (!opp_pool_ || opp_pool_->empty()) return;
+
+    const int N = static_cast<int>(actions_cpu.size(0));
+    auto cp_acc = cur_player_cpu.accessor<int32_t, 1>();
+
+    // Group envs needing override by SnapshotId. Stale IDs (snapshot dropped
+    // since the env sampled it) silently fall through to live policy.
+    std::unordered_map<uint64_t, std::vector<int>> by_id;
+    by_id.reserve(static_cast<size_t>(opp_pool_->size()));
+    for (int i = 0; i < N; ++i) {
+        const uint64_t id = opp_id_[i];
+        if (id == 0) continue;
+        if (cp_acc[i] == learner_seat_[i]) continue;  // learner is acting
+        if (!opp_pool_->has_id(id))         continue;  // stale — fall through
+        by_id[id].push_back(i);
+    }
+    if (by_id.empty()) return;
+
+    auto a_acc_w = actions_cpu.accessor<int64_t, 1>();
+    auto idx_opts = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU);
+
+    for (auto& [id, idxs] : by_id) {
+        const int n = static_cast<int>(idxs.size());
+        // Build a Long index tensor on CPU, then move to device for index_select.
+        // Use a separate buffer (clone) so the tensor owns its memory.
+        std::vector<int64_t> idx64(idxs.begin(), idxs.end());
+        auto idx_cpu = torch::from_blob(idx64.data(), {n}, idx_opts).clone();
+        auto idx_dev = idx_cpu.to(cur_obs.device());
+
+        auto sub_obs  = cur_obs.index_select(0, idx_dev);
+        auto sub_mask = cur_mask.index_select(0, idx_dev);
+
+        auto pool_actions = opp_pool_->select_actions(id, sub_obs, sub_mask);
+        auto pa = pool_actions.accessor<int64_t, 1>();
+        for (int k = 0; k < n; ++k) {
+            a_acc_w[idxs[k]] = pa[k];
+        }
     }
 }
 
@@ -185,8 +292,17 @@ void PPOTrainer::train() {
         if (update_idx_ % 10 == 0) {
             std::cout << "[update " << update_idx_ << "]"
                       << "  rollout=" << stats.rollout_ms << "ms"
-                      << "  update=" << stats.update_ms << "ms\n";
+                      << "  update=" << stats.update_ms << "ms";
+            if (opp_pool_) {
+                std::cout << "  pool=" << opp_pool_->size()
+                          << "/" << opp_pool_->capacity();
+            }
+            std::cout << "\n";
         }
+
+        // Snapshot the post-update weights into the opponent pool. No-op
+        // when disabled or off the snapshot cadence.
+        maybe_snapshot();
     }
 }
 
@@ -231,6 +347,10 @@ void PPOTrainer::collect_rollout_serial() {
         auto cur_mask_cpu   = cur_mask.to(torch::kCPU).contiguous();
         auto cur_player_cpu = cur_player.to(torch::kCPU).contiguous();
 
+        // Override actions for envs where a pool snapshot is acting as the
+        // non-learner seat. No-op when the pool is disabled or empty.
+        apply_pool_overrides(cur_obs, cur_mask, cur_player_cpu, actions_cpu);
+
         auto a_acc  = actions_cpu.accessor<int64_t, 1>();
         auto lp_acc = logp_cpu.accessor<float, 1>();
         auto v_acc  = value_cpu.accessor<float, 1>();
@@ -241,14 +361,23 @@ void PPOTrainer::collect_rollout_serial() {
         auto next_player = torch::zeros({N},    i32_cpu);
         auto np_acc      = next_player.accessor<int32_t, 1>();
 
-        for (int i = 0; i < N; ++i) {
-            const int acting = cp_acc[i];
+        std::vector<uint8_t> did_reset(N, 0);
 
-            // Close out acting's previous pending and record this step.
-            player_state[i].record_step(
-                acting, i, *buffer_,
-                cur_obs_cpu[i], cur_mask_cpu[i],
-                a_acc[i], lp_acc[i], v_acc[i]);
+        for (int i = 0; i < N; ++i) {
+            const int      acting = cp_acc[i];
+            const uint64_t op_id  = opp_id_[i];
+            // When pool is active for this env, only the learner seat's
+            // transitions go into the buffer. Pure self-play (op_id == 0)
+            // keeps recording both seats so the live network learns from
+            // both halves of the experience as before.
+            const bool record = (op_id == 0) || (acting == learner_seat_[i]);
+
+            if (record) {
+                player_state[i].record_step(
+                    acting, i, *buffer_,
+                    cur_obs_cpu[i], cur_mask_cpu[i],
+                    a_acc[i], lp_acc[i], v_acc[i]);
+            }
 
             auto res = envs[i]->step(static_cast<int>(a_acc[i]));
             player_state[i].step_reward(res.reward);
@@ -259,11 +388,17 @@ void PPOTrainer::collect_rollout_serial() {
                 next_obs[i]  = rr.observation;
                 next_mask[i] = rr.legal_action_mask;
                 np_acc[i]    = static_cast<int32_t>(envs[i]->current_player());
+                did_reset[i] = 1;
             } else {
                 next_obs[i]  = res.observation;
                 next_mask[i] = res.legal_action_mask;
                 np_acc[i]    = static_cast<int32_t>(envs[i]->current_player());
             }
+        }
+
+        // Re-roll opponent assignment for envs that just reset.
+        for (int i = 0; i < N; ++i) {
+            if (did_reset[i]) roll_episode_assignment(i);
         }
 
         cur_obs    = next_obs.to(device_);
@@ -334,6 +469,8 @@ void PPOTrainer::collect_rollout_threadpool() {
     auto cur_mask   = carry_legal_mask_.to(device_);
     auto cur_player = carry_current_player_.to(device_);
 
+    std::vector<uint8_t> did_reset(N, 0);
+
     for (int step = 0; step < cfg_.num_steps; ++step) {
         // Full-batch forward on main thread (single inference call per step).
         auto ar = network_->get_action(cur_obs, cur_mask);
@@ -345,6 +482,10 @@ void PPOTrainer::collect_rollout_threadpool() {
         auto cur_mask_cpu   = cur_mask.to(torch::kCPU).contiguous();
         auto cur_player_cpu = cur_player.to(torch::kCPU).contiguous();
 
+        // Override actions for envs where a pool snapshot is acting as the
+        // non-learner seat. No-op when the pool is disabled or empty.
+        apply_pool_overrides(cur_obs, cur_mask, cur_player_cpu, actions_cpu);
+
         auto a_acc  = actions_cpu.accessor<int64_t, 1>();
         auto lp_acc = logp_cpu.accessor<float, 1>();
         auto v_acc  = value_cpu.accessor<float, 1>();
@@ -355,17 +496,25 @@ void PPOTrainer::collect_rollout_threadpool() {
         auto next_player = torch::zeros({N},    i32_cpu);
         auto np_acc      = next_player.accessor<int32_t, 1>();
 
+        std::fill(did_reset.begin(), did_reset.end(), 0);
+
         // Parallel env stepping. Each i lands in exactly one worker, so the
         // env, player_state[i], and next_* tensor slots at [i] are touched by
         // one thread only. RolloutBuffer pushes at (player, i) are disjoint
         // across i so they're also safe — no locks needed.
         step_pool_->parallel_for(N, [&](int i) {
-            const int acting = cp_acc[i];
+            const int      acting = cp_acc[i];
+            const uint64_t op_id  = opp_id_[i];
+            // Pool active for this env → record only the learner seat.
+            // Pure self-play (op_id == 0) → record both seats as before.
+            const bool record = (op_id == 0) || (acting == learner_seat_[i]);
 
-            player_state[i].record_step(
-                acting, i, *buffer_,
-                cur_obs_cpu[i], cur_mask_cpu[i],
-                a_acc[i], lp_acc[i], v_acc[i]);
+            if (record) {
+                player_state[i].record_step(
+                    acting, i, *buffer_,
+                    cur_obs_cpu[i], cur_mask_cpu[i],
+                    a_acc[i], lp_acc[i], v_acc[i]);
+            }
 
             auto res = envs[i]->step(static_cast<int>(a_acc[i]));
             player_state[i].step_reward(res.reward);
@@ -376,12 +525,18 @@ void PPOTrainer::collect_rollout_threadpool() {
                 next_obs[i]  = rr.observation;
                 next_mask[i] = rr.legal_action_mask;
                 np_acc[i]    = static_cast<int32_t>(envs[i]->current_player());
+                did_reset[i] = 1;
             } else {
                 next_obs[i]  = res.observation;
                 next_mask[i] = res.legal_action_mask;
                 np_acc[i]    = static_cast<int32_t>(envs[i]->current_player());
             }
         });
+
+        // Re-roll opponent assignments serially: episode_rng_ isn't thread-safe.
+        for (int i = 0; i < N; ++i) {
+            if (did_reset[i]) roll_episode_assignment(i);
+        }
 
         cur_obs    = next_obs.to(device_);
         cur_mask   = next_mask.to(device_);
