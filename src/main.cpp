@@ -8,6 +8,7 @@
 //  Everything else (hyperparams, bet slots) is set inline below; the
 //  sweep harness will replace this with a richer config loader later.
 
+#include "best_response.h"
 #include "league.h"
 #include "metrics_logger.h"
 #include "ppo.h"
@@ -320,6 +321,40 @@ int main(int argc, char** argv) {
     // contend with rollout/update wall-clock).
     constexpr int snapshot_every = 200;   // updates
 
+    // ── Approximate best-response evaluator (Timbers et al. 2020) ──────
+    // Train a fresh PPO exploiter against a frozen snapshot of the trained
+    // network to get a lower bound on its exploitability. Toggleable via
+    // BestResponseConfig::enabled. See include/best_response.h for details.
+    BestResponseConfig br_cfg;
+    br_cfg.enabled            = true;
+    br_cfg.eval_every         = 1000;     // updates between evaluations
+    br_cfg.updates_per_eval   = 200;      // exploiter PPO updates per eval
+    br_cfg.num_envs           = 32;
+    br_cfg.num_steps          = 128;
+    br_cfg.update_epochs      = 4;
+    br_cfg.num_minibatches    = 4;
+    br_cfg.learning_rate      = 3.0e-4f;
+    br_cfg.ent_coef           = 0.01f;
+    br_cfg.warm_start         = true;     // persist exploiter across evals
+    br_cfg.bb_per_unit_reward = league_cfg.bb_per_unit_reward;
+    br_cfg.seed               = 0xCAFEBABE;
+
+    std::unique_ptr<BestResponseEvaluator> br_eval;
+    if (br_cfg.enabled) {
+        br_eval = std::make_unique<BestResponseEvaluator>(
+            factory, bet_cfg,
+            obs_dim, action_count,
+            ppo_cfg.hidden_dim, ppo_cfg.num_layers,
+            ppo_cfg.hist, ppo_cfg.round_summary,
+            br_cfg, device);
+        std::cout << "Best-response evaluator: ON  (every "
+                  << br_cfg.eval_every << " updates, "
+                  << br_cfg.updates_per_eval << " exploiter updates per eval, "
+                  << "warm_start=" << (br_cfg.warm_start ? "on" : "off") << ")\n";
+    } else {
+        std::cout << "Best-response evaluator: OFF\n";
+    }
+
     // Action labels for the histogram printout.
     auto action_label = [&](int a) -> std::string {
         if (a == 0) return "F";
@@ -402,6 +437,26 @@ int main(int argc, char** argv) {
                 }
             }
             std::cout << "\n";
+        }
+
+        // Approximate best-response evaluation. Synchronous so its wall
+        // time shows up only as a gap between consecutive [update K] lines,
+        // rather than being counted toward the next rollout/update timing.
+        if (br_eval && s.update > 0 && s.update % br_cfg.eval_every == 0) {
+            auto br_result = br_eval->evaluate(
+                trainer.network(), s.update, s.global_step);
+            metrics.log_best_response(br_result);
+
+            std::cout << "[best-response eval @ update " << s.update
+                      << "  br_updates=" << br_result.br_updates_run
+                      << "  hands=" << br_result.num_hands
+                      << "  bb/hand=" << std::fixed << std::setprecision(3)
+                      << br_result.bb_per_hand_a
+                      << "  win%=" << std::setprecision(1)
+                      << (100.0f * br_result.win_rate_a)
+                      << "  duration=" << std::setprecision(0)
+                      << br_result.wall_ms << "ms]"
+                      << std::defaultfloat << "\n\n";
         }
     });
 

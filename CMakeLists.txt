@@ -42,6 +42,7 @@ add_library(poker_ppo_lib
     src/league.cpp
     src/metrics_logger.cpp
     src/opponent_pool.cpp
+    src/best_response.cpp
 )
 target_include_directories(poker_ppo_lib PUBLIC
     include

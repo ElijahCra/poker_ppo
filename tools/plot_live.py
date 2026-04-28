@@ -165,6 +165,7 @@ def main() -> int:
 
     metrics_path = os.path.join(run_dir, "metrics.csv")
     league_path  = os.path.join(run_dir, "league.csv")
+    br_path      = os.path.join(run_dir, "br.csv")
 
     print(f"Watching {run_dir} (refresh {args.refresh:.1f}s — close window or Ctrl-C to stop)")
 
@@ -191,6 +192,7 @@ def main() -> int:
     while plt.fignum_exists(fig.number):
         m = safe_read_csv(metrics_path)
         l = safe_read_csv(league_path)
+        b = safe_read_csv(br_path)
 
         for ax in axes.flat:
             ax.clear()
@@ -252,6 +254,23 @@ def main() -> int:
                 )
             if not mid_run.empty:
                 ax.legend(fontsize=7, loc="best", ncol=1, framealpha=0.85)
+
+        # Overlay approximate-best-response curve on the same panel — the
+        # bb/hand the adaptive PPO exploiter extracts each evaluation. A
+        # rising line means the trained policy is becoming more exploitable
+        # (worst-case performance is degrading); a stable or falling line
+        # means it's becoming more robust.
+        if (not b.empty
+                and {"global_step", "bb_per_hand"}.issubset(b.columns)):
+            br_sorted = b.sort_values("global_step")
+            ax.plot(
+                br_sorted["global_step"], br_sorted["bb_per_hand"],
+                "--D", lw=1.4, ms=4,
+                color="black",
+                label="approx_BR",
+                alpha=0.85,
+            )
+            ax.legend(fontsize=7, loc="best", ncol=1, framealpha=0.85)
 
         n_snapshots = (
             l["global_step"].nunique() if (not l.empty and "global_step" in l.columns) else 0

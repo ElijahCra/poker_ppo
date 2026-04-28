@@ -13,6 +13,7 @@ MetricsLogger::MetricsLogger(const std::string& run_dir) : run_dir_(run_dir) {
 
     metrics_.open(run_dir_ + "/metrics.csv");
     league_ .open(run_dir_ + "/league.csv");
+    br_     .open(run_dir_ + "/br.csv");
 
     metrics_ << "update,global_step,policy_loss,value_loss,entropy,"
                 "approx_kl,clip_fraction,explained_variance,learning_rate,"
@@ -22,6 +23,11 @@ MetricsLogger::MetricsLogger(const std::string& run_dir) : run_dir_(run_dir) {
     // Long format: one row per (snapshot, anchor) pair.  pivot in plot_live.
     league_ << "update,global_step,anchor,num_hands,bb_per_hand,win_rate\n";
     league_.flush();
+
+    // One row per BR evaluation.
+    br_ << "update,global_step,br_updates_run,num_hands,"
+           "bb_per_hand,win_rate,wall_ms\n";
+    br_.flush();
 }
 
 MetricsLogger::~MetricsLogger() = default;
@@ -47,6 +53,15 @@ void MetricsLogger::log_league(int update, int global_step,
                 << r.win_rate_a << '\n';
     }
     league_.flush();
+}
+
+void MetricsLogger::log_best_response(const BestResponseEvaluator::Result& r) {
+    std::lock_guard<std::mutex> lk(mu_);
+    br_ << r.update << ',' << r.global_step << ','
+        << r.br_updates_run << ',' << r.num_hands << ','
+        << r.bb_per_hand_a << ',' << r.win_rate_a << ','
+        << r.wall_ms << '\n';
+    br_.flush();
 }
 
 std::string make_run_dir() {

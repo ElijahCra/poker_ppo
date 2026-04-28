@@ -11,6 +11,7 @@
 //  so anchors can be added or removed without changing the schema.
 //
 
+#include "best_response.h"
 #include "league.h"
 #include "ppo.h"
 
@@ -36,12 +37,16 @@ public:
     void log_league(int update, int global_step,
                     const std::vector<League::MatchResult>& results);
 
+    // Sparse: one row per BR evaluation.
+    void log_best_response(const BestResponseEvaluator::Result& r);
+
     const std::string& run_dir() const { return run_dir_; }
 
 private:
     std::string   run_dir_;
     std::ofstream metrics_;
     std::ofstream league_;
+    std::ofstream br_;
     // Both CSVs may be written from different threads (e.g. background eval).
     // Serialise so a partial-line interleave can't corrupt the file.
     std::mutex    mu_;
