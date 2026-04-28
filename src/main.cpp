@@ -216,12 +216,12 @@ int main(int argc, char** argv) {
     // uninformative). 1000 ≈ 8M env steps of pure self-play before the pool
     // takes its first snapshot.
     ppo_cfg.opp_pool.warmup_updates = 1000;
-    ppo_cfg.opp_pool.p_use_pool     = 0.5f;  // fraction of envs vs pool
+    ppo_cfg.opp_pool.p_use_pool     = 0.25f; // fraction of envs vs pool
     // Cap on distinct snapshots used per rollout. Higher = more opponent
     // diversity within a rollout, but pool inference cost scales linearly.
     // 1 keeps wall time roughly constant in pool size; raise to 2-4 if the
     // gradient signal looks too narrow.
-    ppo_cfg.opp_pool.max_unique_per_rollout = 1;
+    ppo_cfg.opp_pool.max_unique_per_rollout = 6;
 
     // Env must use the same layout so obs_dim aligns with the network split.
     poker_cfg.hist          = ppo_cfg.hist;
@@ -245,8 +245,7 @@ int main(int argc, char** argv) {
     // CPU beats CUDA for this config (3x256 MLP @ batch=32): kernel-launch
     // overhead dominates compute on such a small network. Revisit if you
     // scale the network up (hidden_dim ≥ 512) or num_envs (≥ 128).
-    torch::Device device = torch::cuda::is_available() ? torch::kCUDA : torch::mps::is_available() ? torch::kMPS : torch::kCPU;
-    //torch::Device device = torch::kCPU;
+    torch::Device device = torch::cuda::is_available() ? torch::kCUDA : torch::kCPU;
     std::cout << "Using device: "<<device<<"\n";
 
     PokerEnvironmentFactory factory(poker_cfg);
@@ -294,7 +293,7 @@ int main(int argc, char** argv) {
     }
 
     League::Config league_cfg;
-    league_cfg.num_hands_per_match = 1000;
+    league_cfg.num_hands_per_match = 10000;
     league_cfg.num_parallel_envs   = 32;
     // reward_norm in poker_env is 10 * big_blind; one scaled-reward unit thus
     // corresponds to 10 BB.  Keep this in sync if you change the env's scale.

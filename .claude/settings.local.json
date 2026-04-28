@@ -22,7 +22,11 @@
       "Read(//c/Users/Elijah/AppData/Local/Programs/**)",
       "Bash(/c/Python313/python.exe -c ' *)",
       "Bash(cmake --build cmake-build-debug --target poker_ppo)",
-      "Bash(cmake --build C:/Users/Elijah/CLionProjects/poker_ppo/cmake-build-release --target poker_ppo_lib)"
+      "Bash(cmake --build C:/Users/Elijah/CLionProjects/poker_ppo/cmake-build-release --target poker_ppo_lib)",
+      "Bash(git -C /Users/elijahcrain/CLionProjects/ppo_poker diff src/opponent_pool.cpp include/opponent_pool.h)",
+      "Bash(ninja poker_ppo)",
+      "Bash(cmake --build /Users/elijahcrain/CLionProjects/ppo_poker/cmake-build-release --target poker_ppo)",
+      "Bash(python3 -c \"import ast, sys; ast.parse\\(open\\('/Users/elijahcrain/CLionProjects/ppo_poker/tools/plot_live.py'\\).read\\(\\)\\); print\\('ok'\\)\")"
     ]
   }
 }

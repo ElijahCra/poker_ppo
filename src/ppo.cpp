@@ -288,10 +288,14 @@ void PPOTrainer::train() {
     int total_updates = cfg_.num_updates();
 
     for (update_idx_ = 0; update_idx_ < total_updates; ++update_idx_) {
-        // Anneal learning rate
+        // Anneal learning rate. Linear from `learning_rate` at update 0 down
+        // to `learning_rate * min_lr_frac` at the final update — the floor
+        // avoids the dead-final-quarter where lr ≈ 0 and updates stop moving
+        // the policy.
         if (cfg_.anneal_lr) {
-            float frac = 1.0f - static_cast<float>(update_idx_) / total_updates;
-            float lr   = cfg_.learning_rate * frac;
+            const float frac = 1.0f - static_cast<float>(update_idx_) / total_updates;
+            const float floor_frac = std::max(0.0f, cfg_.min_lr_frac);
+            const float lr = cfg_.learning_rate * std::max(frac, floor_frac);
             for (auto& pg : optimizer_->param_groups())
                 static_cast<torch::optim::AdamOptions&>(pg.options()).lr(lr);
         }

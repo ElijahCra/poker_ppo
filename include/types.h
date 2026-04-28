@@ -202,6 +202,11 @@ struct PPOConfig {
     // ── optimiser ───────────────────────────────────────────────────────
     float  learning_rate    = 2.5e-4f;
     bool   anneal_lr        = true;
+    // Floor on the annealed LR as a fraction of `learning_rate`. With the
+    // default linear-to-zero schedule the last ~quarter of training does
+    // negligible learning; floor at 0.1× to keep updates meaningful all the
+    // way through. Set to 0 to recover the original linear-to-zero behaviour.
+    float  min_lr_frac      = 0.1f;
 
     // ── rollout ─────────────────────────────────────────────────────────
     int    num_envs         = 8;       // parallel self-play games

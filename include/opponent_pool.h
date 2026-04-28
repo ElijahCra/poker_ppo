@@ -7,21 +7,29 @@
 // signature is entropy oscillation, return-variance swings, and regression
 // against fixed anchors mid-training.
 //
-// Standard fix: maintain a FIFO pool of K past snapshots. Each rollout, with
-// probability `p_use_pool`, an env's opponent seat plays a uniformly-sampled
-// pool snapshot instead of the live policy. The live seat's transitions are
-// the only ones the buffer records — opponent transitions are never learned
-// from. This forces the learner to be robust against past versions of itself.
+// Standard fix: maintain a reservoir-sampled pool of K past snapshots. Each
+// rollout, with probability `p_use_pool`, an env's opponent seat plays a
+// uniformly-sampled pool snapshot instead of the live policy. The live seat's
+// transitions are the only ones the buffer records — opponent transitions are
+// never learned from. This forces the learner to be robust against past
+// versions of itself.
+//
+// Reservoir sampling (Vitter's Algorithm R) means every snapshot ever offered
+// has equal probability max_size/seen_count of currently being in the pool.
+// In contrast to FIFO, this preserves easy post-warmup snapshots throughout
+// training instead of evicting them as soon as the pool fills — the pool's
+// effective difficulty no longer rises monotonically and over-fold collapse
+// of the learner is avoided.
 //
 // Snapshots are deep-copied at add_snapshot() time so subsequent training
 // updates can't mutate them. Inference is always under NoGradGuard.
 //
 // Snapshots are addressed by a monotonically-increasing SnapshotId rather
-// than by deque index. When the pool drops an old snapshot, its ID is simply
-// retired — any env that still holds a stale ID falls through to the live
-// policy via has_id() returning false. This avoids "opponent silently swaps
-// mid-episode" if a drop happens between when an env sampled its opponent
-// and when its episode ends.
+// than by container index. When the pool replaces a snapshot, its ID is
+// simply retired — any env that still holds a stale ID falls through to the
+// live policy via has_id() returning false. This avoids "opponent silently
+// swaps mid-episode" if a replacement happens between when an env sampled
+// its opponent and when its episode ends.
 //
 
 #include "network.h"
@@ -52,9 +60,10 @@ public:
     int  capacity() const { return max_size_; }
     bool empty()    const { return snapshots_.empty(); }
 
-    /// Snapshot `src` into the pool. FIFO: drops the oldest snapshot when
-    /// full (its ID stays retired). Returns the new SnapshotId, or 0 if
-    /// max_size <= 0.
+    /// Offer `src` to the pool. Until the reservoir is full we always store;
+    /// once full we accept with probability max_size/seen_count and replace a
+    /// uniformly random existing slot — Vitter's Algorithm R. Returns the new
+    /// SnapshotId on store, or 0 if the offer was rejected (or max_size <= 0).
     SnapshotId add_snapshot(const ActorCritic& src);
 
     /// Sample one of the live snapshots' IDs uniformly. Returns 0 if empty.
@@ -87,7 +96,8 @@ private:
     int                 max_size_;
 
     std::deque<Entry>   snapshots_;
-    SnapshotId          next_id_ = 1;   // 0 reserved
+    SnapshotId          next_id_     = 1;   // 0 reserved
+    uint64_t            seen_count_  = 0;   // total snapshots ever offered
     std::mt19937        rng_;
 };
 

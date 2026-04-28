@@ -28,9 +28,17 @@ import time
 from typing import Optional
 
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 
 REFRESH_SEC = 2.0
+
+# Once the per-update CSV grows past this many rows, panels 0-7 saturate into a
+# solid blob — drawing 6000 connected line segments in a 4-inch-wide panel
+# leaves no whitespace between them.  Bin into TARGET_POINTS buckets and plot
+# the per-bin mean as the line, with a faint min/max fill so single-update
+# spikes are still visible.
+TARGET_POINTS = 2000
 
 
 # The trainer writes runs/ relative to its cwd. Search the usual spots so
@@ -67,6 +75,51 @@ def safe_read_csv(path: str) -> pd.DataFrame:
         return pd.read_csv(path)
     except (pd.errors.EmptyDataError, pd.errors.ParserError):
         return pd.DataFrame()
+
+
+def _bin_downsample(x, y, target: int = TARGET_POINTS):
+    """Decimate (x, y) into ``target`` contiguous bins.
+
+    Returns (x_centers, y_mean, y_min, y_max). When len(x) <= target the
+    input is returned as-is with min/max set to None so the caller can skip
+    drawing the envelope.
+
+    Bins are uniform in *index* space (not x), which is fine for the trainer's
+    metrics since global_step is monotone with near-constant per-update growth.
+    """
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    n = len(x)
+    if n <= target:
+        return x, y, None, None
+    edges = np.linspace(0, n, target + 1, dtype=int)
+    xc  = np.empty(target)
+    yav = np.empty(target)
+    ymn = np.empty(target)
+    ymx = np.empty(target)
+    for i in range(target):
+        s = edges[i]
+        e = max(edges[i + 1], s + 1)  # guard against zero-width bins
+        seg_x = x[s:e]
+        seg_y = y[s:e]
+        xc[i]  = seg_x.mean()
+        yav[i] = seg_y.mean()
+        ymn[i] = seg_y.min()
+        ymx[i] = seg_y.max()
+    return xc, yav, ymn, ymx
+
+
+def _plot_metric(ax, x, y, color: str, label: str | None = None, alpha_line: float = 1.0):
+    """Plot a (possibly large) scalar series with adaptive decimation.
+
+    The mean line is drawn at lw=0.9; if decimation kicks in, a min/max fill
+    is drawn underneath at low alpha so spikes remain visible without the
+    middle of the panel saturating into a solid block.
+    """
+    xc, ym, ymn, ymx = _bin_downsample(x, y)
+    if ymn is not None:
+        ax.fill_between(xc, ymn, ymx, color=color, alpha=0.3, lw=0)
+    ax.plot(xc, ym, lw=0.9, color=color, alpha=alpha_line, label=label)
 
 
 PANELS = [
@@ -147,7 +200,7 @@ def main() -> int:
             x = m["global_step"]
             for (col, title), ax in zip(PANELS, axes.flat[:len(PANELS)]):
                 if col in m.columns:
-                    ax.plot(x, m[col], lw=1.0)
+                    _plot_metric(ax, x, m[col], color="C0")
                 ax.set_title(title, fontsize=9)
                 ax.set_xlabel("step", fontsize=8)
                 ax.grid(alpha=0.3)
@@ -156,9 +209,10 @@ def main() -> int:
             # Panel 7: rollout_ms and update_ms together.
             ax = axes.flat[7]
             if "rollout_ms" in m.columns:
-                ax.plot(x, m["rollout_ms"], lw=1.0, label="rollout")
+                _plot_metric(ax, x, m["rollout_ms"], color="C0", label="rollout")
             if "update_ms" in m.columns:
-                ax.plot(x, m["update_ms"], lw=1.0, alpha=0.85, label="update")
+                _plot_metric(ax, x, m["update_ms"], color="C1", label="update",
+                             alpha_line=0.85)
             ax.set_title("Wall (ms / update)", fontsize=9)
             ax.set_xlabel("step", fontsize=8)
             ax.grid(alpha=0.3)

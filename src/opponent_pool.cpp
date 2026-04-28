@@ -46,11 +46,33 @@ ActorCritic OpponentPool::clone_network(const ActorCritic& src) {
 
 OpponentPool::SnapshotId OpponentPool::add_snapshot(const ActorCritic& src) {
     if (max_size_ <= 0) return 0;
-    while (static_cast<int>(snapshots_.size()) >= max_size_) {
-        snapshots_.pop_front();
+
+    // Vitter's Algorithm R. seen_count_ is incremented on every offer (whether
+    // accepted or not) and is the denominator in the inclusion probability,
+    // giving each historical offer equal odds max_size_/seen_count_ of
+    // currently being in the pool.
+    ++seen_count_;
+
+    // Pool not yet full — accept unconditionally.
+    if (static_cast<int>(snapshots_.size()) < max_size_) {
+        const SnapshotId id = next_id_++;
+        snapshots_.push_back({id, clone_network(src)});
+        return id;
     }
+
+    // Pool full — accept with probability max_size_/seen_count_.
+    std::uniform_int_distribution<uint64_t> ui(1, seen_count_);
+    if (ui(rng_) > static_cast<uint64_t>(max_size_)) {
+        return 0;  // rejected; offered snapshot is discarded without cloning.
+    }
+
+    // Accept: replace a uniformly-random existing slot. The replaced entry's
+    // ID is retired — any env still holding it falls through to live policy
+    // via has_id() returning false.
+    std::uniform_int_distribution<int> us(0, max_size_ - 1);
+    const int slot = us(rng_);
     const SnapshotId id = next_id_++;
-    snapshots_.push_back({id, clone_network(src)});
+    snapshots_[slot] = {id, clone_network(src)};
     return id;
 }
 
