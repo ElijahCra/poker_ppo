@@ -216,8 +216,8 @@ int main(int argc, char** argv) {
     // the gradient signal (most outcomes vs a near-random opponent are
     // uninformative). 1000 ≈ 8M env steps of pure self-play before the pool
     // takes its first snapshot.
-    ppo_cfg.opp_pool.warmup_updates = 1000;
-    ppo_cfg.opp_pool.p_use_pool     = 0.25f; // fraction of envs vs pool
+    ppo_cfg.opp_pool.warmup_updates = 400;
+    ppo_cfg.opp_pool.p_use_pool     = 0.5f; // fraction of envs vs pool
     // Cap on distinct snapshots used per rollout. Higher = more opponent
     // diversity within a rollout, but pool inference cost scales linearly.
     // 1 keeps wall time roughly constant in pool size; raise to 2-4 if the
@@ -247,6 +247,7 @@ int main(int argc, char** argv) {
     // overhead dominates compute on such a small network. Revisit if you
     // scale the network up (hidden_dim ≥ 512) or num_envs (≥ 128).
     torch::Device device = torch::cuda::is_available() ? torch::kCUDA : torch::kCPU;
+
     std::cout << "Using device: "<<device<<"\n";
 
     PokerEnvironmentFactory factory(poker_cfg);
@@ -335,7 +336,7 @@ int main(int argc, char** argv) {
     br_cfg.num_minibatches    = 4;
     br_cfg.learning_rate      = 3.0e-4f;
     br_cfg.ent_coef           = 0.01f;
-    br_cfg.warm_start         = true;     // persist exploiter across evals
+    br_cfg.warm_start         = false;     // persist exploiter across evals
     br_cfg.bb_per_unit_reward = league_cfg.bb_per_unit_reward;
     br_cfg.seed               = 0xCAFEBABE;
 

@@ -253,7 +253,9 @@ def main() -> int:
                     label=anchor_name,
                 )
             if not mid_run.empty:
-                ax.legend(fontsize=7, loc="best", ncol=1, framealpha=0.85)
+                ax.legend(fontsize=7, loc="upper left",
+                          bbox_to_anchor=(1.02, 1.0), borderaxespad=0,
+                          ncol=1, framealpha=0.85)
 
         # Overlay approximate-best-response curve on the same panel — the
         # bb/hand the adaptive PPO exploiter extracts each evaluation. A
@@ -270,7 +272,9 @@ def main() -> int:
                 label="approx_BR",
                 alpha=0.85,
             )
-            ax.legend(fontsize=7, loc="best", ncol=1, framealpha=0.85)
+            ax.legend(fontsize=7, loc="upper left",
+                      bbox_to_anchor=(1.02, 1.0), borderaxespad=0,
+                      ncol=1, framealpha=0.85)
 
         n_snapshots = (
             l["global_step"].nunique() if (not l.empty and "global_step" in l.columns) else 0
@@ -280,7 +284,7 @@ def main() -> int:
             f"({n_anchor_evals} anchor evals)",
             fontsize=10,
         )
-        fig.tight_layout(rect=(0, 0, 1, 0.96))
+        fig.tight_layout(rect=(0, 0, 0.92, 0.96))
 
         try:
             fig.canvas.draw_idle()  # Request a redraw without forcing focus
