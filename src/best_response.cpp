@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <limits>
 
 namespace poker_ppo {
 
@@ -82,16 +84,88 @@ BestResponseEvaluator::evaluate(const ActorCritic& target,
     using ms    = std::chrono::duration<double, std::milli>;
     const auto t0 = clock::now();
 
-    // Snapshot the target so subsequent training updates can't race with our
-    // forward calls during the BR rollout.
+    // Snapshot the target once — every seed plays against the same frozen
+    // copy, so subsequent main-trainer updates can't race with our forwards.
     ActorCritic frozen_target = clone_network(target);
 
-    // Re-init exploiter when warm-start is off, or on the first call.
-    if (!cfg_.warm_start || !warm_started_) {
-        init_exploiter();
-        warm_started_ = true;
+    const int  num_seeds  = std::max(1, cfg_.num_exploiter_seeds);
+    const bool multi_seed = num_seeds > 1;
+
+    std::vector<float> bb_per_seed(num_seeds, 0.0f);
+    int    best_idx       = 0;
+    int    best_num_hands = 0;
+    double best_total_rew = 0.0;
+    int    best_wins      = 0;
+    int    best_ties      = 0;
+    float  best_bb        = -std::numeric_limits<float>::infinity();
+
+    for (int s = 0; s < num_seeds; ++s) {
+        // Multi-seed always re-inits (each seed must be independent for the
+        // max-over-seeds bound to be meaningful). Single-seed honours
+        // warm_start.
+        if (multi_seed || !cfg_.warm_start || !warm_started_) {
+            init_exploiter();
+            warm_started_ = true;
+        }
+
+        EvalStats es = run_one_seed(frozen_target);
+        const float avg = es.num_hands > 0
+            ? static_cast<float>(es.total_reward / es.num_hands) : 0.0f;
+        const float bb  = avg * cfg_.bb_per_unit_reward;
+        bb_per_seed[s] = bb;
+
+        if (bb > best_bb) {
+            best_bb        = bb;
+            best_idx       = s;
+            best_num_hands = es.num_hands;
+            best_total_rew = es.total_reward;
+            best_wins      = es.wins;
+            best_ties      = es.ties;
+        }
     }
 
+    // ── Aggregate across seeds ─────────────────────────────────────────
+    float bb_sum = 0.0f;
+    float bb_min = std::numeric_limits<float>::infinity();
+    for (float x : bb_per_seed) {
+        bb_sum += x;
+        bb_min = std::min(bb_min, x);
+    }
+    const float bb_mean = bb_sum / static_cast<float>(num_seeds);
+    float var_sum = 0.0f;
+    for (float x : bb_per_seed) var_sum += (x - bb_mean) * (x - bb_mean);
+    const float bb_std = std::sqrt(var_sum / static_cast<float>(num_seeds));
+
+    Result r;
+    r.update         = update;
+    r.global_step    = global_step;
+    r.br_updates_run = cfg_.updates_per_eval;
+    // Best-seed (= max-bb) stats: this is the tightest measured lower bound.
+    r.num_hands      = best_num_hands;
+    r.avg_reward_a   = best_num_hands > 0
+                       ? static_cast<float>(best_total_rew / best_num_hands) : 0.0f;
+    r.bb_per_hand_a  = best_bb;
+    r.win_rate_a     = best_num_hands > 0
+                       ? (static_cast<float>(best_wins) + 0.5f * best_ties) /
+                         static_cast<float>(best_num_hands) : 0.0f;
+    r.num_seeds      = num_seeds;
+    r.bb_per_hand_mean = bb_mean;
+    r.bb_per_hand_min  = bb_min;
+    r.bb_per_hand_std  = bb_std;
+    r.wall_ms        = ms(clock::now() - t0).count();
+    (void)best_idx;  // tracked above but not exposed; kept for future use
+    return r;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// run_one_seed — train the (already-initialised) exploiter for
+// cfg_.updates_per_eval PPO updates against the frozen target, then run the
+// eval-match. The caller (evaluate) is responsible for initialising the
+// exploiter before each call so different seeds are independent.
+// ─────────────────────────────────────────────────────────────────────────────
+
+BestResponseEvaluator::EvalStats
+BestResponseEvaluator::run_one_seed(ActorCritic& frozen_target) {
     const int N = cfg_.num_envs;
     const int D = obs_dim_;
     const int A = action_count_;
@@ -306,19 +380,125 @@ BestResponseEvaluator::evaluate(const ActorCritic& target,
         }
     }
 
-    Result r;
-    r.update         = update;
-    r.global_step    = global_step;
-    r.br_updates_run = cfg_.updates_per_eval;
-    r.num_hands      = total_hands;
-    r.avg_reward_a   = total_hands > 0
-                       ? static_cast<float>(total_reward / total_hands) : 0.0f;
-    r.bb_per_hand_a  = r.avg_reward_a * cfg_.bb_per_unit_reward;
-    r.win_rate_a     = total_hands > 0
-                       ? (static_cast<float>(wins) + 0.5f * ties) /
-                         static_cast<float>(total_hands) : 0.0f;
-    r.wall_ms        = ms(clock::now() - t0).count();
-    return r;
+    // ── POST-TRAINING EVAL ──────────────────────────────────────────────
+    // Run a deterministic, no-learning match between the trained exploiter
+    // and the frozen target — this is the canonical BR measurement.
+    // Averaging the exploiter's *training* rewards biases the bound
+    // downward because it includes the early-rollout phase when the
+    // exploiter is still randomly initialised. The post-training match
+    // measures only the trained exploiter's bb/hand, matching the spirit
+    // of the paper's "average over the last few network updates" reporting
+    // (Timbers et al. 2020, Section 4).
+    EvalStats es;
+    if (cfg_.eval_hands > 0) {
+        es = eval_match(frozen_target);
+    } else {
+        // Fallback: use training-time stats (looser bound; debug only).
+        es.num_hands    = total_hands;
+        es.wins         = wins;
+        es.ties         = ties;
+        es.total_reward = total_reward;
+    }
+    return es;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// eval_match — the trained exploiter vs the frozen target, no learning, no
+// recording. Partitions envs by acting seat each step (as League does) so
+// each network forwards only on the sub-batch that needs its decision —
+// avoids running both networks redundantly on every env.
+// ─────────────────────────────────────────────────────────────────────────────
+
+BestResponseEvaluator::EvalStats
+BestResponseEvaluator::eval_match(ActorCritic& target) {
+    EvalStats stats{};
+    const int N = cfg_.num_envs;
+    const int A = action_count_;
+    const int D = obs_dim_;
+    if (N <= 0 || cfg_.eval_hands <= 0) return stats;
+
+    auto f_cpu   = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
+    auto i32_cpu = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU);
+
+    exploiter_->eval();
+    target->eval();
+    torch::NoGradGuard ng;
+
+    // Reset envs and seed per-env state.
+    std::vector<int> exploiter_seat(N);
+    auto cur_obs    = torch::zeros({N, D}, f_cpu);
+    auto cur_mask   = torch::zeros({N, A}, f_cpu);
+    auto cur_player = torch::zeros({N},    i32_cpu);
+    for (int i = 0; i < N; ++i) {
+        auto rr = envs_[i]->reset();
+        cur_obs[i]    = rr.observation;
+        cur_mask[i]   = rr.legal_action_mask;
+        cur_player.accessor<int32_t, 1>()[i] =
+            static_cast<int32_t>(envs_[i]->current_player());
+        exploiter_seat[i] = i % 2;  // initial seat alternation
+    }
+
+    // Reusable [N, ·] sub-batch staging tensors.
+    auto sub_obs  = torch::zeros({N, D}, f_cpu);
+    auto sub_mask = torch::zeros({N, A}, f_cpu);
+
+    auto run_net = [&](ActorCritic& net, const std::vector<int>& idxs,
+                       std::vector<int64_t>& out_actions) {
+        if (idxs.empty()) return;
+        const int n = static_cast<int>(idxs.size());
+        auto bo = sub_obs.narrow(0, 0, n);
+        auto bm = sub_mask.narrow(0, 0, n);
+        for (int j = 0; j < n; ++j) {
+            bo[j] = cur_obs[idxs[j]];
+            bm[j] = cur_mask[idxs[j]];
+        }
+        auto bo_d = bo.to(device_);
+        auto bm_d = bm.to(device_);
+        auto ar = net->get_action(bo_d, bm_d);
+        auto act_cpu = ar.action.to(torch::kCPU).contiguous();
+        auto a = act_cpu.accessor<int64_t, 1>();
+        for (int j = 0; j < n; ++j) out_actions[idxs[j]] = a[j];
+    };
+
+    std::vector<int64_t> actions(N, 0);
+
+    while (stats.num_hands < cfg_.eval_hands) {
+        auto cp = cur_player.accessor<int32_t, 1>();
+
+        std::vector<int> exp_idxs, tgt_idxs;
+        exp_idxs.reserve(N); tgt_idxs.reserve(N);
+        for (int i = 0; i < N; ++i)
+            (cp[i] == exploiter_seat[i] ? exp_idxs : tgt_idxs).push_back(i);
+
+        run_net(exploiter_, exp_idxs, actions);
+        run_net(target,     tgt_idxs, actions);
+
+        for (int i = 0; i < N; ++i) {
+            if (stats.num_hands >= cfg_.eval_hands) break;
+            auto res = envs_[i]->step(static_cast<int>(actions[i]));
+            if (res.done) {
+                const float exp_r = (exploiter_seat[i] == 0)
+                                  ? res.reward : -res.reward;
+                stats.total_reward += exp_r;
+                if      (exp_r > 0.0f)  ++stats.wins;
+                else if (exp_r == 0.0f) ++stats.ties;
+                ++stats.num_hands;
+
+                auto rr = envs_[i]->reset();
+                cur_obs[i]  = rr.observation;
+                cur_mask[i] = rr.legal_action_mask;
+                cur_player.accessor<int32_t, 1>()[i] =
+                    static_cast<int32_t>(envs_[i]->current_player());
+                exploiter_seat[i] = 1 - exploiter_seat[i];
+            } else {
+                cur_obs[i]  = res.observation;
+                cur_mask[i] = res.legal_action_mask;
+                cur_player.accessor<int32_t, 1>()[i] =
+                    static_cast<int32_t>(envs_[i]->current_player());
+            }
+        }
+    }
+    return stats;
 }
 
 }  // namespace poker_ppo

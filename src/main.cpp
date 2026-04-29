@@ -217,7 +217,7 @@ int main(int argc, char** argv) {
     // uninformative). 1000 ≈ 8M env steps of pure self-play before the pool
     // takes its first snapshot.
     ppo_cfg.opp_pool.warmup_updates = 400;
-    ppo_cfg.opp_pool.p_use_pool     = 0.5f; // fraction of envs vs pool
+    ppo_cfg.opp_pool.p_use_pool     = 0.05f; // fraction of envs vs pool
     // Cap on distinct snapshots used per rollout. Higher = more opponent
     // diversity within a rollout, but pool inference cost scales linearly.
     // 1 keeps wall time roughly constant in pool size; raise to 2-4 if the
@@ -294,6 +294,8 @@ int main(int argc, char** argv) {
         action_count = tmp->bet_config().action_count();
     }
 
+
+
     League::Config league_cfg;
     league_cfg.num_hands_per_match = 10000;
     league_cfg.num_parallel_envs   = 32;
@@ -329,14 +331,33 @@ int main(int argc, char** argv) {
     BestResponseConfig br_cfg;
     br_cfg.enabled            = true;
     br_cfg.eval_every         = 1000;     // updates between evaluations
-    br_cfg.updates_per_eval   = 200;      // exploiter PPO updates per eval
+    // Each eval trains a fresh exploiter for `updates_per_eval` updates.
+    // 200 was too short — most evals just measured "can an undertrained
+    // exploiter beat the target" (always no). 1000 gives enough budget for
+    // the exploiter to actually find weaknesses; ~5× the per-eval wall
+    // cost vs 200, still cheap relative to 1000 main updates between evals.
+    br_cfg.updates_per_eval   = 1000;
     br_cfg.num_envs           = 32;
     br_cfg.num_steps          = 128;
     br_cfg.update_epochs      = 4;
     br_cfg.num_minibatches    = 4;
     br_cfg.learning_rate      = 3.0e-4f;
     br_cfg.ent_coef           = 0.01f;
-    br_cfg.warm_start         = false;     // persist exploiter across evals
+    // warm_start=false: each eval starts the exploiter from random init, so
+    // the curve is a time-stationary bound. warm_start=true gives a tighter
+    // bound but conflates "the policy got more exploitable" with "the
+    // exploiter has had more compute." See br.csv for the resulting curve.
+    br_cfg.warm_start         = false;
+    // Post-training eval-only match — the bb/hand reported as the BR estimate
+    // comes from this match, not from rewards collected during exploiter
+    // training (which would bias the bound downward).
+    br_cfg.eval_hands         = 5000;
+    // Per-eval, train this many independent fresh exploiters and report the
+    // max-bb/hand as the canonical bound. Each individual exploiter's
+    // bb/hand is a valid lower bound; the max across seeds is the tightest
+    // bound the budget can produce, and the curve is much less noisy than
+    // any single seed. Mean/min/std are also recorded for diagnostics.
+    br_cfg.num_exploiter_seeds = 3;
     br_cfg.bb_per_unit_reward = league_cfg.bb_per_unit_reward;
     br_cfg.seed               = 0xCAFEBABE;
 
@@ -350,8 +371,9 @@ int main(int argc, char** argv) {
             br_cfg, device);
         std::cout << "Best-response evaluator: ON  (every "
                   << br_cfg.eval_every << " updates, "
-                  << br_cfg.updates_per_eval << " exploiter updates per eval, "
-                  << "warm_start=" << (br_cfg.warm_start ? "on" : "off") << ")\n";
+                  << br_cfg.num_exploiter_seeds << " seeds × "
+                  << br_cfg.updates_per_eval << " exploiter updates, "
+                  << br_cfg.eval_hands << "-hand eval match)\n";
     } else {
         std::cout << "Best-response evaluator: OFF\n";
     }
@@ -449,11 +471,13 @@ int main(int argc, char** argv) {
             metrics.log_best_response(br_result);
 
             std::cout << "[best-response eval @ update " << s.update
-                      << "  br_updates=" << br_result.br_updates_run
-                      << "  hands=" << br_result.num_hands
-                      << "  bb/hand=" << std::fixed << std::setprecision(3)
+                      << "  seeds=" << br_result.num_seeds
+                      << "  bb/hand max=" << std::fixed << std::setprecision(3)
                       << br_result.bb_per_hand_a
-                      << "  win%=" << std::setprecision(1)
+                      << "  mean=" << br_result.bb_per_hand_mean
+                      << "  min=" << br_result.bb_per_hand_min
+                      << "  std=" << br_result.bb_per_hand_std
+                      << "  best-win%=" << std::setprecision(1)
                       << (100.0f * br_result.win_rate_a)
                       << "  duration=" << std::setprecision(0)
                       << br_result.wall_ms << "ms]"

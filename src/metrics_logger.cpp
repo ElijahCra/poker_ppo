@@ -24,9 +24,12 @@ MetricsLogger::MetricsLogger(const std::string& run_dir) : run_dir_(run_dir) {
     league_ << "update,global_step,anchor,num_hands,bb_per_hand,win_rate\n";
     league_.flush();
 
-    // One row per BR evaluation.
-    br_ << "update,global_step,br_updates_run,num_hands,"
-           "bb_per_hand,win_rate,wall_ms\n";
+    // One row per BR evaluation. bb_per_hand is the max-over-seeds (the
+    // tightest measured lower bound); the *_mean/min/std columns are
+    // diagnostics over the per-seed distribution.
+    br_ << "update,global_step,br_updates_run,num_seeds,num_hands,"
+           "bb_per_hand,bb_per_hand_mean,bb_per_hand_min,bb_per_hand_std,"
+           "win_rate,wall_ms\n";
     br_.flush();
 }
 
@@ -58,9 +61,13 @@ void MetricsLogger::log_league(int update, int global_step,
 void MetricsLogger::log_best_response(const BestResponseEvaluator::Result& r) {
     std::lock_guard<std::mutex> lk(mu_);
     br_ << r.update << ',' << r.global_step << ','
-        << r.br_updates_run << ',' << r.num_hands << ','
-        << r.bb_per_hand_a << ',' << r.win_rate_a << ','
-        << r.wall_ms << '\n';
+        << r.br_updates_run << ',' << r.num_seeds << ','
+        << r.num_hands << ','
+        << r.bb_per_hand_a    << ','
+        << r.bb_per_hand_mean << ','
+        << r.bb_per_hand_min  << ','
+        << r.bb_per_hand_std  << ','
+        << r.win_rate_a << ',' << r.wall_ms << '\n';
     br_.flush();
 }
 

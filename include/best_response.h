@@ -61,6 +61,25 @@ struct BestResponseConfig {
     bool  clip_vloss         = false;
 
     bool  warm_start         = true;
+
+    // Number of fresh exploiter seeds per evaluate() call. When >1, each
+    // call trains that many independent exploiters from random init against
+    // the same frozen target, and reports max-bb/hand as the canonical
+    // lower bound (mean/min/std are also recorded as diagnostics). Each
+    // seed's per-eval bb/hand is a valid lower bound on its own; the max
+    // over seeds is the tightest bound the budget can produce, and is much
+    // less noisy than any single seed. Cost scales linearly. When >1,
+    // warm_start is ignored — every seed is fresh.
+    int   num_exploiter_seeds = 3;
+
+    // Hands played in the post-training eval-only match between the trained
+    // exploiter and the frozen target. The eval-match's bb/hand is the
+    // reported BR estimate — using rewards collected during the exploiter's
+    // training rollouts would bias the bound downward (the early-training
+    // exploiter plays badly while it's still learning). Set to 0 to skip
+    // the eval and fall back to training-time reward averaging (debug only).
+    int   eval_hands         = 5000;
+
     float bb_per_unit_reward = 10.0f;  // matches PokerEnvironment::reward_norm
     uint64_t seed            = 0;
 };
@@ -70,11 +89,21 @@ public:
     struct Result {
         int    update;             // main-trainer update_idx_ at evaluation
         int    global_step;        // main-trainer global_step_
-        int    br_updates_run;
-        int    num_hands;
-        float  avg_reward_a;       // exploiter's mean per-hand reward (scaled)
-        float  bb_per_hand_a;      // = avg_reward_a * bb_per_unit_reward
-        float  win_rate_a;         // (wins + 0.5*ties) / num_hands
+        int    br_updates_run;     // PPO updates per exploiter seed
+
+        // Stats from the seed that achieved max bb/hand — that's the
+        // tightest measured lower bound on exploitability.
+        int    num_hands;          // hands in the best-seed eval match
+        float  avg_reward_a;       // best-seed scaled mean reward
+        float  bb_per_hand_a;      // best-seed bb/hand = max over seeds
+        float  win_rate_a;         // best-seed (wins + 0.5*ties) / num_hands
+
+        // Per-seed aggregates (across all `num_seeds` exploiters).
+        int    num_seeds;          // = cfg.num_exploiter_seeds
+        float  bb_per_hand_mean;
+        float  bb_per_hand_min;
+        float  bb_per_hand_std;    // population std
+
         double wall_ms;
     };
 
@@ -99,6 +128,22 @@ public:
 private:
     void init_exploiter();
     ActorCritic clone_network(const ActorCritic& src);
+
+    // Stats from a deterministic, no-learning match between the exploiter
+    // and the frozen target — the canonical BR measurement once training
+    // completes. eval_match() resets envs_ before running.
+    struct EvalStats {
+        int    num_hands    = 0;
+        int    wins         = 0;
+        int    ties         = 0;
+        double total_reward = 0.0;
+    };
+    EvalStats eval_match(ActorCritic& target);
+
+    // Train one exploiter from current state for `cfg_.updates_per_eval`
+    // updates against the frozen target, then run the eval-match. Each
+    // seed of evaluate() invokes this once with a fresh exploiter.
+    EvalStats run_one_seed(ActorCritic& frozen_target);
 
     IPokerEnvironmentFactory& factory_;
     BetConfig                 bet_cfg_;

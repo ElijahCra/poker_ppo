@@ -257,19 +257,31 @@ def main() -> int:
                           bbox_to_anchor=(1.02, 1.0), borderaxespad=0,
                           ncol=1, framealpha=0.85)
 
-        # Overlay approximate-best-response curve on the same panel — the
-        # bb/hand the adaptive PPO exploiter extracts each evaluation. A
-        # rising line means the trained policy is becoming more exploitable
-        # (worst-case performance is degrading); a stable or falling line
-        # means it's becoming more robust.
+        # Overlay approximate-best-response curve on the same panel.
+        # bb_per_hand is max-over-seeds — the tightest measured lower bound
+        # on exploitability. When num_seeds > 1, also shade [min, max] over
+        # seeds to visualise per-eval seed variance.
         if (not b.empty
                 and {"global_step", "bb_per_hand"}.issubset(b.columns)):
             br_sorted = b.sort_values("global_step")
+            multi_seed = (
+                "num_seeds" in br_sorted.columns
+                and "bb_per_hand_min" in br_sorted.columns
+                and (br_sorted["num_seeds"] > 1).any()
+            )
+            if multi_seed:
+                ax.fill_between(
+                    br_sorted["global_step"],
+                    br_sorted["bb_per_hand_min"],
+                    br_sorted["bb_per_hand"],
+                    color="black", alpha=0.12,
+                    label="_nolegend_",
+                )
             ax.plot(
                 br_sorted["global_step"], br_sorted["bb_per_hand"],
                 "--D", lw=1.4, ms=4,
                 color="black",
-                label="approx_BR",
+                label="approx_BR (max)" if multi_seed else "approx_BR",
                 alpha=0.85,
             )
             ax.legend(fontsize=7, loc="upper left",
