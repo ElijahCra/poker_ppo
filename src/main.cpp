@@ -38,7 +38,13 @@ namespace {
     cfg.min_bet              = 1000;
     cfg.min_raise            = 1000;
     cfg.max_raises_per_round = 4;
-    cfg.pot_fractions        = {0.5, 1.0, 2.0};
+    // Log-spaced bet-sizing menu covering small-value / standard cbet /
+    // polarised / overbet zones. 11 fractions + AI slot = 12 raise actions
+    // total (action count = 14: F + C + 11 raises + AI). Sizes below the
+    // pre-flop min-raise (e.g. 0.25 at small pots) are masked out by the
+    // env at action time; the policy learns the legal subset.
+    cfg.pot_fractions        = {0.25, 0.33, 0.5, 0.66, 0.75,
+                                1.0,  1.25, 1.5, 2.0,  2.5, 3.0};
     cfg.include_all_in_slot  = true;
     return cfg;
 }
@@ -169,19 +175,24 @@ int main(int argc, char** argv) {
 
     // ── PPO hyper-parameters ────────────────────────────────────────────
     PPOConfig ppo_cfg;
-    ppo_cfg.total_timesteps = 200'000'000;
-    ppo_cfg.num_envs        = 64;
+    // Scaled for ~8–12 raise sizes (A ≈ 11–14): bumping num_envs, ent_coef,
+    // and total_timesteps to maintain per-action sample SNR, exploration
+    // pressure, and convergence budget at the larger action space.
+    ppo_cfg.total_timesteps = 300'000'000;
+    ppo_cfg.num_envs        = 96;
     ppo_cfg.num_steps       = 128;
     ppo_cfg.update_epochs   = 4;
     ppo_cfg.num_minibatches = 4;
     ppo_cfg.learning_rate   = 3.0e-4f;
-    ppo_cfg.ent_coef        = 0.02f;
+    ppo_cfg.ent_coef        = 0.03f;
 
     ppo_cfg.vf_coef         = 0.5f;
     ppo_cfg.clip_coef       = 0.2f;
     ppo_cfg.clip_vloss      = false;
 
-    ppo_cfg.hidden_dim      = 256;
+    // Scaled for ~8–12 raise sizes: ~√(A_new/A_old) capacity bump on the
+    // shared trunk to support finer action-distribution discrimination.
+    ppo_cfg.hidden_dim      = 384;
     ppo_cfg.num_layers      = 2;
     ppo_cfg.anneal_lr       = true;
 
@@ -222,7 +233,7 @@ int main(int argc, char** argv) {
     // diversity within a rollout, but pool inference cost scales linearly.
     // 1 keeps wall time roughly constant in pool size; raise to 2-4 if the
     // gradient signal looks too narrow.
-    ppo_cfg.opp_pool.max_unique_per_rollout = 6;
+    ppo_cfg.opp_pool.max_unique_per_rollout = 1;
 
     // Env must use the same layout so obs_dim aligns with the network split.
     poker_cfg.hist          = ppo_cfg.hist;
