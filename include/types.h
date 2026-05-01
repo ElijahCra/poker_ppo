@@ -208,6 +208,20 @@ struct PPOConfig {
     // way through. Set to 0 to recover the original linear-to-zero behaviour.
     float  min_lr_frac      = 0.1f;
 
+    // Entropy-coefficient cosine schedule. When enabled, `ent_coef` is the
+    // starting value and the effective coefficient decays smoothly to
+    // `ent_coef_min` over the full training run via:
+    //     ent(t) = ent_min + 0.5·(ent_start − ent_min)·(1 + cos(π·t/T))
+    // Rationale (poker-specific): the optimal entropy regime in IIGs is
+    // higher than typical single-agent RL defaults early in training (lots
+    // of action-space exploration needed) but should drop late so the
+    // policy can sharpen the near-deterministic regions of the strategy
+    // (premium-hand value-betting, trash folds). A constant ent_coef can't
+    // optimise both — too high hurts late-game specialisation and inflates
+    // BR exploitability, too low collapses early exploration.
+    bool   anneal_ent_coef  = false;
+    float  ent_coef_min     = 0.01f;
+
     // ── rollout ─────────────────────────────────────────────────────────
     int    num_envs         = 8;       // parallel self-play games
     int    num_steps        = 128;     // steps per env per rollout

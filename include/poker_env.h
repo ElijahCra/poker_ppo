@@ -4,6 +4,7 @@
 #include "Game.hpp"
 #include "GameConfig.hpp"
 
+#include <array>
 #include <atomic>
 #include <memory>
 #include <random>
@@ -124,6 +125,13 @@ private:
     float pot_norm_    = 1.0f;   // = 2 * initial_stack
     float reward_norm_ = 1.0f;   // = 10 * big_blind; terminal-reward scaling
     int   max_raises_norm_ = 4;  // = game.max_raises_per_round (>=1 guarded)
+
+    // Inverse of the hand_indexer's per-round canonical-bucket count, used
+    // to normalise handHashes[round] into [0, 1] hand-strength features.
+    // Set lazily on first observation since the static indexer needs the
+    // first hand-init pass to be populated. `mutable` because it's a pure
+    // memoisation cache — no observable state change for callers.
+    mutable std::array<float, 4> indexer_norm_ = {0.0f, 0.0f, 0.0f, 0.0f};
 
     // PPO-action-index → Poker Action, or nullopt if illegal this state.
     std::vector<std::optional<::Game::Action>> action_table_;

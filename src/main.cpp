@@ -350,7 +350,14 @@ int main(int argc, char** argv) {
     ppo_cfg.update_epochs   = 4;
     ppo_cfg.num_minibatches = 4;
     ppo_cfg.learning_rate   = 3.0e-4f;
-    ppo_cfg.ent_coef        = 0.08f;
+    // Cosine-anneal entropy from `ent_coef` (start) to `ent_coef_min` (end).
+    // Bracketed by the constant-ent_coef runs we did (0.03 → BR ~1 but
+    // weak vs random; 0.08 → strong vs random but BR ~3). Annealing keeps
+    // the early-exploration benefit of higher entropy and the late
+    // policy-sharpening benefit of lower entropy.
+    ppo_cfg.ent_coef         = 0.06f;
+    ppo_cfg.ent_coef_min     = 0.01f;
+    ppo_cfg.anneal_ent_coef  = true;
 
     ppo_cfg.vf_coef         = 0.5f;
     ppo_cfg.clip_coef       = 0.1f;
@@ -366,7 +373,12 @@ int main(int argc, char** argv) {
     // T = max actions per hand the encoder sees (older actions are dropped).
     // 32 comfortably covers heads-up NLHE: 4 rounds × 4 raises × 2 players
     // = 32 raise slots, plus call/check fillers — truncation is rare.
-    ppo_cfg.hist.enabled         = false;   // --no-attention to disable
+    // Bet-history attention encoder. Verified end-to-end in
+    // Game/tests/attention_test.cpp (forward, backward, masking
+    // correctness, content sensitivity). Enabled here so the network
+    // sees the actual sequence of bets/raises/calls (sizing, position,
+    // round) rather than only the round-summary aggregates.
+    ppo_cfg.hist.enabled         = true;
     ppo_cfg.hist.max_history_len = 32;
     ppo_cfg.hist.attn_dim        = 64;
     ppo_cfg.hist.attn_heads      = 4;
@@ -399,7 +411,7 @@ int main(int argc, char** argv) {
     // diversity within a rollout, but pool inference cost scales linearly.
     // 1 keeps wall time roughly constant in pool size; raise to 2-4 if the
     // gradient signal looks too narrow.
-    ppo_cfg.opp_pool.max_unique_per_rollout = 1;
+    ppo_cfg.opp_pool.max_unique_per_rollout = 4;
 
     // Env must use the same layout so obs_dim aligns with the network split.
     poker_cfg.hist          = ppo_cfg.hist;

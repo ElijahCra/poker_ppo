@@ -31,6 +31,15 @@ target_link_libraries(showdown_test PRIVATE
     GTest::gtest_main
 )
 
+# Attention-encoder tests. These exercise the network module so they need
+# poker_ppo_lib (which transitively pulls in libtorch).
+add_executable(attention_test attention_test.cpp)
+target_link_libraries(attention_test PRIVATE
+    poker_ppo_lib
+    GTest::gtest_main
+)
+
 # Register with CTest so `ctest` discovers the cases automatically.
 include(GoogleTest)
 gtest_discover_tests(showdown_test)
+gtest_discover_tests(attention_test)

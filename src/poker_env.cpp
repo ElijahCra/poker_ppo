@@ -4,6 +4,7 @@
 #include "BettingConfig.hpp"
 #include "Context/GameContext.hpp"
 #include "GameBase.hpp"
+#include "Utility/HandAbstraction/hand_index.h"
 
 #include <cmath>
 #include <stdexcept>
@@ -12,9 +13,20 @@ namespace poker_ppo {
 
 namespace {
 
-constexpr int CARD_SLOTS    = 52;
-constexpr int FEAT_EXTRA    = 10;  // my_stack + opp_stack + pot + cur_bet + raises + 4 round OH + seat
-constexpr int STATIC_OBS    = CARD_SLOTS * 2 + FEAT_EXTRA;
+constexpr int CARD_SLOTS = 52;
+// Static obs features after the two card one-hot blocks:
+//   stacks(2) + pot + cur_bet + raises + round one-hot(4) + seat = 10
+//   hand-strength bucket per round (preflop, flop, turn, river)    = 4
+// The hand-strength block carries one float per round — the canonical
+// hand_indexer bucket index for the acting player on that round, divided
+// by the round's total bucket count to land in [0, 1]. Future rounds are
+// masked to 0 so we don't leak unseen community cards. The indexer's
+// suit-isomorphic clustering is hard for a small MLP to derive from raw
+// card one-hots, so this is a meaningful inductive bias for free.
+constexpr int FEAT_BASIC = 10;
+constexpr int FEAT_HAND_STRENGTH = 4;
+constexpr int FEAT_EXTRA = FEAT_BASIC + FEAT_HAND_STRENGTH;
+constexpr int STATIC_OBS = CARD_SLOTS * 2 + FEAT_EXTRA;
 
 } // namespace
 
@@ -265,6 +277,36 @@ torch::Tensor PokerEnvironment::compute_observation() const {
     for (int r = 0; r < 4; ++r) a[off++] = (r == round) ? 1.0f : 0.0f;
 
     a[off++] = static_cast<float>(me);
+
+    // Hand-strength block: per-round normalised hand_indexer bucket ids.
+    // Lazy-init the per-round divisor on first call (the static indexer
+    // is populated by the first DiscreteGame's CardData::initialize()).
+    if (indexer_norm_[0] == 0.0f) {
+        for (int r = 0; r < 4; ++r) {
+            const uint64_t sz =
+                hand_indexer_size(&::Game::CardData::flopIndexer,
+                                  static_cast<uint_fast32_t>(r));
+            // sz can be 0 only if the indexer wasn't initialised — keep the
+            // sentinel so we retry next call.
+            if (sz == 0) { indexer_norm_[0] = 0.0f; break; }
+            indexer_norm_[r] = 1.0f / static_cast<float>(sz);
+        }
+    }
+    {
+        const auto& handHashes = ctx.cards.handHashes;
+        const int   round_now  = ctx.getRoundNumber();
+        for (int r = 0; r < 4; ++r) {
+            // Mask future-round buckets to 0 so we never leak unseen
+            // community cards; only the rounds we've actually reached
+            // contribute info.
+            if (r <= round_now) {
+                a[off++] = static_cast<float>(handHashes[me * 4 + r])
+                         * indexer_norm_[r];
+            } else {
+                a[off++] = 0.0f;
+            }
+        }
+    }
 
     // Round-summary block: 4 rounds × 4 features.  Sits between the static
     // features and the attention-history block so each sub-block can be

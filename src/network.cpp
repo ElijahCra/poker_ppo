@@ -68,7 +68,10 @@ TowerImpl::TowerImpl(int obs_dim, int output_dim,
                 "ffn2_" + s, torch::nn::Linear(FF, D)));
         }
 
-        trunk_in_dim = static_dim_ + D;
+        // The history encoder contributes its CLS embedding (dim D) to the
+        // trunk input. round_summary, if enabled, contributes its own
+        // features in parallel — accumulate, don't overwrite.
+        trunk_in_dim += D;
     }
 
     // ── trunk + head ────────────────────────────────────────────────────

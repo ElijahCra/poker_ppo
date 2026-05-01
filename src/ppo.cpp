@@ -5,6 +5,7 @@
 #include <iomanip>
 #include <sstream>
 #include <algorithm>
+#include <cmath>
 #include <numeric>
 #include <chrono>
 #include <thread>
@@ -778,6 +779,20 @@ PPOTrainer::UpdateStats PPOTrainer::update() {
     auto total_clip_frac   = torch::zeros({}, stat_opts);
     int  num_updates = 0;
 
+    // Cosine-anneal the entropy coefficient if enabled. Held constant across
+    // all minibatches of *this* update (only changes between updates), so the
+    // PPO loss within an update is well-defined. ent(t) starts at
+    // cfg_.ent_coef and decays toward cfg_.ent_coef_min over total updates.
+    const float ent_coef_now = [&]() {
+        if (!cfg_.anneal_ent_coef) return cfg_.ent_coef;
+        const int total = std::max(1, cfg_.num_updates());
+        const float progress = std::min(
+            1.0f, static_cast<float>(update_idx_) / static_cast<float>(total));
+        const float cosine_factor = 0.5f * (1.0f + std::cos(M_PI * progress));
+        const float ent_min = std::min(cfg_.ent_coef_min, cfg_.ent_coef);
+        return ent_min + cosine_factor * (cfg_.ent_coef - ent_min);
+    }();
+
     for (int epoch = 0; epoch < cfg_.update_epochs; ++epoch) {
         // Shuffle
         auto indices = torch::randperm(B, torch::TensorOptions().dtype(torch::kInt64).device(device_));
@@ -832,8 +847,8 @@ PPOTrainer::UpdateStats PPOTrainer::update() {
 
             // ── total loss ──────────────────────────────────────────
             auto loss = pg_loss
-                      - cfg_.ent_coef * entropy_loss
-                      + cfg_.vf_coef  * v_loss;
+                      - ent_coef_now * entropy_loss
+                      + cfg_.vf_coef * v_loss;
 
             optimizer_->zero_grad();
             loss.backward();
