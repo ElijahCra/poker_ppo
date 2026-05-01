@@ -102,7 +102,9 @@ void reInitialize() {
         if (terminal->winner == player) {
             return static_cast<int32_t>(m_context.getPot()) - contribution;
         }
-        if (terminal->winner == -1) {  // Draw
+        // Tie convention: Transitioner::makeTerminal sets winner = 2 for a
+        // showdown tie. Accept either 2 or the legacy -1 sentinel for safety.
+        if (terminal->winner == 2 || terminal->winner == -1) {
             return static_cast<int32_t>(m_context.getPot() / 2) - contribution;
         }
         // Lose

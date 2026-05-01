@@ -55,3 +55,12 @@ target_link_libraries(poker_ppo_lib PUBLIC
 # ── Example binary ────────────────────────────────────────────────────────────
 add_executable(poker_ppo src/main.cpp)
 target_link_libraries(poker_ppo PRIVATE poker_ppo_lib)
+
+# ── Tests ─────────────────────────────────────────────────────────────────────
+# Opt-in via -DBUILD_TESTS=ON (default ON). Pulls GoogleTest via
+# FetchContent inside Game/tests/.
+option(BUILD_TESTS "Build unit tests" ON)
+if(BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(Game/tests)
+endif()

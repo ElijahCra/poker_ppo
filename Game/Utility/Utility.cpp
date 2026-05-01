@@ -59,6 +59,8 @@ bool Utility::initLookup() {
 
 int Utility::LookupHandValue(int* pCards)
 {
+    // Lazy-load the 120 MB rank table on first call. Cheap branch otherwise.
+    if (!Utility::initialized) Utility::initLookup();
 
     int p = Utility::HR[53 + *pCards++];
     p = Utility::HR[p + *pCards++];

@@ -869,8 +869,12 @@ PPOTrainer::UpdateStats PPOTrainer::update() {
     float n  = static_cast<float>(std::max(1, num_updates));
     float lr = cfg_.learning_rate;
     if (cfg_.anneal_lr) {
-        float frac = 1.0f - static_cast<float>(update_idx_) / cfg_.num_updates();
-        lr = cfg_.learning_rate * frac;
+        // Mirror the floor logic from train()'s anneal block so the
+        // reported lr matches what the optimiser actually uses; otherwise
+        // late-training plots show lr→0 even when the floor is active.
+        const float frac       = 1.0f - static_cast<float>(update_idx_) / cfg_.num_updates();
+        const float floor_frac = std::max(0.0f, cfg_.min_lr_frac);
+        lr = cfg_.learning_rate * std::max(frac, floor_frac);
     }
     // Single device→host sync for all stats
     return UpdateStats{

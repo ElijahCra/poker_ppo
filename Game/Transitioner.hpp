@@ -13,6 +13,7 @@
 #include "GameBase.hpp"
 #include "Context/GameContext.hpp"
 #include "GameState.hpp"
+#include "Utility/Utility.hpp"
 
 namespace Game {
 
@@ -203,13 +204,44 @@ inline TransitionResult Transitioner::makeTerminal(const GameContext& context,
     if (reason != TerminalState::SHOWDOWN) {
         terminal.winner = winner;
     } else {
-        uint64_t player0Hand =context.getCardHash(0,3);
-        uint64_t player1Hand = context.getCardHash(1,3);
-        if (player0Hand == player1Hand) { //compare river hands
-            terminal.winner = 2;
-        } else {
-            terminal.winner = player0Hand > player1Hand ? 0 : 1;
-        }
+        // Showdown: evaluate both 7-card hands with the TwoPlusTwo lookup
+        // and pick the higher rank. The previous code compared
+        // hand_indexer outputs — those are *canonical-form identifiers*,
+        // not strength scores, so the resulting winner was effectively
+        // arbitrary. That bug was leaking into the PPO reward signal on
+        // every showdown.
+        //
+        // Card encoding conversion: deck.h stores cards as
+        //   id_dh = (rank << 2) | suit_dh    rank ∈ [0, 13), suit ∈ [0, 4)
+        // with suit table "shdc" → suit 0=s, 1=h, 2=d, 3=c.
+        // The TwoPlusTwo evaluator (Ray Wotton's tables) uses
+        //   id_2p2 = (rank * 4) + suit_2p2 + 1
+        // with suit order "cdhs" → suit 0=c, 1=d, 2=h, 3=s. So
+        //   suit_2p2 = 3 - suit_dh
+        //   id_2p2   = (id_dh & ~3) + (3 - (id_dh & 3)) + 1
+        const auto& raw = context.cards.rawCards;
+        auto to_2p2 = [](uint8_t c) -> int {
+            const int rank      = c >> 2;
+            const int suit_dh   = c & 3;
+            const int suit_2p2  = 3 - suit_dh;
+            return rank * 4 + suit_2p2 + 1;
+        };
+        int p0_cards[7] = {
+            to_2p2(raw[0]), to_2p2(raw[1]),                  // hole
+            to_2p2(raw[4]), to_2p2(raw[5]), to_2p2(raw[6]),  // flop
+            to_2p2(raw[7]),                                  // turn
+            to_2p2(raw[8]),                                  // river
+        };
+        int p1_cards[7] = {
+            to_2p2(raw[2]), to_2p2(raw[3]),
+            to_2p2(raw[4]), to_2p2(raw[5]), to_2p2(raw[6]),
+            to_2p2(raw[7]),
+            to_2p2(raw[8]),
+        };
+        const int w = Utility::getWinner(p0_cards, p1_cards);
+        // Utility::getWinner returns 0, 1, or 3 (tie). The Game's terminal
+        // convention is winner=2 for tie.
+        terminal.winner = (w == 3) ? 2 : w;
     }
     return {
         .nextState = terminal,

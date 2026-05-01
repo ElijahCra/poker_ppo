@@ -65,6 +65,21 @@ public:
     torch::Tensor legal_action_mask() const override;
     bool is_terminal() const override;
 
+    // ── public state accessors (used by the interactive play CLI) ──────
+    // All values are in mbb (millibigblinds) where applicable, matching
+    // the game engine's internal units.
+    std::array<int, 2> hole_cards(int player) const;
+    int community_count() const;
+    int community_card(int idx) const;
+    int pot() const;
+    int current_bet() const;
+    int stack(int player) const;
+    int round() const;
+    int raise_num() const;
+    /// Terminal utility for `player` in mbb. Undefined if !is_terminal().
+    int terminal_utility(int player) const;
+    const ::Game::GameConfig& game_config() const { return poker_cfg_.game; }
+
 private:
     // Per-action snapshot recorded each time the env applies a player action.
     // Hand-level: cleared by reset(). Truncated to the most-recent

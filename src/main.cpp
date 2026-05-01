@@ -18,6 +18,7 @@
 #include <chrono>
 #include <iomanip>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <string_view>
 
@@ -74,6 +75,166 @@ void printGame(const ::Game::GameConfig& g) {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// run_play — interactive REPL exposing one PokerEnvironment + the trained
+// network over stdin/stdout. Driven by tools/play.py for the UI.
+//
+// Protocol: each command from the client is a single line. The server
+// responds with multiple `key value...` lines terminated by an `OK` line.
+// All amounts are in mbb; cards are integer ids (rank<<2 | suit) in [0, 52).
+//
+// Commands:
+//   INFO                — emit static config (action_count, obs_dim, blinds,
+//                         pot_fractions, etc.).
+//   STATE               — emit current game state (player, cards, stacks,
+//                         pot, mask, obs, done, utility).
+//   STEP <action_idx>   — apply the given action; emit new STATE.
+//   RESET               — reset to a fresh hand; emit new STATE.
+//   MODEL               — run the trained network on the current observation;
+//                         emit chosen action + full softmax probs + value.
+//   QUIT                — exit cleanly.
+//
+// Errors: emit a single `ERR <message>` line followed by `OK`.
+// ─────────────────────────────────────────────────────────────────────────────
+
+void run_play(IPokerEnvironmentFactory& factory,
+              const BetConfig&    bet_cfg,
+              const PPOConfig&    ppo_cfg,
+              const PokerConfig&  poker_cfg,
+              torch::Device       device,
+              const std::string&  model_path) {
+    PPOTrainer trainer(factory, bet_cfg, ppo_cfg, device);
+    trainer.load(model_path);
+    auto& net = trainer.network();
+    net->eval();
+
+    // Single env for play. We need the concrete PokerEnvironment for the
+    // state-inspection accessors (hole_cards, pot, etc.).
+    auto env_base = factory.create(bet_cfg);
+    auto* env = dynamic_cast<PokerEnvironment*>(env_base.get());
+    if (!env) {
+        std::cerr << "ERR factory did not produce PokerEnvironment\n";
+        return;
+    }
+    env->reset();
+
+    auto emit_info = [&]() {
+        const auto& g = env->game_config();
+        std::cout << "obs_dim "      << env->obs_dim()             << "\n";
+        std::cout << "action_count " << bet_cfg.action_count()     << "\n";
+        std::cout << "initial_stack " << g.initial_stack           << "\n";
+        std::cout << "small_blind "   << g.small_blind             << "\n";
+        std::cout << "big_blind "     << g.big_blind               << "\n";
+        std::cout << "min_raise "     << g.min_raise               << "\n";
+        std::cout << "max_raises_per_round " << int(g.max_raises_per_round) << "\n";
+        std::cout << "pot_fractions " << g.pot_fractions.size();
+        for (double f : g.pot_fractions) std::cout << " " << f;
+        std::cout << "\n";
+        std::cout << "has_allin " << (g.include_all_in_slot ? 1 : 0) << "\n";
+        std::cout << "OK" << std::endl;
+    };
+
+    auto emit_state = [&]() {
+        std::cout << "cur_player " << env->current_player() << "\n";
+        std::cout << "round "      << env->round()          << "\n";
+        std::cout << "pot "        << env->pot()            << "\n";
+        std::cout << "cb "         << env->current_bet()    << "\n";
+        std::cout << "raises "     << env->raise_num()      << "\n";
+        const auto h0 = env->hole_cards(0);
+        const auto h1 = env->hole_cards(1);
+        std::cout << "hole_p0 " << h0[0] << " " << h0[1] << "\n";
+        std::cout << "hole_p1 " << h1[0] << " " << h1[1] << "\n";
+        std::cout << "stacks "  << env->stack(0) << " " << env->stack(1) << "\n";
+        const int n_comm = env->community_count();
+        std::cout << "board " << n_comm;
+        for (int i = 0; i < n_comm; ++i)
+            std::cout << " " << env->community_card(i);
+        std::cout << "\n";
+        const auto mask = env->legal_action_mask();
+        const auto m_acc = mask.accessor<float, 1>();
+        std::cout << "mask " << mask.size(0);
+        for (int i = 0; i < mask.size(0); ++i)
+            std::cout << " " << (m_acc[i] > 0.5f ? 1 : 0);
+        std::cout << "\n";
+        const auto obs = env->observation();
+        const auto o_acc = obs.accessor<float, 1>();
+        std::cout << "obs " << obs.size(0);
+        for (int i = 0; i < obs.size(0); ++i)
+            std::cout << " " << o_acc[i];
+        std::cout << "\n";
+        std::cout << "done " << (env->is_terminal() ? 1 : 0) << "\n";
+        if (env->is_terminal()) {
+            std::cout << "utility_p0 " << env->terminal_utility(0) << "\n";
+            std::cout << "utility_p1 " << env->terminal_utility(1) << "\n";
+        }
+        std::cout << "OK" << std::endl;
+    };
+
+    auto emit_model = [&]() {
+        torch::NoGradGuard ng;
+        auto obs  = env->observation().unsqueeze(0).to(device);
+        auto mask = env->legal_action_mask().unsqueeze(0).to(device);
+        // Pool conditioning at deploy time: leave is_pool unset → defaults
+        // to self-play (class 0) inside value_with_offset. Actor's logits
+        // don't depend on it anyway.
+        auto [logits, value] = net->forward(obs);
+        const auto masked = logits + (1.0f - mask) * (-1e8f);
+        const auto probs  = torch::softmax(masked, -1).squeeze(0).to(torch::kCPU).contiguous();
+        // Sample one action stochastically (matches training rollout policy).
+        const auto ar = net->get_action(obs, mask);
+        const auto sampled = ar.action.to(torch::kCPU).item<int64_t>();
+        // Greedy (argmax) action for diagnostics.
+        const auto greedy = std::get<1>(probs.max(0)).item<int64_t>();
+        std::cout << "sampled "  << sampled << "\n";
+        std::cout << "greedy "   << greedy  << "\n";
+        std::cout << "value "    << value.squeeze(0).item<float>() << "\n";
+        const auto p_acc = probs.accessor<float, 1>();
+        std::cout << "probs " << probs.size(0);
+        for (int i = 0; i < probs.size(0); ++i)
+            std::cout << " " << p_acc[i];
+        std::cout << "\n";
+        std::cout << "OK" << std::endl;
+    };
+
+    // Ready signal so the client can sync.
+    std::cout << "READY" << std::endl;
+
+    std::string line;
+    while (std::getline(std::cin, line)) {
+        if (line.empty()) continue;
+        std::istringstream iss(line);
+        std::string cmd;
+        iss >> cmd;
+        try {
+            if (cmd == "INFO") {
+                emit_info();
+            } else if (cmd == "STATE") {
+                emit_state();
+            } else if (cmd == "STEP") {
+                int action;
+                if (!(iss >> action)) {
+                    std::cout << "ERR bad_step_arg\nOK" << std::endl;
+                    continue;
+                }
+                env->step(action);
+                emit_state();
+            } else if (cmd == "RESET") {
+                env->reset();
+                emit_state();
+            } else if (cmd == "MODEL") {
+                emit_model();
+            } else if (cmd == "QUIT") {
+                break;
+            } else {
+                std::cout << "ERR unknown_cmd\nOK" << std::endl;
+            }
+        } catch (const std::exception& e) {
+            std::cout << "ERR " << e.what() << "\nOK" << std::endl;
+        }
+    }
+    (void)poker_cfg;  // reserved for future per-variant features
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -99,6 +260,8 @@ int main(int argc, char** argv) {
     //   ./poker_ppo --round-summary                 → enable per-round summary block
     bool             benchmark_mode  = false;
     bool             scaling_mode    = false;
+    bool             play_mode       = false;
+    std::string      play_model_path;
     bool             use_attention   = true;
     bool             use_round_summary = true;
     int              benchmark_iters = 20;
@@ -139,6 +302,9 @@ int main(int argc, char** argv) {
                 try { benchmark_iters = std::stoi(argv[i + 1]); ++i; }
                 catch (...) { /* leave default */ }
             }
+        } else if (a == "--play") {
+            play_mode = true;
+            if (i + 1 < argc) { play_model_path = argv[i + 1]; ++i; }
         } else if (a == "--strategy") {
             if (i + 1 < argc) { strategy = argv[i + 1]; ++i; }
         } else if (a == "--no-attention") {
@@ -184,11 +350,11 @@ int main(int argc, char** argv) {
     ppo_cfg.update_epochs   = 4;
     ppo_cfg.num_minibatches = 4;
     ppo_cfg.learning_rate   = 3.0e-4f;
-    ppo_cfg.ent_coef        = 0.03f;
+    ppo_cfg.ent_coef        = 0.08f;
 
     ppo_cfg.vf_coef         = 0.5f;
-    ppo_cfg.clip_coef       = 0.2f;
-    ppo_cfg.clip_vloss      = false;
+    ppo_cfg.clip_coef       = 0.1f;
+    ppo_cfg.clip_vloss      = true;
 
     // Scaled for ~8–12 raise sizes: ~√(A_new/A_old) capacity bump on the
     // shared trunk to support finer action-distribution discrimination.
@@ -271,6 +437,16 @@ int main(int argc, char** argv) {
         std::cout << "}, iters=" << benchmark_iters << "\n\n";
         scaling_benchmark(factory, bet_cfg, ppo_cfg, device,
                           env_counts, benchmark_iters, /*warmup=*/2);
+        return 0;
+    }
+
+    if (play_mode) {
+        if (play_model_path.empty()) {
+            std::cerr << "--play requires a model path: ./poker_ppo --play <path>\n";
+            return 1;
+        }
+        std::cerr << "[play] loading " << play_model_path << "\n";
+        run_play(factory, bet_cfg, ppo_cfg, poker_cfg, device, play_model_path);
         return 0;
     }
 

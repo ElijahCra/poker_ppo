@@ -71,6 +71,38 @@ int PokerEnvironment::current_player() const {
     return game_->getCurrentPlayer();
 }
 
+// ── public state accessors ─────────────────────────────────────────────────
+
+std::array<int, 2> PokerEnvironment::hole_cards(int player) const {
+    auto h = game_->getContext().getHoleCards(player);
+    return {static_cast<int>(h[0]), static_cast<int>(h[1])};
+}
+int PokerEnvironment::community_count() const {
+    return game_->getContext().getCommunityCount();
+}
+int PokerEnvironment::community_card(int idx) const {
+    return static_cast<int>(game_->getContext().getCommunityCard(idx));
+}
+int PokerEnvironment::pot() const {
+    return static_cast<int>(game_->getContext().getPot());
+}
+int PokerEnvironment::current_bet() const {
+    return static_cast<int>(game_->getCurrentBet());
+}
+int PokerEnvironment::stack(int player) const {
+    return static_cast<int>(game_->getContext().getStack(player));
+}
+int PokerEnvironment::round() const {
+    return game_->getContext().getRoundNumber();
+}
+int PokerEnvironment::raise_num() const {
+    return game_->getContext().getRaiseNum();
+}
+int PokerEnvironment::terminal_utility(int player) const {
+    return is_terminal()
+        ? static_cast<int>(game_->getUtility(player)) : 0;
+}
+
 bool PokerEnvironment::is_terminal() const {
     return game_->isTerminal();
 }
