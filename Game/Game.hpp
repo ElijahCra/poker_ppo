@@ -28,7 +28,9 @@ using ActionSet = typename ActionPolicy::ActionSet;
 static constexpr int PlayerNum = 2;
 
 // Config is copied into the Game so GameContext can hold a stable pointer.
-explicit Game(std::mt19937& engine, GameConfig game_cfg = {}, BettingConfig betting_cfg = {})
+explicit Game(std::mt19937& engine,
+              DefaultGameConfig    game_cfg    = kGameConfig,
+              DefaultBettingConfig betting_cfg = kBettingConfig)
     : m_rng(engine),
       m_game_config(std::move(game_cfg)),
       m_betting_config(std::move(betting_cfg)),
@@ -150,38 +152,12 @@ void reInitialize() {
     return ActionPolicy::numActions(m_available_actions);
 }
 
-// Static factory methods for common configurations
-static BettingConfig makeFixedLimitConfig(uint32_t smallBet, uint32_t bigBet) {
-    BettingConfig config;
-    config.config.strategy = BettingConfig::BetSizeStrategy::DISCRETE_OPTIONS;
-    config.config.discreteAmounts = {smallBet, bigBet};
-    config.config.maxRaisesPerRound = 4;
-    return config;
-}
-
-static BettingConfig makePotLimitConfig() {
-    BettingConfig config;
-    config.config.strategy = BettingConfig::BetSizeStrategy::FIXED_FRACTIONS;
-    config.config.potFractions = {1.0f};
-    config.config.maxRaisesPerRound = 999;
-    return config;
-}
-
-static BettingConfig makeNoLimitConfig(std::vector<double> preferredSizes = {0.5f, 0.75f, 1.0f}) {
-    BettingConfig config;
-    config.config.strategy = BettingConfig::BetSizeStrategy::FIXED_FRACTIONS;
-    config.config.potFractions = std::move(preferredSizes);
-    config.config.allowAllIn = true;
-    config.config.maxRaisesPerRound = 999;
-    return config;
-}
-
-[[nodiscard]] const GameConfig& getGameConfig() const noexcept { return m_game_config; }
+[[nodiscard]] const DefaultGameConfig& getGameConfig() const noexcept { return m_game_config; }
 
 private:
 std::mt19937& m_rng;
-GameConfig m_game_config;          // owned copy; referenced by m_context
-BettingConfig m_betting_config;
+DefaultGameConfig    m_game_config;       // owned copy; referenced by m_context
+DefaultBettingConfig m_betting_config;
 GameContext m_context;             // must be declared after m_game_config
 GameState m_current_state;
 ActionSet m_available_actions;

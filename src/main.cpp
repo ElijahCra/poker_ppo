@@ -1,12 +1,9 @@
 //  main.cpp — PPO self-play training on the Poker heads-up NLHE engine,
 //  with an Elo league for progress tracking.
 //
-//  First arg (optional) selects a named game variant:
-//      ./poker_ppo                   → full 52-card NLHE (default)
-//      ./poker_ppo no_deuces_48      → drop all 2s (48-card deck)
-//      ./poker_ppo short_deck_36     → drop 2s–5s (36-card short-deck)
-//  Everything else (hyperparams, bet slots) is set inline below; the
-//  sweep harness will replace this with a richer config loader later.
+//  Game variant + hyperparameters are baked in via `include/config.h`
+//  (`kPPOConfig`, `kBetConfig`, `kBRConfig`, `kPokerConfig`). Edit those
+//  and rebuild to change the run.
 
 #include "best_response.h"
 #include "league.h"
@@ -26,31 +23,7 @@ using namespace poker_ppo;
 
 namespace {
 
-::Game::GameConfig makeGameConfig(std::string_view name) {
-    if (name == "no_deuces_48") return ::Game::GameConfig::noDeuces();
-    if (name == "short_deck_36") return ::Game::GameConfig::shortDeck36();
-
-    // Default: full 52-card NLHE with pot-fraction raise slots.
-    ::Game::GameConfig cfg;
-    cfg.name                 = "nlhe_full_52";
-    cfg.initial_stack        = 100'000;
-    cfg.small_blind          = 500;
-    cfg.big_blind            = 1000;
-    cfg.min_bet              = 1000;
-    cfg.min_raise            = 1000;
-    cfg.max_raises_per_round = 4;
-    // Log-spaced bet-sizing menu covering small-value / standard cbet /
-    // polarised / overbet zones. 11 fractions + AI slot = 12 raise actions
-    // total (action count = 14: F + C + 11 raises + AI). Sizes below the
-    // pre-flop min-raise (e.g. 0.25 at small pots) are masked out by the
-    // env at action time; the policy learns the legal subset.
-    cfg.pot_fractions        = {0.25, 0.33, 0.5, 0.66, 0.75,
-                                1.0,  1.25, 1.5, 2.0,  2.5, 3.0};
-    cfg.include_all_in_slot  = true;
-    return cfg;
-}
-
-void printGame(const ::Game::GameConfig& g) {
+void printGame(const ::Game::DefaultGameConfig& g) {
     std::cout << "─── Game variant: " << g.name << " ──────────────────\n"
               << "  deck cards      : " << int(g.deck_size())
               << "  (excluded " << g.excluded_cards.size() << "/52)\n"
@@ -99,11 +72,9 @@ void printGame(const ::Game::GameConfig& g) {
 
 void run_play(IPokerEnvironmentFactory& factory,
               const BetConfig&    bet_cfg,
-              const PPOConfig&    ppo_cfg,
-              const PokerConfig&  poker_cfg,
               torch::Device       device,
               const std::string&  model_path) {
-    PPOTrainer trainer(factory, bet_cfg, ppo_cfg, device);
+    PPOTrainer trainer(factory, device);
     trainer.load(model_path);
     auto& net = trainer.network();
     net->eval();
@@ -232,7 +203,6 @@ void run_play(IPokerEnvironmentFactory& factory,
             std::cout << "ERR " << e.what() << "\nOK" << std::endl;
         }
     }
-    (void)poker_cfg;  // reserved for future per-variant features
 }
 
 } // namespace
@@ -249,40 +219,15 @@ int main(int argc, char** argv) {
 
     // ── CLI parse ──────────────────────────────────────────────────────
     // Recognised forms:
-    //   ./poker_ppo                                    → train, default variant
-    //   ./poker_ppo <variant>                          → train, named variant
-    //   ./poker_ppo --benchmark [iters]                → A/B rollout bench
-    //   ./poker_ppo <variant> --benchmark [iters]
-    //   ./poker_ppo --scaling N1,N2,N3,... [iters]    → scaling sweep
-    //   ./poker_ppo <variant> --scaling 8,16,32 [iters]
-    //   ./poker_ppo --strategy {serial|threadpool}  (training mode)
-    //   ./poker_ppo --no-attention                  → disable bet-history encoder
-    //   ./poker_ppo --round-summary                 → enable per-round summary block
+    //   ./poker_ppo                                  → train (default config)
+    //   ./poker_ppo --benchmark [iters]              → A/B rollout bench
+    //   ./poker_ppo --play <model_path>              → interactive REPL
+    //   ./poker_ppo --strategy {serial|threadpool}   → training rollout strategy
     bool             benchmark_mode  = false;
-    bool             scaling_mode    = false;
     bool             play_mode       = false;
     std::string      play_model_path;
-    bool             use_attention   = true;
-    bool             use_round_summary = true;
     int              benchmark_iters = 20;
-    std::vector<int> env_counts;
-    std::string      variant         = "nlhe_full_52";
     std::string      strategy        = "threadpool";  // default training rollout
-
-    auto parse_int_list = [](std::string_view s) {
-        std::vector<int> out;
-        size_t start = 0;
-        while (start <= s.size()) {
-            size_t end = s.find(',', start);
-            if (end == std::string_view::npos) end = s.size();
-            if (end > start) {
-                try { out.push_back(std::stoi(std::string(s.substr(start, end - start)))); }
-                catch (...) {}
-            }
-            start = end + 1;
-        }
-        return out;
-    };
 
     for (int i = 1; i < argc; ++i) {
         std::string_view a = argv[i];
@@ -292,130 +237,34 @@ int main(int argc, char** argv) {
                 try { benchmark_iters = std::stoi(argv[i + 1]); ++i; }
                 catch (...) { /* leave default */ }
             }
-        } else if (a == "--scaling") {
-            scaling_mode = true;
-            if (i + 1 < argc) {
-                env_counts = parse_int_list(argv[i + 1]);
-                ++i;
-            }
-            if (i + 1 < argc) {
-                try { benchmark_iters = std::stoi(argv[i + 1]); ++i; }
-                catch (...) { /* leave default */ }
-            }
         } else if (a == "--play") {
             play_mode = true;
             if (i + 1 < argc) { play_model_path = argv[i + 1]; ++i; }
         } else if (a == "--strategy") {
             if (i + 1 < argc) { strategy = argv[i + 1]; ++i; }
-        } else if (a == "--no-attention") {
-            use_attention = false;
-        } else if (a == "--attention") {
-            use_attention = true;
-        } else if (a == "--round-summary") {
-            use_round_summary = true;
-        } else if (a == "--no-round-summary") {
-            use_round_summary = false;
         } else {
-            variant = std::string(a);
+            std::cerr << "unknown argument '" << a << "'\n";
+            return 1;
         }
     }
 
-    if (scaling_mode && env_counts.empty()) {
-        env_counts = {8, 16, 32, 64, 128};  // sensible default sweep
-    }
-
     // ── Game variant: deck, stacks, blinds, betting structure ──────────
-    PokerConfig poker_cfg;
-    poker_cfg.game = makeGameConfig(variant);
-    poker_cfg.seed = 0x12345;
+    // `kPokerConfig` is the single compile-time PokerConfig consumed
+    // throughout the binary. Edit `include/config.h` + `Game/GameConfig.hpp`
+    // to change variants.
+    PokerConfig poker_cfg = kPokerConfig;
     poker_cfg.game.validate();
 
-    // ── BetConfig: must expose the same total action count to PPO ──────
-    BetConfig bet_cfg;
-    bet_cfg.num_raise_sizes    = poker_cfg.num_raise_slots();
-    bet_cfg.min_raise          = 0.5;      // unused by adapter
-    bet_cfg.geometric_ratio    = 1.5;      // unused by adapter
-    bet_cfg.max_bets_per_round = poker_cfg.game.max_raises_per_round;
+    // ── BetConfig / PPOConfig: pulled directly from `include/config.h` ──
+    // The trainer already references `config::kPPOConfig` / `kBetConfig`
+    // internally; the local copies below just exist so the existing
+    // call-sites (printing, league, run_play) keep their `const PPOConfig&`
+    // / `const BetConfig&` parameter shape. Edit `include/config.h` to
+    // change values.
+    BetConfig bet_cfg = config::kBetConfig;
+    PPOConfig ppo_cfg = config::kPPOConfig;
 
     printGame(poker_cfg.game);
-
-    // ── PPO hyper-parameters ────────────────────────────────────────────
-    PPOConfig ppo_cfg;
-    // Scaled for ~8–12 raise sizes (A ≈ 11–14): bumping num_envs, ent_coef,
-    // and total_timesteps to maintain per-action sample SNR, exploration
-    // pressure, and convergence budget at the larger action space.
-    ppo_cfg.total_timesteps = 300'000'000;
-    ppo_cfg.num_envs        = 96;
-    ppo_cfg.num_steps       = 128;
-    ppo_cfg.update_epochs   = 4;
-    ppo_cfg.num_minibatches = 4;
-    ppo_cfg.learning_rate   = 3.0e-4f;
-    // Cosine-anneal entropy from `ent_coef` (start) to `ent_coef_min` (end).
-    // Bracketed by the constant-ent_coef runs we did (0.03 → BR ~1 but
-    // weak vs random; 0.08 → strong vs random but BR ~3). Annealing keeps
-    // the early-exploration benefit of higher entropy and the late
-    // policy-sharpening benefit of lower entropy.
-    ppo_cfg.ent_coef         = 0.06f;
-    ppo_cfg.ent_coef_min     = 0.01f;
-    ppo_cfg.anneal_ent_coef  = true;
-
-    ppo_cfg.vf_coef         = 0.5f;
-    ppo_cfg.clip_coef       = 0.1f;
-    ppo_cfg.clip_vloss      = true;
-
-    // Scaled for ~8–12 raise sizes: ~√(A_new/A_old) capacity bump on the
-    // shared trunk to support finer action-distribution discrimination.
-    ppo_cfg.hidden_dim      = 384;
-    ppo_cfg.num_layers      = 2;
-    ppo_cfg.anneal_lr       = true;
-
-    // ── Bet-history attention encoder ──────────────────────────────────
-    // T = max actions per hand the encoder sees (older actions are dropped).
-    // 32 comfortably covers heads-up NLHE: 4 rounds × 4 raises × 2 players
-    // = 32 raise slots, plus call/check fillers — truncation is rare.
-    // Bet-history attention encoder. Verified end-to-end in
-    // Game/tests/attention_test.cpp (forward, backward, masking
-    // correctness, content sensitivity). Enabled here so the network
-    // sees the actual sequence of bets/raises/calls (sizing, position,
-    // round) rather than only the round-summary aggregates.
-    ppo_cfg.hist.enabled         = true;
-    ppo_cfg.hist.max_history_len = 32;
-    ppo_cfg.hist.attn_dim        = 64;
-    ppo_cfg.hist.attn_heads      = 4;
-    ppo_cfg.hist.ffn_mult        = 4;
-    ppo_cfg.hist.num_blocks      = 1;
-
-    // ── Round-summary feature block ────────────────────────────────────
-    // Cheap MLP-friendly alternative (or complement) to attention: 4 features
-    // × 4 rounds appended directly to the trunk input.  Toggle independently
-    // of --attention with --round-summary / --no-round-summary.
-    ppo_cfg.round_summary.enabled = true;
-
-    // ── Opponent pool (self-play stabilisation) ────────────────────────
-    // Without this, pure self-play cycles: policy collapses to exploit its
-    // current self, then diverges into a different collapsed mode. Symptoms
-    // are entropy oscillation and regression vs fixed anchors mid-training.
-    // With it, ~p_use_pool of envs play against a uniformly-sampled past
-    // snapshot, forcing the live policy to be robust against past selves.
-    ppo_cfg.opp_pool.enabled        = true;
-    ppo_cfg.opp_pool.max_size       = 20;
-    ppo_cfg.opp_pool.snapshot_every = 200;   // updates between snapshots
-    // Warmup gates BOTH the first snapshot and the first sampling. Setting
-    // this too low fills the pool with barely-trained snapshots, which dilutes
-    // the gradient signal (most outcomes vs a near-random opponent are
-    // uninformative). 1000 ≈ 8M env steps of pure self-play before the pool
-    // takes its first snapshot.
-    ppo_cfg.opp_pool.warmup_updates = 400;
-    ppo_cfg.opp_pool.p_use_pool     = 0.05f; // fraction of envs vs pool
-    // Cap on distinct snapshots used per rollout. Higher = more opponent
-    // diversity within a rollout, but pool inference cost scales linearly.
-    // 1 keeps wall time roughly constant in pool size; raise to 2-4 if the
-    // gradient signal looks too narrow.
-    ppo_cfg.opp_pool.max_unique_per_rollout = 4;
-
-    // Env must use the same layout so obs_dim aligns with the network split.
-    poker_cfg.hist          = ppo_cfg.hist;
-    poker_cfg.round_summary = ppo_cfg.round_summary;
     std::cout << "Bet-history attention encoder: "
               << (ppo_cfg.hist.enabled ? "ON" : "OFF") << "\n"
               << "Round-summary block          : "
@@ -441,28 +290,17 @@ int main(int argc, char** argv) {
 
     PokerEnvironmentFactory factory(poker_cfg);
 
-    if (scaling_mode) {
-        std::cout << "\n[scaling mode] sweep over num_envs={";
-        for (size_t i = 0; i < env_counts.size(); ++i) {
-            std::cout << env_counts[i] << (i + 1 < env_counts.size() ? "," : "");
-        }
-        std::cout << "}, iters=" << benchmark_iters << "\n\n";
-        scaling_benchmark(factory, bet_cfg, ppo_cfg, device,
-                          env_counts, benchmark_iters, /*warmup=*/2);
-        return 0;
-    }
-
     if (play_mode) {
         if (play_model_path.empty()) {
             std::cerr << "--play requires a model path: ./poker_ppo --play <path>\n";
             return 1;
         }
         std::cerr << "[play] loading " << play_model_path << "\n";
-        run_play(factory, bet_cfg, ppo_cfg, poker_cfg, device, play_model_path);
+        run_play(factory, bet_cfg, device, play_model_path);
         return 0;
     }
 
-    PPOTrainer trainer(factory, bet_cfg, ppo_cfg, device);
+    PPOTrainer trainer(factory, device);
 
     if (benchmark_mode) {
         std::cout << "\n[benchmark mode] comparing serial / threadpool\n";
@@ -695,7 +533,10 @@ int main(int argc, char** argv) {
     metrics.log_league(/*update=*/-1, /*step=*/-1, final_results);
     league.print_results(final_results);
 
-    const std::string model_path = "poker_ppo_model_" + poker_cfg.game.name + ".pt";
+    // poker_cfg.game.name is now a std::string_view (constexpr-friendly);
+    // bridge to std::string explicitly for the path concatenation.
+    const std::string model_path =
+        std::string("poker_ppo_model_") + std::string(poker_cfg.game.name) + ".pt";
     trainer.save(model_path);
     std::cout << "\nModel saved to " << model_path << "\n";
     return 0;

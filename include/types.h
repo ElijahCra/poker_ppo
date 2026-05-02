@@ -1,5 +1,7 @@
 #pragma once
 
+#include "features.h"
+
 #include <torch/torch.h>
 #include <cstdint>
 #include <vector>
@@ -31,9 +33,11 @@ struct BetConfig {
                                       // player per betting round
 
     /// Total number of discrete actions = fold + check/call + raises.
-    int action_count() const { return 2 + num_raise_sizes; }
+    constexpr int action_count() const { return 2 + num_raise_sizes; }
 
     /// Returns the actual raise amount for raise index i ∈ [0, num_raise_sizes).
+    /// Note: uses std::pow which isn't constexpr until C++26 — kept non-
+    /// constexpr to avoid the dependency.
     double raise_amount(int i) const {
         assert(i >= 0 && i < num_raise_sizes);
         return min_raise * std::pow(geometric_ratio, i);
@@ -124,8 +128,12 @@ struct BetHistoryConfig {
     ///   T (mask) + T * F (token features)   = T * (1 + F)
     /// Returns 0 when the encoder is disabled — caller-side code that uses
     /// this to size obs / split tensors then falls back to a "static-only"
-    /// layout automatically.
-    [[nodiscard]] int history_block_dim() const {
+    /// layout automatically. Also returns 0 unconditionally when the
+    /// compile-time flag `features::ATTENTION_ENCODER` is false, so the
+    /// entire history block is stripped from the obs layout when the
+    /// feature is excluded from the build.
+    [[nodiscard]] constexpr int history_block_dim() const {
+        if constexpr (!features::ATTENTION_ENCODER) return 0;
         return enabled ? max_history_len * (1 + feat_per_action) : 0;
     }
 };
@@ -154,7 +162,12 @@ struct RoundSummaryConfig {
 
     bool enabled = false;        // off by default; flip on with --round-summary
 
-    [[nodiscard]] int dim() const {
+    /// Block size in floats. Returns 0 unconditionally when the compile-
+    /// time flag `features::ROUND_SUMMARY` is false — the round-summary
+    /// block is stripped from the obs layout when the feature is excluded
+    /// from the build, and Tower's input-dim arithmetic stays consistent.
+    [[nodiscard]] constexpr int dim() const {
+        if constexpr (!features::ROUND_SUMMARY) return 0;
         return enabled ? num_rounds * feat_per_round : 0;
     }
 };
@@ -241,9 +254,9 @@ struct PPOConfig {
     OpponentPoolConfig  opp_pool;
 
     // ── derived ─────────────────────────────────────────────────────────
-    int batch_size()     const { return num_envs * num_steps; }
-    int minibatch_size() const { return batch_size() / num_minibatches; }
-    int num_updates()    const { return total_timesteps / batch_size(); }
+    constexpr int batch_size()     const { return num_envs * num_steps; }
+    constexpr int minibatch_size() const { return batch_size() / num_minibatches; }
+    constexpr int num_updates()    const { return total_timesteps / batch_size(); }
 };
 
 } // namespace poker_ppo

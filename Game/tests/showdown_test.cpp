@@ -581,27 +581,15 @@ void check_or_call(GameT& g) {
 
 TEST(Integration, EndToEndShowdownAgreesWithEvaluator) {
     // Reuse the project's default 52-card NLHE config so blinds, stacks,
-    // and round structure match what training sees.
-    Game::GameConfig gcfg;
-    gcfg.name                 = "nlhe_full_52";
-    gcfg.initial_stack        = 100'000;
-    gcfg.small_blind          = 500;
-    gcfg.big_blind            = 1000;
-    gcfg.min_bet              = 1000;
-    gcfg.min_raise            = 1000;
-    gcfg.max_raises_per_round = 4;
-    gcfg.pot_fractions        = {0.5, 1.0, 2.0};
-    gcfg.include_all_in_slot  = true;
+    // and round structure match what training sees. The test drives
+    // check-down to showdown regardless of bet menu, so we use the same
+    // DefaultGameConfig (11 pot fractions) as the rest of the codebase
+    // — Game::DiscreteGame is non-templated and accepts only that
+    // instantiation.
+    Game::DefaultGameConfig gcfg = Game::make_nlhe_full_52();
     gcfg.validate();
 
-    Game::BettingConfig bet_cfg;
-    bet_cfg.config.strategy =
-        Game::BettingConfig::BetSizeStrategy::FIXED_FRACTIONS;
-    bet_cfg.config.potFractions      = gcfg.pot_fractions;
-    bet_cfg.config.minBet            = gcfg.min_bet;
-    bet_cfg.config.minRaise          = gcfg.min_raise;
-    bet_cfg.config.maxRaisesPerRound = gcfg.max_raises_per_round;
-    bet_cfg.config.allowAllIn        = gcfg.include_all_in_slot;
+    Game::DefaultBettingConfig bet_cfg = Game::make_default_betting_config(gcfg);
 
     // Helper: deck.h id → TwoPlusTwo id (mirrors Transitioner's conversion).
     auto to_2p2 = [](uint8_t c) -> int {

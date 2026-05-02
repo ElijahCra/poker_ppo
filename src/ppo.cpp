@@ -97,10 +97,8 @@ BootstrapTensors build_bootstrap(
 // ═════════════════════════════════════════════════════════════════════════════
 
 PPOTrainer::PPOTrainer(IPokerEnvironmentFactory& env_factory,
-                       const BetConfig& bet_cfg,
-                       const PPOConfig& ppo_cfg,
                        torch::Device device)
-    : cfg_(ppo_cfg), bet_cfg_(bet_cfg), device_(device),
+    : device_(device),
       network_(nullptr),
       episode_rng_(cfg_.opp_pool.seed
                    ? cfg_.opp_pool.seed
@@ -108,7 +106,7 @@ PPOTrainer::PPOTrainer(IPokerEnvironmentFactory& env_factory,
 {
     // Create vectorized environment
     vec_env_ = std::make_unique<VectorizedEnv>(
-        env_factory, bet_cfg, cfg_.num_envs);
+        env_factory, bet_cfg_, cfg_.num_envs);
 
     int obs_dim      = vec_env_->obs_dim();
     int action_count = vec_env_->action_count();
@@ -292,10 +290,13 @@ void PPOTrainer::train() {
         // Anneal learning rate. Linear from `learning_rate` at update 0 down
         // to `learning_rate * min_lr_frac` at the final update — the floor
         // avoids the dead-final-quarter where lr ≈ 0 and updates stop moving
-        // the policy.
-        if (cfg_.anneal_lr) {
+        // the policy. Gated on `if constexpr` so the entire scheduler block
+        // is dead-code-eliminated when `cfg_.anneal_lr == false` at compile
+        // time (the optimiser then runs at the configured `learning_rate`
+        // for the whole run with no per-update branch).
+        if constexpr (cfg_.anneal_lr) {
             const float frac = 1.0f - static_cast<float>(update_idx_) / total_updates;
-            const float floor_frac = std::max(0.0f, cfg_.min_lr_frac);
+            constexpr float floor_frac = cfg_.min_lr_frac > 0.0f ? cfg_.min_lr_frac : 0.0f;
             const float lr = cfg_.learning_rate * std::max(frac, floor_frac);
             for (auto& pg : optimizer_->param_groups())
                 static_cast<torch::optim::AdamOptions&>(pg.options()).lr(lr);
@@ -694,68 +695,6 @@ PPOTrainer::benchmark_rollouts(int iters, int warmup, bool verbose) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// scaling_benchmark — sweep num_envs, build a fresh trainer per row, summarise.
-// ─────────────────────────────────────────────────────────────────────────────
-void scaling_benchmark(IPokerEnvironmentFactory& factory,
-                       const BetConfig& bet_cfg,
-                       PPOConfig ppo_cfg,
-                       torch::Device device,
-                       const std::vector<int>& env_counts,
-                       int iters, int warmup) {
-    std::vector<PPOTrainer::BenchmarkResult> rows;
-    rows.reserve(env_counts.size());
-
-    for (int n : env_counts) {
-        if (n <= 0) continue;
-        std::cout << "[scaling] num_envs=" << n << " — building trainer & timing..."
-                  << std::flush;
-        ppo_cfg.num_envs = n;
-        PPOTrainer trainer(factory, bet_cfg, ppo_cfg, device);
-        rows.push_back(trainer.benchmark_rollouts(iters, warmup, /*verbose=*/false));
-        std::cout << " done\n";
-    }
-
-    if (rows.empty()) return;
-
-    // ── Summary table ───────────────────────────────────────────────────
-    auto fmt = [](double v, int w, int p) {
-        std::ostringstream os;
-        os << std::fixed << std::setprecision(p) << std::setw(w) << v;
-        return os.str();
-    };
-    auto col = [](const std::string& s, int w) {
-        std::ostringstream os;
-        os << std::setw(w) << s;
-        return os.str();
-    };
-
-    // All rows share the same strategy ordering — pull names from row 0.
-    const auto& strats = rows.front().by_strategy;
-
-    std::cout << "\n═════════════════ rollout scaling benchmark ═════════════════\n"
-              << "  iters=" << iters << "  warmup=" << warmup
-              << "  num_steps=" << ppo_cfg.num_steps
-              << "  device=" << (device.is_cuda() ? "cuda" : "cpu") << "\n"
-              << "  ───────────────────────────────────────────────────────────\n"
-              << "  " << col("num_envs", 8)
-              << "  " << col("samples", 8);
-    for (const auto& kv : strats) std::cout << "  " << col(kv.first + "_ms",   12);
-    for (const auto& kv : strats) std::cout << "  " << col(kv.first + "_us/s", 12);
-    std::cout << "\n  ───────────────────────────────────────────────────────────\n";
-
-    for (const auto& r : rows) {
-        std::cout << "  " << col(std::to_string(r.num_envs), 8)
-                  << "  " << col(std::to_string(r.samples),  8);
-        for (const auto& kv : r.by_strategy)
-            std::cout << "  " << fmt(kv.second.median_ms, 12, 2);
-        for (const auto& kv : r.by_strategy)
-            std::cout << "  " << fmt(kv.second.median_ms * 1e3 / r.samples, 12, 2);
-        std::cout << "\n";
-    }
-    std::cout << "═══════════════════════════════════════════════════════════\n\n";
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 PPOTrainer::UpdateStats PPOTrainer::update() {
     network_->train();
 
@@ -783,14 +722,20 @@ PPOTrainer::UpdateStats PPOTrainer::update() {
     // all minibatches of *this* update (only changes between updates), so the
     // PPO loss within an update is well-defined. ent(t) starts at
     // cfg_.ent_coef and decays toward cfg_.ent_coef_min over total updates.
+    // `if constexpr` strips the cosine block when anneal is off — we then
+    // return cfg_.ent_coef as a literal.
     const float ent_coef_now = [&]() {
-        if (!cfg_.anneal_ent_coef) return cfg_.ent_coef;
-        const int total = std::max(1, cfg_.num_updates());
-        const float progress = std::min(
-            1.0f, static_cast<float>(update_idx_) / static_cast<float>(total));
-        const float cosine_factor = 0.5f * (1.0f + std::cos(M_PI * progress));
-        const float ent_min = std::min(cfg_.ent_coef_min, cfg_.ent_coef);
-        return ent_min + cosine_factor * (cfg_.ent_coef - ent_min);
+        if constexpr (!cfg_.anneal_ent_coef) {
+            return cfg_.ent_coef;
+        } else {
+            const int total = std::max(1, cfg_.num_updates());
+            const float progress = std::min(
+                1.0f, static_cast<float>(update_idx_) / static_cast<float>(total));
+            const float cosine_factor = 0.5f * (1.0f + std::cos(M_PI * progress));
+            constexpr float ent_min =
+                cfg_.ent_coef_min < cfg_.ent_coef ? cfg_.ent_coef_min : cfg_.ent_coef;
+            return ent_min + cosine_factor * (cfg_.ent_coef - ent_min);
+        }
     }();
 
     for (int epoch = 0; epoch < cfg_.update_epochs; ++epoch) {
@@ -809,10 +754,14 @@ PPOTrainer::UpdateStats PPOTrainer::update() {
             auto mb_val     = b_val.index_select(0, mb_idx);
             auto mb_masks   = b_masks.index_select(0, mb_idx);
 
-            // Normalise advantages
-            if (cfg_.norm_advantages && mb_adv.size(0) > 1) {
-                mb_adv = (mb_adv - mb_adv.mean()) /
-                         (mb_adv.std() + 1e-8f);
+            // Normalise advantages. Gated on `if constexpr` so when
+            // `cfg_.norm_advantages` is false at build time the entire
+            // mean/std/divide block is stripped.
+            if constexpr (cfg_.norm_advantages) {
+                if (mb_adv.size(0) > 1) {
+                    mb_adv = (mb_adv - mb_adv.mean()) /
+                             (mb_adv.std() + 1e-8f);
+                }
             }
 
             // Actor forward: get new log_probs and entropy for stored actions
@@ -829,8 +778,12 @@ PPOTrainer::UpdateStats PPOTrainer::update() {
             auto pg_loss  = torch::max(pg_loss1, pg_loss2).mean();
 
             // ── value loss ──────────────────────────────────────────
+            // Gated on `if constexpr` so only one of the two branches
+            // makes it into the binary — the dispatcher is gone too,
+            // which is meaningful per minibatch (4 epochs × 4 MBs per
+            // update = 16 calls of dead overhead per update otherwise).
             torch::Tensor v_loss;
-            if (cfg_.clip_vloss) {
+            if constexpr (cfg_.clip_vloss) {
                 auto v_clipped = mb_val + torch::clamp(
                     er.value - mb_val,
                     -cfg_.clip_coef, cfg_.clip_coef);
@@ -883,12 +836,12 @@ PPOTrainer::UpdateStats PPOTrainer::update() {
     // ── return stats; train() fills in timings and invokes log_cb_ ──────
     float n  = static_cast<float>(std::max(1, num_updates));
     float lr = cfg_.learning_rate;
-    if (cfg_.anneal_lr) {
+    if constexpr (cfg_.anneal_lr) {
         // Mirror the floor logic from train()'s anneal block so the
         // reported lr matches what the optimiser actually uses; otherwise
         // late-training plots show lr→0 even when the floor is active.
         const float frac       = 1.0f - static_cast<float>(update_idx_) / cfg_.num_updates();
-        const float floor_frac = std::max(0.0f, cfg_.min_lr_frac);
+        constexpr float floor_frac = cfg_.min_lr_frac > 0.0f ? cfg_.min_lr_frac : 0.0f;
         lr = cfg_.learning_rate * std::max(frac, floor_frac);
     }
     // Single device→host sync for all stats

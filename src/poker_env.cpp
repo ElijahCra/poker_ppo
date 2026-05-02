@@ -5,6 +5,7 @@
 #include "Context/GameContext.hpp"
 #include "GameBase.hpp"
 #include "Utility/HandAbstraction/hand_index.h"
+#include "features.h"
 
 #include <cmath>
 #include <stdexcept>
@@ -16,15 +17,19 @@ namespace {
 constexpr int CARD_SLOTS = 52;
 // Static obs features after the two card one-hot blocks:
 //   stacks(2) + pot + cur_bet + raises + round one-hot(4) + seat = 10
-//   hand-strength bucket per round (preflop, flop, turn, river)    = 4
+//   hand-strength bucket per round (preflop, flop, turn, river)    = 4 (gated)
 // The hand-strength block carries one float per round — the canonical
 // hand_indexer bucket index for the acting player on that round, divided
 // by the round's total bucket count to land in [0, 1]. Future rounds are
 // masked to 0 so we don't leak unseen community cards. The indexer's
 // suit-isomorphic clustering is hard for a small MLP to derive from raw
 // card one-hots, so this is a meaningful inductive bias for free.
+//
+// FEAT_HAND_STRENGTH compiles to 0 when `features::HAND_STRENGTH` is off,
+// shrinking STATIC_OBS at compile time and matching the if-constexpr-
+// gated write block in compute_observation.
 constexpr int FEAT_BASIC = 10;
-constexpr int FEAT_HAND_STRENGTH = 4;
+constexpr int FEAT_HAND_STRENGTH = features::HAND_STRENGTH ? 4 : 0;
 constexpr int FEAT_EXTRA = FEAT_BASIC + FEAT_HAND_STRENGTH;
 constexpr int STATIC_OBS = CARD_SLOTS * 2 + FEAT_EXTRA;
 
@@ -66,13 +71,9 @@ PokerEnvironment::PokerEnvironment(const PokerConfig& poker_cfg,
     reward_norm_ = 10.0f * static_cast<float>(gcfg.big_blind);
     max_raises_norm_ = std::max<int>(1, gcfg.max_raises_per_round);
 
-    game_betting_cfg_.config.strategy =
-        ::Game::BettingConfig::BetSizeStrategy::FIXED_FRACTIONS;
-    game_betting_cfg_.config.potFractions      = gcfg.pot_fractions;
-    game_betting_cfg_.config.minBet            = gcfg.min_bet;
-    game_betting_cfg_.config.minRaise          = gcfg.min_raise;
-    game_betting_cfg_.config.maxRaisesPerRound = gcfg.max_raises_per_round;
-    game_betting_cfg_.config.allowAllIn        = gcfg.include_all_in_slot;
+    // Both sides are now std::array — straight constexpr factory call,
+    // no more iterator-bridge between vector/array.
+    game_betting_cfg_ = ::Game::make_default_betting_config(gcfg);
 
     game_ = std::make_unique<::Game::DiscreteGame>(rng_, gcfg, game_betting_cfg_);
 
@@ -281,18 +282,21 @@ torch::Tensor PokerEnvironment::compute_observation() const {
     // Hand-strength block: per-round normalised hand_indexer bucket ids.
     // Lazy-init the per-round divisor on first call (the static indexer
     // is populated by the first DiscreteGame's CardData::initialize()).
-    if (indexer_norm_[0] == 0.0f) {
-        for (int r = 0; r < 4; ++r) {
-            const uint64_t sz =
-                hand_indexer_size(&::Game::CardData::flopIndexer,
-                                  static_cast<uint_fast32_t>(r));
-            // sz can be 0 only if the indexer wasn't initialised — keep the
-            // sentinel so we retry next call.
-            if (sz == 0) { indexer_norm_[0] = 0.0f; break; }
-            indexer_norm_[r] = 1.0f / static_cast<float>(sz);
+    // The entire block — cache + per-round write — is stripped from the
+    // binary when `features::HAND_STRENGTH` is false; FEAT_HAND_STRENGTH
+    // also goes to 0 then, so STATIC_OBS shrinks consistently.
+    if constexpr (features::HAND_STRENGTH) {
+        if (indexer_norm_[0] == 0.0f) {
+            for (int r = 0; r < 4; ++r) {
+                const uint64_t sz =
+                    hand_indexer_size(&::Game::CardData::flopIndexer,
+                                      static_cast<uint_fast32_t>(r));
+                // sz can be 0 only if the indexer wasn't initialised —
+                // keep the sentinel so we retry next call.
+                if (sz == 0) { indexer_norm_[0] = 0.0f; break; }
+                indexer_norm_[r] = 1.0f / static_cast<float>(sz);
+            }
         }
-    }
-    {
         const auto& handHashes = ctx.cards.handHashes;
         const int   round_now  = ctx.getRoundNumber();
         for (int r = 0; r < 4; ++r) {
@@ -308,17 +312,26 @@ torch::Tensor PokerEnvironment::compute_observation() const {
         }
     }
 
-    // Round-summary block: 4 rounds × 4 features.  Sits between the static
-    // features and the attention-history block so each sub-block can be
-    // toggled independently without disturbing the others' offsets.
-    if (rs_cfg_.enabled) {
-        off = write_round_summary_block(a, off, me);
+    // Round-summary block: 4 rounds × 4 features.  Sits between the
+    // static features and the attention-history block so each sub-block
+    // can be toggled independently without disturbing the others'
+    // offsets. Both the compile-time flag and the runtime config flag
+    // must agree — when the build flag is off the entire write site is
+    // dead-code-eliminated, and RoundSummaryConfig::dim() returns 0.
+    if constexpr (features::ROUND_SUMMARY) {
+        if (rs_cfg_.enabled) {
+            off = write_round_summary_block(a, off, me);
+        }
     }
 
-    // Bet-history block: [T mask] + [T × F token features].  Only emitted
-    // when the attention encoder is enabled — otherwise the obs ends here.
-    if (hist_cfg_.enabled) {
-        off = write_history_block(a, off, me);
+    // Bet-history block: [T mask] + [T × F token features]. Same dual-
+    // tier gating: stripping `features::ATTENTION_ENCODER` removes the
+    // call site entirely, and BetHistoryConfig::history_block_dim()
+    // returns 0 so the obs ends here.
+    if constexpr (features::ATTENTION_ENCODER) {
+        if (hist_cfg_.enabled) {
+            off = write_history_block(a, off, me);
+        }
     }
     (void)off;
 

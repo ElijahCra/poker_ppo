@@ -1,6 +1,7 @@
 #pragma once
 
 #include "types.h"
+#include "config.h"
 #include "environment.h"
 #include "network.h"
 #include "rollout_buffer.h"
@@ -50,10 +51,12 @@ public:
 
     using LogCallback = std::function<void(const UpdateStats&)>;
 
-    PPOTrainer(IPokerEnvironmentFactory& env_factory,
-               const BetConfig& bet_cfg,
-               const PPOConfig& ppo_cfg,
-               torch::Device device = torch::kCPU);
+    // The trainer reads its hyperparameters from `config::kPPOConfig` and
+    // its bet abstraction from `config::kBetConfig` — both compile-time
+    // constants. The constructor only needs runtime-only inputs: the env
+    // factory and the device.
+    explicit PPOTrainer(IPokerEnvironmentFactory& env_factory,
+                        torch::Device device = torch::kCPU);
 
     // Out-of-line so the implicit destructor doesn't need StepThreadPool's
     // full definition at every PPOTrainer use site.
@@ -136,8 +139,13 @@ private:
         const torch::Tensor& cur_player_cpu, // [N] int32 CPU
         torch::Tensor& actions_cpu);         // [N] int64 CPU — modified in place
 
-    PPOConfig    cfg_;
-    BetConfig    bet_cfg_;
+    // Runtime cfg_ is gone — the trainer now reads its hyperparameters
+    // straight off `config::kPPOConfig` (compile-time). The reference is
+    // kept as `cfg_` so existing call-sites (`cfg_.gamma` etc.) keep
+    // working unchanged AND constexpr-friendly contexts (`if constexpr`)
+    // can use them. The `inline` makes it a non-ODR definition.
+    static inline constexpr const PPOConfig& cfg_      = config::kPPOConfig;
+    static inline constexpr const BetConfig& bet_cfg_  = config::kBetConfig;
     torch::Device device_;
 
     ActorCritic  network_;
@@ -183,24 +191,5 @@ private:
     std::vector<uint64_t>         rollout_pool_ids_;
     std::mt19937                  episode_rng_;
 };
-
-// ─────────────────────────────────────────────────────────────────────────────
-// scaling_benchmark
-// ─────────────────────────────────────────────────────────────────────────────
-//
-// Build a fresh PPOTrainer for each value in `env_counts` and run the 3-way
-// benchmark_rollouts() against it. Prints one summary table at the end so
-// you can see how each strategy scales with num_envs.
-//
-// `ppo_cfg` is taken by value because we mutate `num_envs` per row.
-// `num_steps` and the network shape stay constant across rows.
-
-void scaling_benchmark(IPokerEnvironmentFactory& factory,
-                       const BetConfig& bet_cfg,
-                       PPOConfig ppo_cfg,
-                       torch::Device device,
-                       const std::vector<int>& env_counts,
-                       int iters  = 10,
-                       int warmup = 2);
 
 } // namespace poker_ppo

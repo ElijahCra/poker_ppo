@@ -72,7 +72,7 @@ struct DiscreteActionPolicy {
     }
 
     [[nodiscard]] static ActionSet generateActions(
-        const BettingConfig& config,
+        const DefaultBettingConfig& config,
         const GameContext& context,
         const ActionState& state);
 
@@ -122,7 +122,7 @@ struct ContinuousActionPolicy {
     }
 
     [[nodiscard]] static ActionSet generateActions(
-        const BettingConfig& config,
+        const DefaultBettingConfig& config,
         const GameContext& context,
         const ActionState& state);
 
@@ -136,7 +136,7 @@ struct ContinuousActionPolicy {
 // Implementation: DiscreteActionPolicy::generateActions
 // ============================================================================
 inline DiscreteActionPolicy::ActionSet DiscreteActionPolicy::generateActions(
-    const BettingConfig& config,
+    const DefaultBettingConfig& config,
     const GameContext& context,
     const ActionState& state)
 {
@@ -181,7 +181,7 @@ inline DiscreteActionPolicy::ActionSet DiscreteActionPolicy::generateActions(
 // Implementation: ContinuousActionPolicy::generateActions
 // ============================================================================
 inline ContinuousActionPolicy::ActionSet ContinuousActionPolicy::generateActions(
-    const BettingConfig& config,
+    const DefaultBettingConfig& config,
     const GameContext& context,
     const ActionState& state)
 {

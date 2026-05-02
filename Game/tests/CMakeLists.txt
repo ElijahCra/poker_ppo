@@ -39,7 +39,28 @@ target_link_libraries(attention_test PRIVATE
     GTest::gtest_main
 )
 
+# BettingConfig tests. Header-only path (BettingConfig.hpp + GameConfig.hpp
+# + GameBase.hpp), so we just need the Game interface lib for include
+# directories. DiscreteGame's transition path pulls in Utility for the
+# TwoPlusTwo evaluator.
+add_executable(betting_config_test betting_config_test.cpp)
+target_link_libraries(betting_config_test PRIVATE
+    Game
+    Utility
+    GTest::gtest_main
+)
+
+# PokerConfig tests. Pulls poker_env.h (transitively config.h + Game) so
+# we link against poker_ppo_lib for the include path + libtorch.
+add_executable(poker_config_test poker_config_test.cpp)
+target_link_libraries(poker_config_test PRIVATE
+    poker_ppo_lib
+    GTest::gtest_main
+)
+
 # Register with CTest so `ctest` discovers the cases automatically.
 include(GoogleTest)
 gtest_discover_tests(showdown_test)
 gtest_discover_tests(attention_test)
+gtest_discover_tests(betting_config_test)
+gtest_discover_tests(poker_config_test)

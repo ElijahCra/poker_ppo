@@ -31,7 +31,7 @@ public:
 
     static TransitionResult transition(const Action& action,
                                        const GameContext& context,
-                                       const BettingConfig& config,
+                                       const DefaultBettingConfig& config,
                                        const GameState& state) {
         return std::visit([&](const auto& s) {
             return process(action, context, config, s);
@@ -40,11 +40,11 @@ public:
 
 private:
     static TransitionResult process(const Action& action, const GameContext& context,
-                                    const BettingConfig& config, const ChanceState& state);
+                                    const DefaultBettingConfig& config, const ChanceState& state);
     static TransitionResult process(const Action& action, const GameContext& context,
-                                    const BettingConfig& config, const ActionState& state);
+                                    const DefaultBettingConfig& config, const ActionState& state);
     static TransitionResult process(const Action& action, const GameContext& context,
-                                    const BettingConfig& config, const TerminalState& state);
+                                    const DefaultBettingConfig& config, const TerminalState& state);
 
     static TransitionResult makeTerminal(const GameContext& context, int winner,
                                          double pot, TerminalState::Reason reason);
@@ -53,7 +53,7 @@ private:
 // Implementation
 inline TransitionResult Transitioner::process([[maybe_unused]] const Action& action,
                                               [[maybe_unused]] const GameContext& context,
-                                              [[maybe_unused]] const BettingConfig& config,
+                                              [[maybe_unused]] const DefaultBettingConfig& config,
                                               const ChanceState& state)
 {
     TransitionResult result;
@@ -74,7 +74,7 @@ inline TransitionResult Transitioner::process([[maybe_unused]] const Action& act
 }
 
 inline TransitionResult Transitioner::process(const Action& action, const GameContext& context,
-                                              [[maybe_unused]] const BettingConfig& config,
+                                              [[maybe_unused]] const DefaultBettingConfig& config,
                                               const ActionState& state) {
     return std::visit([&context, &state]<typename ActionType>(const ActionType& act) -> TransitionResult {
         using T = std::decay_t<ActionType>;
@@ -186,7 +186,7 @@ inline TransitionResult Transitioner::process(const Action& action, const GameCo
 
 inline TransitionResult Transitioner::process([[maybe_unused]] const Action& action,
                                               [[maybe_unused]] const GameContext& context,
-                                              [[maybe_unused]] const BettingConfig& config,
+                                              [[maybe_unused]] const DefaultBettingConfig& config,
                                               [[maybe_unused]] const TerminalState& state)
 {
     throw std::logic_error("Cannot transition from terminal state");

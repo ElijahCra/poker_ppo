@@ -16,7 +16,12 @@ struct CardData {
     // Layout: [0..1] p0 hole, [2..3] p1 hole, [4..6] flop, [7] turn, [8] river
     std::array<uint8_t, 9> rawCards{};
 
-    void initialize(std::mt19937& rng, const GameConfig& cfg) {
+    // Template parameter `GameCfgT` lets the caller pass any concrete
+    // `GameConfig<NumPotFractions, NumExcludedCards>` instantiation —
+    // CardData itself doesn't depend on those template parameters, only
+    // on `cfg.dealable_cards()` (a runtime helper that allocates).
+    template <typename GameCfgT>
+    void initialize(std::mt19937& rng, const GameCfgT& cfg) {
         if (!init) {
             // Static indexer is initialized once with the fixed {2,3,1,1}
             // round structure. GameConfig::validate() ensures cfg matches.

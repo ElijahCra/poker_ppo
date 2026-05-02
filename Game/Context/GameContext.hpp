@@ -24,7 +24,7 @@ namespace Game {
 class GameContext {
 public:
 
-explicit GameContext(const GameConfig& cfg) : m_cfg(&cfg) {
+explicit GameContext(const DefaultGameConfig& cfg) : m_cfg(&cfg) {
     cfg.validate();
     players.reset(cfg);
     betting.maxRaises = cfg.max_raises_per_round;
@@ -41,7 +41,7 @@ explicit GameContext(const GameConfig& cfg) : m_cfg(&cfg) {
 struct BettingData {
     uint32_t pot = 0;
     int raiseNum = 0;
-    int maxRaises = 4;                // populated from GameConfig
+    int maxRaises = 4;                // populated from DefaultGameConfig
     std::vector<uint32_t> sequence;   // action amounts in mbb
 
     BettingData() noexcept {
@@ -70,7 +70,7 @@ void reset(std::mt19937& rng) {
     addBlinds();
 }
 
-[[nodiscard]] const GameConfig& config() const noexcept { return *m_cfg; }
+[[nodiscard]] const DefaultGameConfig& config() const noexcept { return *m_cfg; }
 
 // String infoset format
 static std::string actionToString(const Action& action) {
@@ -191,7 +191,7 @@ RoundData round;
 CardData cards;
 
 private:
-const GameConfig* m_cfg;   // non-owning; lifetime managed by Game
+const DefaultGameConfig* m_cfg;   // non-owning; lifetime managed by Game
 };
 
 }  // namespace Game

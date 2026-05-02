@@ -1,4 +1,6 @@
 #include "network.h"
+#include "features.h"
+
 #include <torch/torch.h>
 #include <stdexcept>
 
@@ -27,51 +29,58 @@ TowerImpl::TowerImpl(int obs_dim, int output_dim,
 
     int trunk_in_dim = static_dim_ + round_summary_.dim();
 
-    if (hist_.enabled) {
-        const int D  = hist_.attn_dim;
-        const int H  = hist_.attn_heads;
-        const int T  = hist_.max_history_len;
-        const int F  = BetHistoryConfig::feat_per_action;
-        const int FF = hist_.ffn_mult * D;
+    // Attention-encoder construction. The entire `if constexpr` block —
+    // module registrations, parameter allocations, and the trunk-dim
+    // contribution — is dead-code-eliminated when the build flag is
+    // false. RoundSummaryConfig::dim()/BetHistoryConfig::history_block_dim()
+    // already handle the corresponding obs-layout sizes consistently.
+    if constexpr (features::ATTENTION_ENCODER) {
+        if (hist_.enabled) {
+            const int D  = hist_.attn_dim;
+            const int H  = hist_.attn_heads;
+            const int T  = hist_.max_history_len;
+            const int F  = BetHistoryConfig::feat_per_action;
+            const int FF = hist_.ffn_mult * D;
 
-        if (D <= 0 || H <= 0 || D % H != 0) {
-            throw std::invalid_argument(
-                "BetHistoryConfig: attn_dim must be a positive multiple of attn_heads");
+            if (D <= 0 || H <= 0 || D % H != 0) {
+                throw std::invalid_argument(
+                    "BetHistoryConfig: attn_dim must be a positive multiple of attn_heads");
+            }
+
+            token_embed_ = register_module("token_embed", torch::nn::Linear(F, D));
+
+            cls_token_ = register_parameter("cls_token", torch::zeros({1, 1, D}));
+            pos_embed_ = register_parameter("pos_embed", torch::zeros({1, T + 1, D}));
+            torch::nn::init::normal_(cls_token_, /*mean=*/0.0, /*std=*/0.02);
+            torch::nn::init::normal_(pos_embed_, /*mean=*/0.0, /*std=*/0.02);
+
+            attn_ln_.reserve(hist_.num_blocks);
+            qkv_proj_.reserve(hist_.num_blocks);
+            out_proj_.reserve(hist_.num_blocks);
+            ffn_ln_.reserve(hist_.num_blocks);
+            ffn1_.reserve(hist_.num_blocks);
+            ffn2_.reserve(hist_.num_blocks);
+            for (int b = 0; b < hist_.num_blocks; ++b) {
+                const std::string s = std::to_string(b);
+                attn_ln_.push_back(register_module(
+                    "attn_ln_" + s, torch::nn::LayerNorm(torch::nn::LayerNormOptions({D}))));
+                qkv_proj_.push_back(register_module(
+                    "qkv_proj_" + s, torch::nn::Linear(D, 3 * D)));
+                out_proj_.push_back(register_module(
+                    "out_proj_" + s, torch::nn::Linear(D, D)));
+                ffn_ln_.push_back(register_module(
+                    "ffn_ln_" + s, torch::nn::LayerNorm(torch::nn::LayerNormOptions({D}))));
+                ffn1_.push_back(register_module(
+                    "ffn1_" + s, torch::nn::Linear(D, FF)));
+                ffn2_.push_back(register_module(
+                    "ffn2_" + s, torch::nn::Linear(FF, D)));
+            }
+
+            // The history encoder contributes its CLS embedding (dim D)
+            // to the trunk input. round_summary, if enabled, contributes
+            // its own features in parallel — accumulate, don't overwrite.
+            trunk_in_dim += D;
         }
-
-        token_embed_ = register_module("token_embed", torch::nn::Linear(F, D));
-
-        cls_token_ = register_parameter("cls_token", torch::zeros({1, 1, D}));
-        pos_embed_ = register_parameter("pos_embed", torch::zeros({1, T + 1, D}));
-        torch::nn::init::normal_(cls_token_, /*mean=*/0.0, /*std=*/0.02);
-        torch::nn::init::normal_(pos_embed_, /*mean=*/0.0, /*std=*/0.02);
-
-        attn_ln_.reserve(hist_.num_blocks);
-        qkv_proj_.reserve(hist_.num_blocks);
-        out_proj_.reserve(hist_.num_blocks);
-        ffn_ln_.reserve(hist_.num_blocks);
-        ffn1_.reserve(hist_.num_blocks);
-        ffn2_.reserve(hist_.num_blocks);
-        for (int b = 0; b < hist_.num_blocks; ++b) {
-            const std::string s = std::to_string(b);
-            attn_ln_.push_back(register_module(
-                "attn_ln_" + s, torch::nn::LayerNorm(torch::nn::LayerNormOptions({D}))));
-            qkv_proj_.push_back(register_module(
-                "qkv_proj_" + s, torch::nn::Linear(D, 3 * D)));
-            out_proj_.push_back(register_module(
-                "out_proj_" + s, torch::nn::Linear(D, D)));
-            ffn_ln_.push_back(register_module(
-                "ffn_ln_" + s, torch::nn::LayerNorm(torch::nn::LayerNormOptions({D}))));
-            ffn1_.push_back(register_module(
-                "ffn1_" + s, torch::nn::Linear(D, FF)));
-            ffn2_.push_back(register_module(
-                "ffn2_" + s, torch::nn::Linear(FF, D)));
-        }
-
-        // The history encoder contributes its CLS embedding (dim D) to the
-        // trunk input. round_summary, if enabled, contributes its own
-        // features in parallel — accumulate, don't overwrite.
-        trunk_in_dim += D;
     }
 
     // ── trunk + head ────────────────────────────────────────────────────
@@ -95,17 +104,19 @@ TowerImpl::TowerImpl(int obs_dim, int output_dim,
     torch::nn::init::orthogonal_(head_->weight, head_init_std);
     torch::nn::init::constant_(head_->bias, 0.0);
 
-    if (hist_.enabled) {
-        auto xavier_lin = [](torch::nn::Linear& lin) {
-            torch::nn::init::xavier_uniform_(lin->weight);
-            torch::nn::init::constant_(lin->bias, 0.0);
-        };
-        xavier_lin(token_embed_);
-        for (int b = 0; b < hist_.num_blocks; ++b) {
-            xavier_lin(qkv_proj_[b]);
-            xavier_lin(out_proj_[b]);
-            xavier_lin(ffn1_[b]);
-            xavier_lin(ffn2_[b]);
+    if constexpr (features::ATTENTION_ENCODER) {
+        if (hist_.enabled) {
+            auto xavier_lin = [](torch::nn::Linear& lin) {
+                torch::nn::init::xavier_uniform_(lin->weight);
+                torch::nn::init::constant_(lin->bias, 0.0);
+            };
+            xavier_lin(token_embed_);
+            for (int b = 0; b < hist_.num_blocks; ++b) {
+                xavier_lin(qkv_proj_[b]);
+                xavier_lin(out_proj_[b]);
+                xavier_lin(ffn1_[b]);
+                xavier_lin(ffn2_[b]);
+            }
         }
     }
 }
@@ -177,15 +188,25 @@ torch::Tensor TowerImpl::forward(torch::Tensor obs) {
     parts.reserve(3);
     parts.push_back(static_feats);
 
-    if (round_summary_.enabled) {
-        parts.push_back(obs.narrow(1, off, round_summary_.dim()));
-        off += round_summary_.dim();
+    // Round-summary parse: dual-tier gated. When the build flag is off,
+    // RoundSummaryConfig::dim() also returns 0, so the obs simply doesn't
+    // have these features and the parts list omits them.
+    if constexpr (features::ROUND_SUMMARY) {
+        if (round_summary_.enabled) {
+            parts.push_back(obs.narrow(1, off, round_summary_.dim()));
+            off += round_summary_.dim();
+        }
     }
 
-    if (hist_.enabled) {
-        auto history_blk = obs.narrow(1, off, hist_.history_block_dim());
-        off += hist_.history_block_dim();
-        parts.push_back(encode_history(history_blk));
+    // Bet-history attention parse: same dual-tier gating. When the build
+    // flag is off, encode_history is never called and the entire encoder
+    // pipeline is dead.
+    if constexpr (features::ATTENTION_ENCODER) {
+        if (hist_.enabled) {
+            auto history_blk = obs.narrow(1, off, hist_.history_block_dim());
+            off += hist_.history_block_dim();
+            parts.push_back(encode_history(history_blk));
+        }
     }
     (void)off;
 

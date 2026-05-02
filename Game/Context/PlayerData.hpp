@@ -49,7 +49,7 @@ struct PlayerData {
         return infoSets[player];
     }
 
-    void reset(const GameConfig& cfg) noexcept {
+    void reset(const DefaultGameConfig& cfg) noexcept {
         currentPlayer = 0;
         stacks.fill(cfg.initial_stack);
         for (auto& infoSet : infoSets) {

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "environment.h"
+#include "config.h"
 #include "Game.hpp"
 #include "GameConfig.hpp"
 
@@ -34,20 +35,46 @@ namespace poker_ppo {
 // millibigblinds as stored by Poker), normalised by INITIAL_STACK so it sits in
 // a reasonable range for the critic.  PPO handles the sign-flip for seat 1.
 
-// Wraps a Game::GameConfig (the poker variant) plus PPO-side knobs.
+// Wraps a Game::DefaultGameConfig (the poker variant) plus PPO-side knobs.
 // All poker-rule tuning lives in `game`; only per-run seeding and adapter
 // flags belong on PokerConfig itself.
 struct PokerConfig {
-    ::Game::GameConfig  game{};           // deck, stacks, blinds, betting structure
+    ::Game::DefaultGameConfig  game{};           // deck, stacks, blinds, betting structure
     BetHistoryConfig    hist{};           // attention-encoder layout (T, F, ...)
     RoundSummaryConfig  round_summary{};  // per-round summary feature block
 
     // Seed used as a base — each created env gets seed ^ instance hash.
     uint64_t seed = 0x9E3779B97F4A7C15ull;
 
-    [[nodiscard]] int num_raise_slots() const { return game.num_raise_slots(); }
-    [[nodiscard]] int action_count()    const { return game.action_count(); }
+    [[nodiscard]] constexpr int num_raise_slots() const noexcept { return game.num_raise_slots(); }
+    [[nodiscard]] constexpr int action_count()    const noexcept { return game.action_count(); }
 };
+
+// ─── Live constexpr instance ──────────────────────────────────────────
+//
+// Single compile-time PokerConfig consumed by PokerEnvironment /
+// PokerEnvironmentFactory / main.cpp. The trainer-side feature gates
+// (`hist`, `round_summary`) are pulled directly from `kPPOConfig` so the
+// env's observation layout and the network's input layout can never
+// drift apart. The seed is the PRNG base — each env XORs an instance
+// hash on top.
+inline constexpr PokerConfig kPokerConfig{
+    .game          = ::Game::kGameConfig,
+    .hist          = config::kPPOConfig.hist,
+    .round_summary = config::kPPOConfig.round_summary,
+    .seed          = 0x12345ULL,
+};
+
+// Compile-time invariants. These mirror the runtime check in the
+// PokerEnvironment constructor — having them as static_asserts means
+// any drift between BetConfig and the game's action layout fails to
+// build instead of throwing at runtime.
+static_assert(kPokerConfig.action_count() == config::kBetConfig.action_count(),
+              "kBetConfig.action_count() must match kPokerConfig.action_count() "
+              "(2 + num_raise_slots)");
+static_assert(kPokerConfig.game.max_raises_per_round
+              == static_cast<uint8_t>(config::kBetConfig.max_bets_per_round),
+              "BetConfig.max_bets_per_round must match game.max_raises_per_round");
 
 class PokerEnvironment : public IPokerEnvironment {
 public:
@@ -79,7 +106,7 @@ public:
     int raise_num() const;
     /// Terminal utility for `player` in mbb. Undefined if !is_terminal().
     int terminal_utility(int player) const;
-    const ::Game::GameConfig& game_config() const { return poker_cfg_.game; }
+    const ::Game::DefaultGameConfig& game_config() const { return poker_cfg_.game; }
 
 private:
     // Per-action snapshot recorded each time the env applies a player action.
@@ -114,7 +141,7 @@ private:
     BetHistoryConfig    hist_cfg_;
     RoundSummaryConfig  rs_cfg_;
     std::mt19937 rng_;
-    ::Game::BettingConfig game_betting_cfg_;
+    ::Game::DefaultBettingConfig game_betting_cfg_;
     std::unique_ptr<::Game::DiscreteGame> game_;
 
     int obs_dim_       = 0;

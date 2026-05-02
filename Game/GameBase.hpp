@@ -14,7 +14,7 @@ namespace Game {
 
 // Structural constants — fixed at build time because arrays, blind layout,
 // and the static hand_indexer assume them. Runtime variation lives in
-// GameConfig (initial_stack, blinds, max_raises, excluded_cards, …).
+// DefaultGameConfig (initial_stack, blinds, max_raises, excluded_cards, …).
 static constexpr int NUM_PLAYERS         = NUM_PLAYERS_FIXED;
 static constexpr int NUM_ROUNDS          = NUM_ROUNDS_FIXED;
 static constexpr int DECK_SIZE           = CARD_NAMESPACE_SIZE;  // card-ID space (always 52)
