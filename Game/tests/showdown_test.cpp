@@ -18,6 +18,7 @@
 //
 // Rank values are 0..12 where 0 = "2" and 12 = "A" in both encodings.
 
+#include "Utility/CardConversion.hpp"
 #include "Utility/Utility.hpp"
 #include "Game.hpp"
 #include "GameConfig.hpp"
@@ -592,12 +593,10 @@ TEST(Integration, EndToEndShowdownAgreesWithEvaluator) {
     Game::DefaultBettingConfig bet_cfg = Game::make_default_betting_config(gcfg);
 
     // Helper: deck.h id → TwoPlusTwo id (mirrors Transitioner's conversion).
-    auto to_2p2 = [](uint8_t c) -> int {
-        const int rank      = c >> 2;
-        const int suit_dh   = c & 3;
-        const int suit_2p2  = 3 - suit_dh;
-        return rank * 4 + suit_2p2 + 1;
-    };
+    // Single source of truth for the deck.h ↔ TwoPlusTwo encoding lives
+    // in Game/Utility/CardConversion.hpp; reuse it here so a future
+    // encoding tweak doesn't require touching this test.
+    auto to_2p2 = [](uint8_t c) { return Game::deck_to_two_plus_two(c); };
 
     constexpr int N_HANDS = 50;
     int wins_p0 = 0, wins_p1 = 0, ties = 0;

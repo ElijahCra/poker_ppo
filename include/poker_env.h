@@ -1,16 +1,17 @@
 #pragma once
 
-#include "environment.h"
 #include "config.h"
+#include "environment.h"
+#include "observation_builder.h"
 #include "Game.hpp"
 #include "GameConfig.hpp"
 
 #include <array>
 #include <atomic>
 #include <memory>
+#include <optional>
 #include <random>
 #include <vector>
-#include <optional>
 
 namespace poker_ppo {
 
@@ -82,7 +83,7 @@ public:
                         const BetConfig& bet_cfg,
                         uint64_t seed);
 
-    int obs_dim() const override { return obs_dim_; }
+    int obs_dim() const override;
     const BetConfig& bet_config() const override { return bet_cfg_; }
 
     StepResult reset() override;
@@ -109,62 +110,30 @@ public:
     const ::Game::DefaultGameConfig& game_config() const { return poker_cfg_.game; }
 
 private:
-    // Per-action snapshot recorded each time the env applies a player action.
-    // Hand-level: cleared by reset(). Truncated to the most-recent
-    // `hist_cfg_.max_history_len` entries when serialised.
-    struct HistEntry {
-        uint32_t amount;        // chip delta added to pot (mbb)
-        uint8_t  player;        // 0 or 1 (seat that took the action)
-        uint8_t  round;         // 0..3
-        bool     is_aggressive; // true = Raise, false = Call/Check/Fold
-    };
-
     void auto_advance_chance();
     void rebuild_action_table();
-    torch::Tensor compute_observation() const;
     torch::Tensor compute_mask() const;
-
-    /// Serialise `bet_history_` into a [T, F] tokens block + [T] mask, written
-    /// into `obs` at offset `dst_off`.  Layout: mask first, then tokens (row-
-    /// major).  Returns the new offset (= dst_off + T*(1+F)).
-    int write_history_block(torch::TensorAccessor<float, 1>& a, int dst_off,
-                            int current_player) const;
-
-    /// Write the per-round summary block (4 rounds × 4 features) at offset
-    /// `dst_off` and return the new offset.  Derived live from `bet_history_`
-    /// so it stays consistent with the attention encoder when both are on.
-    int write_round_summary_block(torch::TensorAccessor<float, 1>& a,
-                                  int dst_off, int current_player) const;
 
     PokerConfig         poker_cfg_;
     BetConfig           bet_cfg_;
-    BetHistoryConfig    hist_cfg_;
-    RoundSummaryConfig  rs_cfg_;
-    std::mt19937 rng_;
-    ::Game::DefaultBettingConfig game_betting_cfg_;
+    std::mt19937        rng_;
+    ::Game::DefaultBettingConfig          game_betting_cfg_;
     std::unique_ptr<::Game::DiscreteGame> game_;
 
-    int obs_dim_       = 0;
-    int static_obs_dim_ = 0;     // obs_dim_ minus the history tail
-    int A_             = 0;
-    int allin_slot_    = -1;     // -1 if disabled
-    float stack_norm_  = 1.0f;   // = game.initial_stack; observation scaling
-    float pot_norm_    = 1.0f;   // = 2 * initial_stack
-    float reward_norm_ = 1.0f;   // = 10 * big_blind; terminal-reward scaling
-    int   max_raises_norm_ = 4;  // = game.max_raises_per_round (>=1 guarded)
+    // Obs construction is delegated to ObservationBuilder. The env owns
+    // the bet-history buffer + the layout/normalisers; the builder owns
+    // the per-tensor write logic.
+    ObservationBuilder obs_builder_;
 
-    // Inverse of the hand_indexer's per-round canonical-bucket count, used
-    // to normalise handHashes[round] into [0, 1] hand-strength features.
-    // Set lazily on first observation since the static indexer needs the
-    // first hand-init pass to be populated. `mutable` because it's a pure
-    // memoisation cache — no observable state change for callers.
-    mutable std::array<float, 4> indexer_norm_ = {0.0f, 0.0f, 0.0f, 0.0f};
+    int   A_              = 0;
+    int   allin_slot_     = -1;     // -1 if disabled
+    float reward_norm_    = 1.0f;   // = 10 * big_blind; terminal-reward scaling
 
     // PPO-action-index → Poker Action, or nullopt if illegal this state.
     std::vector<std::optional<::Game::Action>> action_table_;
 
     // Hand-level bet history (cleared on reset, appended in step).
-    std::vector<HistEntry> bet_history_;
+    std::vector<BetHistoryEntry> bet_history_;
 };
 
 class PokerEnvironmentFactory : public IPokerEnvironmentFactory {

@@ -1,10 +1,31 @@
 #pragma once
 
-#include "types.h"
+#include "config.h"
+#include "observation_layout.h"
 #include <torch/torch.h>
 #include <vector>
 
 namespace poker_ppo {
+
+// ─── Numeric constants used by the network and downstream consumers ─────
+// `kIllegalActionLogit` is the additive value applied to illegal actions
+// before softmax, sending their post-softmax probability to ~0. We use
+// -1e8 (and not -inf) so log-prob computations stay finite if any caller
+// happens to gather an illegal slot — the value is small enough that
+// fp32 softmax produces 0 to many ULPs but the upstream arithmetic never
+// produces a NaN.
+inline constexpr float kIllegalActionLogit = -1e8f;
+
+// Used inside the attention encoder's softmax over keys; we want a more
+// negative value here because the keys are already attended *before* the
+// softmax, and -1e8 turned out to leak ~1e-9 weight on padded positions
+// which the unit tests caught. -1e9 is enough to drive that residual to
+// 0 in fp32.
+inline constexpr float kAttentionMaskLogit = -1e9f;
+
+// Numerical-safety epsilon added to the denominator of advantage
+// normalisation in the PPO update.
+inline constexpr float kAdvantageEps = 1e-8f;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tower — one half of an actor-critic pair: optional bet-history attention
@@ -29,7 +50,7 @@ private:
 
     BetHistoryConfig    hist_;
     RoundSummaryConfig  round_summary_;
-    int  static_dim_  = 0;
+    ObservationLayout   layout_;
 
     // Attention encoder (only registered if hist.enabled).
     torch::nn::Linear token_embed_{nullptr};
@@ -117,5 +138,28 @@ private:
 };
 
 TORCH_MODULE(ActorCritic);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// clone_actor_critic — deep-copy an ActorCritic by shape + parameters.
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// libtorch's `clone()` on a Module does NOT do what we want here — it
+// returns a base `Module`, not a typed `ActorCritic`, and it requires
+// parameter buffers be re-registered. The reservoir-sampling opponent
+// pool and the best-response evaluator both want a typed deep copy, so
+// they both implemented the same routine. Centralised here.
+//
+// Allocates a fresh ActorCritic of matching shape, copies parameters and
+// buffers (under NoGradGuard), moves to `device`, and switches to eval()
+// since a clone is always a frozen target.
+[[nodiscard]] ActorCritic clone_actor_critic(
+    const ActorCritic&  src,
+    int                 obs_dim,
+    int                 action_count,
+    int                 hidden_dim,
+    int                 num_layers,
+    BetHistoryConfig    hist,
+    RoundSummaryConfig  round_summary,
+    torch::Device       device);
 
 } // namespace poker_ppo

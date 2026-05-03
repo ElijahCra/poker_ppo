@@ -1,9 +1,5 @@
-//
-// Created by Elijah Crain on 12/31/25.
-//
+#pragma once
 
-#ifndef POKER_HASHUTIL_HPP
-#define POKER_HASHUTIL_HPP
 #include <cstdint>
 #include <cstring>
 
@@ -25,5 +21,3 @@ inline uint64_t floatBits(float f) {
     return static_cast<uint64_t>(bits);
 }
 }  // namespace HashUtil
-
-#endif //POKER_HASHUTIL_HPP

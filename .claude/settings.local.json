@@ -27,7 +27,10 @@
       "Bash(ninja poker_ppo)",
       "Bash(cmake --build /Users/elijahcrain/CLionProjects/ppo_poker/cmake-build-release --target poker_ppo)",
       "Bash(python3 -c \"import ast, sys; ast.parse\\(open\\('/Users/elijahcrain/CLionProjects/ppo_poker/tools/plot_live.py'\\).read\\(\\)\\); print\\('ok'\\)\")",
-      "Bash(cmake --build /Users/elijahcrain/CLionProjects/ppo_poker/cmake-build-release)"
+      "Bash(cmake --build /Users/elijahcrain/CLionProjects/ppo_poker/cmake-build-release)",
+      "Bash(ctest)",
+      "Bash(cmake -S /Users/elijahcrain/CLionProjects/ppo_poker -B /Users/elijahcrain/CLionProjects/ppo_poker/cmake-build-release)",
+      "Bash(ctest --output-on-failure --rerun-failed)"
     ]
   }
 }

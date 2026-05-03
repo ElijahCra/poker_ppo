@@ -1,9 +1,5 @@
-//
-// Created by Elijah Crain on 10/5/25.
-//
+#pragma once
 
-#ifndef CFR2_TEXAS_GAME_GAMECONTEXT_HPP
-#define CFR2_TEXAS_GAME_GAMECONTEXT_HPP
 #include <array>
 #include <cassert>
 #include <random>
@@ -203,5 +199,3 @@ struct std::hash<Game::InfoSetData> {
         return data.toNumericId();
     }
 };
-
-#endif  // CFR2_TEXAS_GAME_GAMECONTEXT_HPP

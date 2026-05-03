@@ -51,28 +51,6 @@ void BestResponseEvaluator::init_exploiter() {
         torch::optim::AdamOptions(cfg_.learning_rate).eps(1e-5));
 }
 
-ActorCritic BestResponseEvaluator::clone_network(const ActorCritic& src) {
-    ActorCritic dst(obs_dim_, action_count_, hidden_dim_, num_layers_,
-                    hist_, round_summary_);
-    dst->to(device_);
-
-    torch::NoGradGuard ng;
-    auto sp = src->parameters();
-    auto dp = dst->parameters();
-    TORCH_CHECK(sp.size() == dp.size(),
-                "BestResponseEvaluator::clone_network: parameter count mismatch");
-    for (size_t i = 0; i < sp.size(); ++i)
-        dp[i].copy_(sp[i].detach().to(device_));
-    auto sb = src->buffers();
-    auto db = dst->buffers();
-    TORCH_CHECK(sb.size() == db.size(),
-                "BestResponseEvaluator::clone_network: buffer count mismatch");
-    for (size_t i = 0; i < sb.size(); ++i)
-        db[i].copy_(sb[i].detach().to(device_));
-    dst->eval();
-    return dst;
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // evaluate
 // ─────────────────────────────────────────────────────────────────────────────
@@ -86,7 +64,9 @@ BestResponseEvaluator::evaluate(const ActorCritic& target,
 
     // Snapshot the target once — every seed plays against the same frozen
     // copy, so subsequent main-trainer updates can't race with our forwards.
-    ActorCritic frozen_target = clone_network(target);
+    ActorCritic frozen_target = clone_actor_critic(
+        target, obs_dim_, action_count_, hidden_dim_, num_layers_,
+        hist_, round_summary_, device_);
 
     const int  num_seeds  = std::max(1, cfg_.num_exploiter_seeds);
     const bool multi_seed = num_seeds > 1;

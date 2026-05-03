@@ -1,9 +1,4 @@
-//
-// Created by Elijah Crain on 12/21/25.
-//
-
-#ifndef CFR2_ACTIONPOLICY_HPP
-#define CFR2_ACTIONPOLICY_HPP
+#pragma once
 
 #include <algorithm>
 #include <vector>
@@ -158,7 +153,9 @@ inline DiscreteActionPolicy::ActionSet DiscreteActionPolicy::generateActions(
             state.raiseCount == 1 &&
             state.lastRaiser == 1)
         {
-            callAmount -= 500;
+            // SB calling preflop owes BB-SB = small_blind, not the full
+            // BB — its half-blind is already in the pot.
+            callAmount -= context.config().small_blind;
         }
 
         uint32_t finalCallAmount = std::min(callAmount, context.players.stacks[current_player]);
@@ -201,7 +198,9 @@ inline ContinuousActionPolicy::ActionSet ContinuousActionPolicy::generateActions
             state.raiseCount == 1 &&
             state.lastRaiser == 1)
         {
-            callAmount -= 500;
+            // SB calling preflop owes BB-SB = small_blind, not the full
+            // BB — its half-blind is already in the pot.
+            callAmount -= context.config().small_blind;
         }
         bounds.callAmount = std::min(callAmount, playerStack);
     } else {
@@ -230,5 +229,3 @@ inline ContinuousActionPolicy::ActionSet ContinuousActionPolicy::generateActions
 }
 
 }  // namespace Game
-
-#endif //CFR2_ACTIONPOLICY_HPP

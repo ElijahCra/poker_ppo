@@ -1,9 +1,5 @@
-//
-// Created by Elijah Crain on 10/5/25.
-//
+#pragma once
 
-#ifndef CFR2_VARIANTTEXAS_GAME_HPP
-#define CFR2_VARIANTTEXAS_GAME_HPP
 #include <random>
 #include <stdexcept>
 #include <algorithm>
@@ -104,9 +100,7 @@ void reInitialize() {
         if (terminal->winner == player) {
             return static_cast<int32_t>(m_context.getPot()) - contribution;
         }
-        // Tie convention: Transitioner::makeTerminal sets winner = 2 for a
-        // showdown tie. Accept either 2 or the legacy -1 sentinel for safety.
-        if (terminal->winner == 2 || terminal->winner == -1) {
+        if (terminal->winner == TIE_WINNER) {
             return static_cast<int32_t>(m_context.getPot() / 2) - contribution;
         }
         // Lose
@@ -167,14 +161,24 @@ ActionSet m_available_actions;
 }
 
 void updateAvailableActions() {
-    if (std::holds_alternative<TerminalState>(m_current_state)) {
-        m_available_actions = ActionPolicy::makeEmptyActionSet();
-    } else if (std::holds_alternative<ChanceState>(m_current_state)) {
-        m_available_actions = ActionPolicy::makeChanceActionSet();
-    } else if (const auto* actionState = std::get_if<ActionState>(&m_current_state)) {
-        m_available_actions = ActionPolicy::generateActions(
-            m_betting_config, m_context, *actionState);
-    }
+    // Exhaustive variant dispatch — same idiom as Transitioner. Compiler
+    // will static_assert if a new GameState alternative is added without
+    // a matching branch here.
+    m_available_actions = std::visit([this]<typename S>(const S& s) -> ActionSet {
+        using T = std::decay_t<S>;
+        if constexpr (std::is_same_v<T, TerminalState>) {
+            (void)s;
+            return ActionPolicy::makeEmptyActionSet();
+        } else if constexpr (std::is_same_v<T, ChanceState>) {
+            (void)s;
+            return ActionPolicy::makeChanceActionSet();
+        } else if constexpr (std::is_same_v<T, ActionState>) {
+            return ActionPolicy::generateActions(m_betting_config, m_context, s);
+        } else {
+            static_assert(!std::is_same_v<T, T>,
+                          "updateAvailableActions: missing GameState branch");
+        }
+    }, m_current_state);
 }
 
 void updateInfoSets(const Action& action) {
@@ -236,5 +240,3 @@ using DiscreteGame = Game<DiscreteActionPolicy>;
 using ContinuousGame = Game<ContinuousActionPolicy>;
 
 }  // namespace Game
-
-#endif  // CFR2_VARIANTTEXAS_GAME_HPP

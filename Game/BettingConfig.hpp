@@ -20,8 +20,7 @@
 // learner.
 //
 
-#ifndef CFR2_BETTINGCONFIG_HPP
-#define CFR2_BETTINGCONFIG_HPP
+#pragma once
 
 #include <array>
 #include <cstddef>
@@ -186,5 +185,3 @@ inline constexpr DefaultBettingConfig kBettingConfig =
     make_default_betting_config(kGameConfig);
 
 }  // namespace Game
-
-#endif  // CFR2_BETTINGCONFIG_HPP

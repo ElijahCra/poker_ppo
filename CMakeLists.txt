@@ -38,11 +38,17 @@ add_library(poker_ppo_lib
     src/network.cpp
     src/ppo.cpp
     src/rollout_buffer.cpp
+    src/rollout_collector.cpp
     src/poker_env.cpp
+    src/observation_builder.cpp
     src/league.cpp
     src/metrics_logger.cpp
     src/opponent_pool.cpp
+    src/opponent_manager.cpp
     src/best_response.cpp
+    src/cmd_train.cpp
+    src/cmd_play.cpp
+    src/cmd_benchmark.cpp
 )
 target_include_directories(poker_ppo_lib PUBLIC
     include

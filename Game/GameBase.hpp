@@ -1,11 +1,5 @@
-//
-// Created by Elijah Crain on 10/5/25.
-//
+#pragma once
 
-#ifndef CFR2_TEXAS_GAMEBASE_HPP
-#define CFR2_TEXAS_GAMEBASE_HPP
-#include <optional>
-#include <string>
 #include <variant>
 
 #include "GameConfig.hpp"
@@ -20,6 +14,16 @@ static constexpr int NUM_ROUNDS          = NUM_ROUNDS_FIXED;
 static constexpr int DECK_SIZE           = CARD_NAMESPACE_SIZE;  // card-ID space (always 52)
 static constexpr int NUM_HOLE_CARDS      = NUM_HOLE_CARDS_FIXED;
 static constexpr int NUM_COMMUNITY_CARDS = 5;
+
+// Sentinel for "no player" / "unset seat". 0xFF is unambiguous in a
+// uint8_t (NUM_PLAYERS is 2 so seat IDs are 0..1) and survives narrowing.
+// Used by ActionState::lastRaiser, TerminalState::winner, and the various
+// `1 - currentPlayer` "the other player" sites that need an unset value.
+static constexpr uint8_t INVALID_PLAYER = 0xFF;
+// Sentinel for "showdown tie" in TerminalState::winner — distinct from
+// INVALID_PLAYER. The TwoPlusTwo evaluator returns 3 for a tie; we
+// normalise to 2 here (one greater than the largest valid seat id).
+static constexpr uint8_t TIE_WINNER = 2;
 
 // Action types as structs
 struct Fold {
@@ -57,5 +61,3 @@ using Action = std::variant<
     Chance
 >;
 }
-
-#endif //CFR2_TEXAS_GAMEBASE_HPP

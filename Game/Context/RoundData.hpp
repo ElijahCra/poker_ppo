@@ -1,9 +1,4 @@
-//
-// Created by Elijah Crain on 12/31/25.
-//
-
-#ifndef POKER_ROUNDDATA_HPP
-#define POKER_ROUNDDATA_HPP
+#pragma once
 
 #include "../GameState.hpp"
 
@@ -29,5 +24,3 @@ struct RoundData {
     [[nodiscard]] bool isRiver()   const noexcept { return number == 3; }
 };
 }
-
-#endif //POKER_ROUNDDATA_HPP

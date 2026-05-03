@@ -27,10 +27,10 @@
 // exploiter-acting states and is OOD on target-acting carry states.
 //
 
+#include "config.h"
 #include "environment.h"
 #include "network.h"
 #include "rollout_buffer.h"
-#include "types.h"
 
 #include <torch/torch.h>
 
@@ -39,50 +39,6 @@
 #include <vector>
 
 namespace poker_ppo {
-
-struct BestResponseConfig {
-    bool  enabled            = false;  // master toggle
-    int   eval_every         = 1000;   // run every N main-trainer updates
-    int   updates_per_eval   = 200;    // PPO updates of exploiter per evaluation
-
-    int   num_envs           = 32;
-    int   num_steps          = 128;
-    int   update_epochs      = 4;
-    int   num_minibatches    = 4;
-
-    float learning_rate      = 3.0e-4f;
-    float ent_coef           = 0.01f;
-    float vf_coef            = 0.5f;
-    float clip_coef          = 0.2f;
-    float max_grad_norm      = 0.5f;
-    float gamma              = 1.0f;
-    float gae_lambda         = 1.0f;
-    bool  norm_advantages    = true;
-    bool  clip_vloss         = false;
-
-    bool  warm_start         = true;
-
-    // Number of fresh exploiter seeds per evaluate() call. When >1, each
-    // call trains that many independent exploiters from random init against
-    // the same frozen target, and reports max-bb/hand as the canonical
-    // lower bound (mean/min/std are also recorded as diagnostics). Each
-    // seed's per-eval bb/hand is a valid lower bound on its own; the max
-    // over seeds is the tightest bound the budget can produce, and is much
-    // less noisy than any single seed. Cost scales linearly. When >1,
-    // warm_start is ignored — every seed is fresh.
-    int   num_exploiter_seeds = 3;
-
-    // Hands played in the post-training eval-only match between the trained
-    // exploiter and the frozen target. The eval-match's bb/hand is the
-    // reported BR estimate — using rewards collected during the exploiter's
-    // training rollouts would bias the bound downward (the early-training
-    // exploiter plays badly while it's still learning). Set to 0 to skip
-    // the eval and fall back to training-time reward averaging (debug only).
-    int   eval_hands         = 5000;
-
-    float bb_per_unit_reward = 10.0f;  // matches PokerEnvironment::reward_norm
-    uint64_t seed            = 0;
-};
 
 class BestResponseEvaluator {
 public:
@@ -127,7 +83,6 @@ public:
 
 private:
     void init_exploiter();
-    ActorCritic clone_network(const ActorCritic& src);
 
     // Stats from a deterministic, no-learning match between the exploiter
     // and the frozen target — the canonical BR measurement once training

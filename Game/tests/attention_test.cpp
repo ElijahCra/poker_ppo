@@ -16,7 +16,6 @@
 // internal encoder shapes.
 
 #include "network.h"
-#include "types.h"
 
 #include <gtest/gtest.h>
 #include <torch/torch.h>
@@ -28,26 +27,12 @@ namespace {
 using namespace poker_ppo;
 
 // ─── Helpers to build a known obs vector ─────────────────────────────────
+//
+// Uses the project's canonical `ObservationLayout` so the test can never
+// drift from the real env-↔-network layout: a layout change forces a
+// failure here too, at compile time.
 
-constexpr int CARD_SLOTS = 52;
-constexpr int N_STATIC_NON_CARD = 11;  // stacks(2) + pot + cb + raises + round_oh(4) + me + alignment
-
-struct Layout {
-    int static_dim;
-    int round_summary_dim;
-    int hist_dim;
-    int total;
-};
-
-Layout layout_for(const BetHistoryConfig& hist, const RoundSummaryConfig& rs) {
-    // static = 2*CARD_SLOTS + 2 + 1 + 1 + 1 + 4 + 1 = 112; matches PokerEnvironment.
-    Layout L{};
-    L.static_dim        = 2 * CARD_SLOTS + N_STATIC_NON_CARD;
-    L.round_summary_dim = rs.dim();
-    L.hist_dim          = hist.history_block_dim();
-    L.total             = L.static_dim + L.round_summary_dim + L.hist_dim;
-    return L;
-}
+constexpr int CARD_SLOTS = ObservationLayout::CARD_SLOTS;
 
 // Build a [1, total] obs tensor with a configurable history block.
 //   `mask_real` = number of leading positions in the history that are real
@@ -58,28 +43,27 @@ torch::Tensor make_obs(const BetHistoryConfig& hist,
                        const RoundSummaryConfig& rs,
                        int mask_real,
                        uint32_t token_seed) {
-    const Layout L = layout_for(hist, rs);
-    auto obs = torch::zeros({1, L.total}, torch::kFloat32);
+    const auto L = ObservationLayout::build(hist, rs);
+    auto obs = torch::zeros({1, L.total_dim}, torch::kFloat32);
     auto a   = obs.accessor<float, 2>();
 
     // Static features: a couple of card one-hots, valid stacks/pot, sane round.
-    a[0][0]  = 1.0f;             // hole card 0
-    a[0][13] = 1.0f;             // hole card 1
-    a[0][2 * CARD_SLOTS + 0] = 0.95f;  // stack me
-    a[0][2 * CARD_SLOTS + 1] = 0.95f;  // stack opp
-    a[0][2 * CARD_SLOTS + 2] = 0.01f;  // pot
-    a[0][2 * CARD_SLOTS + 3] = 0.01f;  // current_bet
-    a[0][2 * CARD_SLOTS + 4] = 0.0f;   // raise_num
-    a[0][2 * CARD_SLOTS + 5] = 1.0f;   // round one-hot[0] = preflop
-    // round one-hot[1..3], me — leave zeros.
+    a[0][L.hole_off + 0]  = 1.0f;         // hole card 0
+    a[0][L.hole_off + 13] = 1.0f;         // hole card 1
+    a[0][L.static_off + 0] = 0.95f;       // stack me
+    a[0][L.static_off + 1] = 0.95f;       // stack opp
+    a[0][L.static_off + 2] = 0.01f;       // pot
+    a[0][L.static_off + 3] = 0.01f;       // current_bet
+    a[0][L.static_off + 4] = 0.0f;        // raise_num
+    a[0][L.static_off + 5] = 1.0f;        // round one-hot[0] = preflop
+    // round one-hot[1..3], me, hand_strength[..] — leave zeros.
 
     if (rs.enabled) {
-        // Leave round-summary features at zero — we don't care about them
-        // for these tests.
+        // Leave round-summary features at zero — irrelevant for these tests.
     }
 
     if (hist.enabled) {
-        const int hist_off = L.static_dim + L.round_summary_dim;
+        const int hist_off = L.history_off;
         const int T        = hist.max_history_len;
         const int F        = BetHistoryConfig::feat_per_action;
 
@@ -137,8 +121,8 @@ TEST(Attention, ForwardAndBackwardRun) {
     RoundSummaryConfig rs;
     rs.enabled = false;
 
-    const Layout L = layout_for(hist, rs);
-    ActorCritic net(L.total, /*action_count=*/4,
+    const auto L = ObservationLayout::build(hist, rs);
+    ActorCritic net(L.total_dim, /*action_count=*/4,
                     /*hidden_dim=*/32, /*num_layers=*/2,
                     hist, rs);
     net->train();
@@ -178,8 +162,8 @@ TEST(Attention, PaddingIsInvariantToGarbageInPaddedSlots) {
     RoundSummaryConfig rs;
     rs.enabled = false;
 
-    const Layout L = layout_for(hist, rs);
-    ActorCritic net(L.total, /*action_count=*/4, 32, 2, hist, rs);
+    const auto L = ObservationLayout::build(hist, rs);
+    ActorCritic net(L.total_dim, /*action_count=*/4, 32, 2, hist, rs);
     net->eval();
 
     // Same `mask_real=3` and same real-token seed → identical real content.
@@ -188,7 +172,7 @@ TEST(Attention, PaddingIsInvariantToGarbageInPaddedSlots) {
 
     // Hand-craft a second obs with same mask + same real tokens but diff padding.
     auto obs_b = obs_a.clone();
-    const int hist_off = L.static_dim + L.round_summary_dim;
+    const int hist_off = L.history_off;
     const int T = hist.max_history_len;
     const int F = BetHistoryConfig::feat_per_action;
     const int tok_off = hist_off + T;
@@ -219,8 +203,8 @@ TEST(Attention, EncoderIsContentSensitiveOnRealTokens) {
     RoundSummaryConfig rs;
     rs.enabled = false;
 
-    const Layout L = layout_for(hist, rs);
-    ActorCritic net(L.total, /*action_count=*/4, 32, 2, hist, rs);
+    const auto L = ObservationLayout::build(hist, rs);
+    ActorCritic net(L.total_dim, /*action_count=*/4, 32, 2, hist, rs);
     net->eval();
 
     auto obs_a = make_obs(hist, rs, /*mask_real=*/3, /*token_seed=*/100);
@@ -253,8 +237,8 @@ TEST(Attention, AddingPureZeroPaddingDoesNotChangeOutput) {
     RoundSummaryConfig rs;
     rs.enabled = false;
 
-    const Layout L = layout_for(hist, rs);
-    ActorCritic net(L.total, /*action_count=*/4, 32, 2, hist, rs);
+    const auto L = ObservationLayout::build(hist, rs);
+    ActorCritic net(L.total_dim, /*action_count=*/4, 32, 2, hist, rs);
     net->eval();
 
     // obs_a: 3 real tokens, padded slots have zeros (mask=0 + token=0).
@@ -263,7 +247,7 @@ TEST(Attention, AddingPureZeroPaddingDoesNotChangeOutput) {
     // Wipe padded token slots to zero on top of make_obs's garbage.
     {
         auto a = obs_a.accessor<float, 2>();
-        const int hist_off = L.static_dim + L.round_summary_dim;
+        const int hist_off = L.history_off;
         const int T = hist.max_history_len;
         const int F = BetHistoryConfig::feat_per_action;
         const int tok_off = hist_off + T;

@@ -1,14 +1,19 @@
 #pragma once
-
-#include "features.h"
+//
+// types.h — env↔PPO interaction types only.
+//
+// The env exchanges three things with the trainer: a `BetConfig` describing
+// the discrete action space, an `Action` index encoding, and a `StepResult`
+// per step. Everything else (PPO hyperparameters, attention/round-summary
+// feature configs, opponent-pool settings) lives in `config.h` so this
+// header stays light — it's included by `environment.h` and downstream by
+// pretty much every TU.
+//
 
 #include <torch/torch.h>
-#include <cstdint>
-#include <vector>
-#include <string>
-#include <cmath>
 #include <cassert>
-#include <optional>
+#include <cmath>
+#include <vector>
 
 namespace poker_ppo {
 
@@ -22,32 +27,25 @@ namespace poker_ppo {
 /// Raise actions use geometrically-spaced bet sizes:
 ///   bet_i = min_raise * ratio^i   for i in [0, num_raise_sizes)
 ///
-/// Example with min_raise=1.0, ratio=2.0, num_raise_sizes=4:
-///   raises = {1x pot, 2x pot, 4x pot, 8x pot}   (or whatever unit you choose)
-///
 struct BetConfig {
-    int    num_raise_sizes  = 4;      // number of distinct raise amounts
-    double min_raise        = 1.0;    // smallest raise (in your chosen unit)
-    double geometric_ratio  = 2.0;    // multiplier between successive raises
-    int    max_bets_per_round = 4;    // cap on total bet/raise actions per
-                                      // player per betting round
+    int    num_raise_sizes    = 4;     // distinct raise amounts
+    double min_raise          = 1.0;   // smallest raise (in your unit)
+    double geometric_ratio    = 2.0;   // multiplier between successive raises
+    int    max_bets_per_round = 4;     // cap on raises per player per round
 
-    /// Total number of discrete actions = fold + check/call + raises.
-    constexpr int action_count() const { return 2 + num_raise_sizes; }
+    /// Total discrete actions = fold + check/call + raises.
+    constexpr int action_count() const noexcept { return 2 + num_raise_sizes; }
 
-    /// Returns the actual raise amount for raise index i ∈ [0, num_raise_sizes).
-    /// Note: uses std::pow which isn't constexpr until C++26 — kept non-
-    /// constexpr to avoid the dependency.
+    /// Raise amount for raise index i ∈ [0, num_raise_sizes). Not constexpr
+    /// because std::pow isn't constexpr until C++26.
     double raise_amount(int i) const {
         assert(i >= 0 && i < num_raise_sizes);
         return min_raise * std::pow(geometric_ratio, i);
     }
 
-    /// Convenience: all raise amounts as a vector.
     std::vector<double> all_raise_amounts() const {
         std::vector<double> v(num_raise_sizes);
-        for (int i = 0; i < num_raise_sizes; ++i)
-            v[i] = raise_amount(i);
+        for (int i = 0; i < num_raise_sizes; ++i) v[i] = raise_amount(i);
         return v;
     }
 };
@@ -65,198 +63,24 @@ namespace Action {
     constexpr int Fold      = 0;
     constexpr int CheckCall = 1;
 
-    /// Convert a raise index (0-based) into the flat action id.
-    inline int Raise(int raise_idx) { return 2 + raise_idx; }
-
-    /// True if action id represents a raise.
-    inline bool is_raise(int action_id) { return action_id >= 2; }
-
-    /// Extract the raise index from a flat action id.
-    inline int raise_index(int action_id) {
+    inline int  Raise(int raise_idx)        { return 2 + raise_idx; }
+    inline bool is_raise(int action_id)     { return action_id >= 2; }
+    inline int  raise_index(int action_id)  {
         assert(is_raise(action_id));
         return action_id - 2;
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Observation / step data
+// Step result
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// What the environment returns after a step (or reset).
+/// Returned by `IPokerEnvironment::reset()` and `step()`.
 struct StepResult {
-    torch::Tensor observation;        // [obs_dim]  float
-    float         reward  = 0.0f;     // reward for the acting player
-    bool          done    = false;    // episode over?
-    torch::Tensor legal_action_mask;  // [action_count]  bool / float mask
-                                      // 1 = legal, 0 = illegal
-};
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Bet-history attention config
-// ─────────────────────────────────────────────────────────────────────────────
-//
-// The environment exposes a *variable-length* sequence of past betting actions
-// (this hand) as a fixed-size, padded block at the tail of the observation
-// vector. The network slices that block back into a [T, F] token tensor and
-// runs a small Transformer encoder over it.
-//
-// A learnable CLS token is prepended to the sequence so attention has a
-// well-defined output even when the history is empty (preflop, before any
-// action). The CLS output is concatenated with the static features.
-//
-// Per-action features (F = 8):
-//   0  amount / initial_stack
-//   1  amount / (2 * initial_stack)        (≈ pot-scale)
-//   2  is_my_action  (1 if the *current* acting player made it)
-//   3  is_aggressive (1 = Raise, 0 = Call/Check/Fold)
-//   4  round one-hot[0]  (preflop)
-//   5  round one-hot[1]  (flop)
-//   6  round one-hot[2]  (turn)
-//   7  round one-hot[3]  (river)
-//
-struct BetHistoryConfig {
-    static constexpr int feat_per_action = 8;
-
-    bool enabled         = true; // master switch for the attention encoder
-    int  max_history_len = 32;   // T — padded length of the action sequence
-    int  attn_dim        = 64;   // D — token embedding & attention model dim
-    int  attn_heads      = 4;    // H — multi-head attention heads (D % H == 0)
-    int  ffn_mult        = 4;    // FFN inner dim = ffn_mult * attn_dim
-    int  num_blocks      = 1;    // stacked attention blocks
-
-    /// Total trailing block in the observation vector:
-    ///   T (mask) + T * F (token features)   = T * (1 + F)
-    /// Returns 0 when the encoder is disabled — caller-side code that uses
-    /// this to size obs / split tensors then falls back to a "static-only"
-    /// layout automatically. Also returns 0 unconditionally when the
-    /// compile-time flag `features::ATTENTION_ENCODER` is false, so the
-    /// entire history block is stripped from the obs layout when the
-    /// feature is excluded from the build.
-    [[nodiscard]] constexpr int history_block_dim() const {
-        if constexpr (!features::ATTENTION_ENCODER) return 0;
-        return enabled ? max_history_len * (1 + feat_per_action) : 0;
-    }
-};
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Round-summary feature block
-// ─────────────────────────────────────────────────────────────────────────────
-//
-// A hand-engineered, fixed-size alternative (or complement) to the attention
-// encoder.  For each of the four betting rounds (preflop, flop, turn, river)
-// the env emits four features computed from the current hand's bet history:
-//
-//   0  my_chips_in     — chip delta I put in this round  / initial_stack
-//   1  opp_chips_in    — chip delta opponent put in      / initial_stack
-//   2  raises_count    — total raises this round         / max_raises_per_round
-//   3  i_am_aggressor  — 1 if I was the last to raise this round, else 0
-//
-// All features are computed from the acting player's perspective so the same
-// shared network can be used for both seats.  Block size = 4 rounds × 4 feats
-// = 16 floats (when enabled) appended to the obs immediately after the static
-// features and before the attention-history block.
-//
-struct RoundSummaryConfig {
-    static constexpr int feat_per_round = 4;
-    static constexpr int num_rounds     = 4;
-
-    bool enabled = false;        // off by default; flip on with --round-summary
-
-    /// Block size in floats. Returns 0 unconditionally when the compile-
-    /// time flag `features::ROUND_SUMMARY` is false — the round-summary
-    /// block is stripped from the obs layout when the feature is excluded
-    /// from the build, and Tower's input-dim arithmetic stays consistent.
-    [[nodiscard]] constexpr int dim() const {
-        if constexpr (!features::ROUND_SUMMARY) return 0;
-        return enabled ? num_rounds * feat_per_round : 0;
-    }
-};
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Opponent pool — frozen past-policy snapshots for self-play stabilisation.
-// Empty / disabled by default: full self-play. When enabled, every
-// `snapshot_every` updates the trainer copies the live network into a FIFO
-// pool of size `max_size`. During rollouts, each env independently rolls a
-// per-episode opponent: with probability `p_use_pool` it draws a pool member
-// to play the non-learner seat; otherwise it stays in current-vs-current
-// self-play. Pool snapshots only start being sampled once `warmup_updates`
-// have elapsed, so the pool isn't filled with cold-start garbage.
-// ─────────────────────────────────────────────────────────────────────────────
-struct OpponentPoolConfig {
-    bool   enabled         = false;
-    int    max_size        = 20;
-    int    snapshot_every  = 200;
-    int    warmup_updates  = 200;
-    float  p_use_pool      = 0.5f;
-    // Cap on distinct pool snapshots used in any single rollout. Lower values
-    // make pool inference cheap (one batched forward per step instead of one
-    // per snapshot) at the cost of less opponent diversity within a rollout —
-    // diversity recovers across rollouts as we re-sample at each rollout
-    // start. Default 1 keeps wall time roughly constant in pool size.
-    int    max_unique_per_rollout = 1;
-    uint64_t seed          = 0;   // 0 → random_device
-};
-
-// ─────────────────────────────────────────────────────────────────────────────
-// PPO hyper-parameters
-// ─────────────────────────────────────────────────────────────────────────────
-
-struct PPOConfig {
-    // ── core PPO ────────────────────────────────────────────────────────
-    float  gamma            = 1.0f;
-    float  gae_lambda       = 1.0f;
-    float  clip_coef        = 0.1f;
-    float  ent_coef         = 0.01f;
-    float  vf_coef          = 0.5f;
-    float  max_grad_norm    = 0.5f;
-    bool   clip_vloss       = true;
-    bool   norm_advantages  = true;
-
-    // ── optimiser ───────────────────────────────────────────────────────
-    float  learning_rate    = 2.5e-4f;
-    bool   anneal_lr        = true;
-    // Floor on the annealed LR as a fraction of `learning_rate`. With the
-    // default linear-to-zero schedule the last ~quarter of training does
-    // negligible learning; floor at 0.1× to keep updates meaningful all the
-    // way through. Set to 0 to recover the original linear-to-zero behaviour.
-    float  min_lr_frac      = 0.1f;
-
-    // Entropy-coefficient cosine schedule. When enabled, `ent_coef` is the
-    // starting value and the effective coefficient decays smoothly to
-    // `ent_coef_min` over the full training run via:
-    //     ent(t) = ent_min + 0.5·(ent_start − ent_min)·(1 + cos(π·t/T))
-    // Rationale (poker-specific): the optimal entropy regime in IIGs is
-    // higher than typical single-agent RL defaults early in training (lots
-    // of action-space exploration needed) but should drop late so the
-    // policy can sharpen the near-deterministic regions of the strategy
-    // (premium-hand value-betting, trash folds). A constant ent_coef can't
-    // optimise both — too high hurts late-game specialisation and inflates
-    // BR exploitability, too low collapses early exploration.
-    bool   anneal_ent_coef  = false;
-    float  ent_coef_min     = 0.01f;
-
-    // ── rollout ─────────────────────────────────────────────────────────
-    int    num_envs         = 8;       // parallel self-play games
-    int    num_steps        = 128;     // steps per env per rollout
-    int    update_epochs    = 4;       // passes over the rollout buffer
-    int    num_minibatches  = 4;
-
-    // ── training ────────────────────────────────────────────────────────
-    int    total_timesteps  = 10'000'000;
-
-    // ── network ─────────────────────────────────────────────────────────
-    int    hidden_dim       = 512;
-    int    num_layers       = 3;
-    BetHistoryConfig    hist;          // attention encoder over bet history
-    RoundSummaryConfig  round_summary; // hand-engineered per-round features
-
-    // ── opponent pool (self-play stabilisation) ─────────────────────────
-    OpponentPoolConfig  opp_pool;
-
-    // ── derived ─────────────────────────────────────────────────────────
-    constexpr int batch_size()     const { return num_envs * num_steps; }
-    constexpr int minibatch_size() const { return batch_size() / num_minibatches; }
-    constexpr int num_updates()    const { return total_timesteps / batch_size(); }
+    torch::Tensor observation;        // [obs_dim]    float
+    float         reward  = 0.0f;     // for the acting player
+    bool          done    = false;
+    torch::Tensor legal_action_mask;  // [action_count]  1=legal, 0=illegal
 };
 
 } // namespace poker_ppo

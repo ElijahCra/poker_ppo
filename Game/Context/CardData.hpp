@@ -1,9 +1,4 @@
-//
-// Created by Elijah Crain on 12/31/25.
-//
-
-#ifndef POKER_CARDDATA_HPP
-#define POKER_CARDDATA_HPP
+#pragma once
 
 namespace Game {
 // Card data
@@ -63,5 +58,3 @@ struct CardData {
 };
 
 }
-
-#endif //POKER_CARDDATA_HPP

@@ -26,10 +26,10 @@
 //     std::cout << r.anchor_name << ": " << r.bb_per_hand_a << " bb/hand\n";
 //   }
 
+#include "config.h"
 #include "environment.h"
 #include "network.h"
 #include "policy.h"
-#include "types.h"
 
 #include <torch/torch.h>
 

@@ -32,8 +32,8 @@
 // its opponent and when its episode ends.
 //
 
+#include "config.h"
 #include "network.h"
-#include "types.h"
 
 #include <torch/torch.h>
 
@@ -64,17 +64,17 @@ public:
     /// once full we accept with probability max_size/seen_count and replace a
     /// uniformly random existing slot — Vitter's Algorithm R. Returns the new
     /// SnapshotId on store, or 0 if the offer was rejected (or max_size <= 0).
-    SnapshotId add_snapshot(const ActorCritic& src);
+    [[nodiscard]] SnapshotId add_snapshot(const ActorCritic& src);
 
     /// Sample one of the live snapshots' IDs uniformly. Returns 0 if empty.
-    SnapshotId sample_id();
+    [[nodiscard]] SnapshotId sample_id();
 
     /// Sample up to `n` distinct snapshot IDs without replacement. Returns at
     /// most `min(n, size())` IDs in random order; empty vector if pool is empty.
-    std::vector<SnapshotId> sample_ids(int n);
+    [[nodiscard]] std::vector<SnapshotId> sample_ids(int n);
 
     /// Is `id` currently in the pool?
-    bool has_id(SnapshotId id) const;
+    [[nodiscard]] bool has_id(SnapshotId id) const;
 
     /// Run inference for snapshot `id` over a sub-batch.
     /// `obs`/`legal_mask` must already live on `device_`. Caller must ensure
@@ -85,8 +85,6 @@ public:
                                  const torch::Tensor& legal_mask);
 
 private:
-    ActorCritic clone_network(const ActorCritic& src);
-
     struct Entry { SnapshotId id; ActorCritic net; };
 
     int obs_dim_, action_count_, hidden_dim_, num_layers_;

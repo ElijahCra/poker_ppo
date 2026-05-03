@@ -4,47 +4,33 @@
 #include "BettingConfig.hpp"
 #include "Context/GameContext.hpp"
 #include "GameBase.hpp"
-#include "Utility/HandAbstraction/hand_index.h"
-#include "features.h"
 
-#include <cmath>
 #include <stdexcept>
 
 namespace poker_ppo {
-
-namespace {
-
-constexpr int CARD_SLOTS = 52;
-// Static obs features after the two card one-hot blocks:
-//   stacks(2) + pot + cur_bet + raises + round one-hot(4) + seat = 10
-//   hand-strength bucket per round (preflop, flop, turn, river)    = 4 (gated)
-// The hand-strength block carries one float per round — the canonical
-// hand_indexer bucket index for the acting player on that round, divided
-// by the round's total bucket count to land in [0, 1]. Future rounds are
-// masked to 0 so we don't leak unseen community cards. The indexer's
-// suit-isomorphic clustering is hard for a small MLP to derive from raw
-// card one-hots, so this is a meaningful inductive bias for free.
-//
-// FEAT_HAND_STRENGTH compiles to 0 when `features::HAND_STRENGTH` is off,
-// shrinking STATIC_OBS at compile time and matching the if-constexpr-
-// gated write block in compute_observation.
-constexpr int FEAT_BASIC = 10;
-constexpr int FEAT_HAND_STRENGTH = features::HAND_STRENGTH ? 4 : 0;
-constexpr int FEAT_EXTRA = FEAT_BASIC + FEAT_HAND_STRENGTH;
-constexpr int STATIC_OBS = CARD_SLOTS * 2 + FEAT_EXTRA;
-
-} // namespace
 
 // ═════════════════════════════════════════════════════════════════════════════
 // PokerEnvironment
 // ═════════════════════════════════════════════════════════════════════════════
 
 PokerEnvironment::PokerEnvironment(const PokerConfig& poker_cfg,
-                                         const BetConfig& bet_cfg,
-                                         uint64_t seed)
-    : poker_cfg_(poker_cfg), bet_cfg_(bet_cfg),
-      hist_cfg_(poker_cfg.hist), rs_cfg_(poker_cfg.round_summary),
-      rng_(seed)
+                                   const BetConfig&   bet_cfg,
+                                   uint64_t           seed)
+    : poker_cfg_(poker_cfg),
+      bet_cfg_(bet_cfg),
+      rng_(seed),
+      // Both sides are now std::array — straight constexpr factory call,
+      // no more iterator-bridge between vector/array.
+      game_betting_cfg_(::Game::make_default_betting_config(poker_cfg.game)),
+      game_(std::make_unique<::Game::DiscreteGame>(rng_, poker_cfg.game, game_betting_cfg_)),
+      // Norms: stack_norm = initial_stack, pot_norm = 2*initial_stack so
+      // both sit in roughly [0, 1]; max_raises_norm guards against div-by-0.
+      obs_builder_(
+          poker_cfg.hist,
+          poker_cfg.round_summary,
+          /*stack_norm=*/      static_cast<float>(poker_cfg.game.initial_stack),
+          /*pot_norm=*/        2.0f * static_cast<float>(poker_cfg.game.initial_stack),
+          /*max_raises_norm=*/ poker_cfg.game.max_raises_per_round)
 {
     A_ = poker_cfg_.action_count();
     if (A_ != bet_cfg_.action_count()) {
@@ -52,30 +38,19 @@ PokerEnvironment::PokerEnvironment(const PokerConfig& poker_cfg,
             "BetConfig.action_count() must equal PokerConfig.action_count() "
             "(2 + num_raise_slots)");
     }
-    static_obs_dim_ = STATIC_OBS;
-    // Layout: [static] [round_summary?] [history?]
-    obs_dim_        = static_obs_dim_ + rs_cfg_.dim() + hist_cfg_.history_block_dim();
-    bet_history_.reserve(hist_cfg_.max_history_len * 2);
+
+    bet_history_.reserve(poker_cfg.hist.max_history_len * 2);
 
     const auto& gcfg = poker_cfg_.game;
     allin_slot_ = gcfg.include_all_in_slot
         ? 2 + static_cast<int>(gcfg.pot_fractions.size())
         : -1;
 
-    // Obs features stay scaled by stack so they sit in roughly [0, 1].
-    stack_norm_  = static_cast<float>(gcfg.initial_stack);
-    pot_norm_    = 2.0f * stack_norm_;
-    // Reward is scaled separately so per-hand rewards land in O(0.1) range
-    // (≈ utility_in_mbb / 10·big_blind).  Avoids both vanishing gradients
-    // (stack-normalised) and mode collapse (big_blind-normalised).
+    // Reward is scaled separately from the obs so per-hand rewards land
+    // in O(0.1) range (≈ utility_in_mbb / 10·big_blind). Avoids both
+    // vanishing gradients (stack-normalised) and mode collapse
+    // (big_blind-normalised).
     reward_norm_ = 10.0f * static_cast<float>(gcfg.big_blind);
-    max_raises_norm_ = std::max<int>(1, gcfg.max_raises_per_round);
-
-    // Both sides are now std::array — straight constexpr factory call,
-    // no more iterator-bridge between vector/array.
-    game_betting_cfg_ = ::Game::make_default_betting_config(gcfg);
-
-    game_ = std::make_unique<::Game::DiscreteGame>(rng_, gcfg, game_betting_cfg_);
 
     action_table_.assign(A_, std::nullopt);
 }
@@ -120,8 +95,16 @@ bool PokerEnvironment::is_terminal() const {
     return game_->isTerminal();
 }
 
+int PokerEnvironment::obs_dim() const {
+    // Defined here for completeness even though the inline override in
+    // poker_env.h would suffice — kept for docstring locality.
+    return obs_builder_.obs_dim();
+}
+
 torch::Tensor PokerEnvironment::observation() const {
-    return compute_observation();
+    return obs_builder_.build(
+        game_->getContext(), bet_history_,
+        static_cast<int>(game_->getCurrentBet()));
 }
 
 torch::Tensor PokerEnvironment::legal_action_mask() const {
@@ -133,7 +116,7 @@ StepResult PokerEnvironment::reset() {
     bet_history_.clear();
     auto_advance_chance();
     rebuild_action_table();
-    return { compute_observation(), 0.0f, false, compute_mask() };
+    return { observation(), 0.0f, false, compute_mask() };
 }
 
 StepResult PokerEnvironment::step(int action_idx) {
@@ -147,10 +130,10 @@ StepResult PokerEnvironment::step(int action_idx) {
     const int seat_before  = game_->getCurrentPlayer();
     const int round_before = game_->getContext().getRoundNumber();
 
-    // Record the action into the bet-history sequence *before* transitioning,
-    // so player and round reflect the state in which the action was taken.
+    // Record the action into the bet-history sequence *before*
+    // transitioning, so player and round reflect the pre-step state.
     {
-        HistEntry e{};
+        BetHistoryEntry e{};
         e.player = static_cast<uint8_t>(seat_before);
         e.round  = static_cast<uint8_t>(round_before);
 
@@ -178,16 +161,16 @@ StepResult PokerEnvironment::step(int action_idx) {
     }
 
     if (game_->isTerminal()) {
-        // Reward for seat 0.  getUtility returns chips in mbb; normalise.
+        // Terminal reward for seat 0 in mbb / reward_norm.
         const float r = static_cast<float>(game_->getUtility(0)) / reward_norm_;
-        // obs/mask are unused after a terminal flag (PPO layer calls reset()).
-        auto obs  = torch::zeros({obs_dim_});
+        // Obs/mask are unused after terminal; PPO calls reset() next.
+        auto obs  = torch::zeros({obs_builder_.obs_dim()});
         auto mask = torch::zeros({A_});
         return { obs, r, true, mask };
     }
 
     rebuild_action_table();
-    return { compute_observation(), 0.0f, false, compute_mask() };
+    return { observation(), 0.0f, false, compute_mask() };
 }
 
 // ── internals ────────────────────────────────────────────────────────────────
@@ -207,7 +190,7 @@ void PokerEnvironment::rebuild_action_table() {
     const uint32_t cb  = game_->getCurrentBet();
 
     const auto& pot_fractions = poker_cfg_.game.pot_fractions;
-    const auto& available = game_->getActions();
+    const auto& available     = game_->getActions();
     for (const auto& act : available) {
         std::visit([&]<typename T>(const T& a) {
             using U = std::decay_t<T>;
@@ -232,7 +215,7 @@ void PokerEnvironment::rebuild_action_table() {
                     action_table_[allin_slot_] = act;
                 }
             } else {
-                // Chance never appears in action state; ignore.
+                // Chance never appears in an action state; ignore.
             }
         }, act);
     }
@@ -245,173 +228,6 @@ torch::Tensor PokerEnvironment::compute_mask() const {
         if (action_table_[i].has_value()) acc[i] = 1.0f;
     }
     return mask;
-}
-
-torch::Tensor PokerEnvironment::compute_observation() const {
-    auto obs = torch::zeros({obs_dim_});
-    auto a   = obs.accessor<float, 1>();
-
-    const auto& ctx = game_->getContext();
-    const int me   = ctx.getCurrentPlayer();
-    const int opp  = 1 - me;
-
-    // Hole cards (only current player's — never leak the opponent's).
-    const auto hole = ctx.getHoleCards(me);
-    a[hole[0]] = 1.0f;
-    a[hole[1]] = 1.0f;
-
-    // Community cards visible for this round.
-    const int n_comm = ctx.getCommunityCount();
-    for (int i = 0; i < n_comm; ++i) {
-        a[CARD_SLOTS + ctx.getCommunityCard(i)] = 1.0f;
-    }
-
-    int off = 2 * CARD_SLOTS;
-    a[off++] = static_cast<float>(ctx.getStack(me))  / stack_norm_;
-    a[off++] = static_cast<float>(ctx.getStack(opp)) / stack_norm_;
-    a[off++] = static_cast<float>(ctx.getPot())      / pot_norm_;
-    a[off++] = static_cast<float>(game_->getCurrentBet()) / stack_norm_;
-    a[off++] = static_cast<float>(ctx.getRaiseNum())
-             / static_cast<float>(max_raises_norm_);
-
-    const int round = ctx.getRoundNumber();
-    for (int r = 0; r < 4; ++r) a[off++] = (r == round) ? 1.0f : 0.0f;
-
-    a[off++] = static_cast<float>(me);
-
-    // Hand-strength block: per-round normalised hand_indexer bucket ids.
-    // Lazy-init the per-round divisor on first call (the static indexer
-    // is populated by the first DiscreteGame's CardData::initialize()).
-    // The entire block — cache + per-round write — is stripped from the
-    // binary when `features::HAND_STRENGTH` is false; FEAT_HAND_STRENGTH
-    // also goes to 0 then, so STATIC_OBS shrinks consistently.
-    if constexpr (features::HAND_STRENGTH) {
-        if (indexer_norm_[0] == 0.0f) {
-            for (int r = 0; r < 4; ++r) {
-                const uint64_t sz =
-                    hand_indexer_size(&::Game::CardData::flopIndexer,
-                                      static_cast<uint_fast32_t>(r));
-                // sz can be 0 only if the indexer wasn't initialised —
-                // keep the sentinel so we retry next call.
-                if (sz == 0) { indexer_norm_[0] = 0.0f; break; }
-                indexer_norm_[r] = 1.0f / static_cast<float>(sz);
-            }
-        }
-        const auto& handHashes = ctx.cards.handHashes;
-        const int   round_now  = ctx.getRoundNumber();
-        for (int r = 0; r < 4; ++r) {
-            // Mask future-round buckets to 0 so we never leak unseen
-            // community cards; only the rounds we've actually reached
-            // contribute info.
-            if (r <= round_now) {
-                a[off++] = static_cast<float>(handHashes[me * 4 + r])
-                         * indexer_norm_[r];
-            } else {
-                a[off++] = 0.0f;
-            }
-        }
-    }
-
-    // Round-summary block: 4 rounds × 4 features.  Sits between the
-    // static features and the attention-history block so each sub-block
-    // can be toggled independently without disturbing the others'
-    // offsets. Both the compile-time flag and the runtime config flag
-    // must agree — when the build flag is off the entire write site is
-    // dead-code-eliminated, and RoundSummaryConfig::dim() returns 0.
-    if constexpr (features::ROUND_SUMMARY) {
-        if (rs_cfg_.enabled) {
-            off = write_round_summary_block(a, off, me);
-        }
-    }
-
-    // Bet-history block: [T mask] + [T × F token features]. Same dual-
-    // tier gating: stripping `features::ATTENTION_ENCODER` removes the
-    // call site entirely, and BetHistoryConfig::history_block_dim()
-    // returns 0 so the obs ends here.
-    if constexpr (features::ATTENTION_ENCODER) {
-        if (hist_cfg_.enabled) {
-            off = write_history_block(a, off, me);
-        }
-    }
-    (void)off;
-
-    return obs;
-}
-
-int PokerEnvironment::write_history_block(
-    torch::TensorAccessor<float, 1>& a, int dst_off, int current_player) const
-{
-    const int T = hist_cfg_.max_history_len;
-    const int F = BetHistoryConfig::feat_per_action;
-
-    // Truncate to the most-recent T actions if the hand has run longer.  In
-    // heads-up NLHE with max_raises_per_round=4 and 4 rounds this is unlikely
-    // to fire, but the env doesn't enforce a hard cap so we guard against it.
-    const int n_total = static_cast<int>(bet_history_.size());
-    const int n_keep  = std::min(n_total, T);
-    const int start   = n_total - n_keep;
-
-    // Mask block: [dst_off : dst_off + T]
-    const int mask_off = dst_off;
-    for (int i = 0; i < n_keep; ++i) a[mask_off + i] = 1.0f;
-    // (remaining slots already zero from torch::zeros)
-
-    // Token block: [dst_off + T : dst_off + T + T*F], row-major (token i, feat f)
-    const int tok_off = dst_off + T;
-    for (int i = 0; i < n_keep; ++i) {
-        const auto& e = bet_history_[start + i];
-        const int   base = tok_off + i * F;
-
-        const float amt = static_cast<float>(e.amount);
-        a[base + 0] = amt / stack_norm_;
-        a[base + 1] = amt / pot_norm_;
-        a[base + 2] = (static_cast<int>(e.player) == current_player) ? 1.0f : 0.0f;
-        a[base + 3] = e.is_aggressive ? 1.0f : 0.0f;
-        // round one-hot
-        a[base + 4] = (e.round == 0) ? 1.0f : 0.0f;
-        a[base + 5] = (e.round == 1) ? 1.0f : 0.0f;
-        a[base + 6] = (e.round == 2) ? 1.0f : 0.0f;
-        a[base + 7] = (e.round == 3) ? 1.0f : 0.0f;
-    }
-
-    return dst_off + T + T * F;
-}
-
-int PokerEnvironment::write_round_summary_block(
-    torch::TensorAccessor<float, 1>& a, int dst_off, int current_player) const
-{
-    constexpr int R = RoundSummaryConfig::num_rounds;
-    constexpr int F = RoundSummaryConfig::feat_per_round;
-
-    // Aggregate bet_history_ into per-round totals.  Cheap — bet_history_
-    // is bounded by max_raises_per_round × num_rounds × players + calls, so
-    // a few dozen entries at most.
-    uint32_t my_chips[R]      = {};
-    uint32_t opp_chips[R]     = {};
-    int      raises_in[R]     = {};
-    int      last_aggressor[R];
-    for (int r = 0; r < R; ++r) last_aggressor[r] = -1;
-
-    for (const auto& e : bet_history_) {
-        if (e.round >= R) continue;  // defensive
-        if (static_cast<int>(e.player) == current_player) my_chips[e.round]  += e.amount;
-        else                                              opp_chips[e.round] += e.amount;
-        if (e.is_aggressive) {
-            raises_in[e.round]++;
-            last_aggressor[e.round] = e.player;
-        }
-    }
-
-    const float raises_norm = static_cast<float>(max_raises_norm_);
-    for (int r = 0; r < R; ++r) {
-        const int base = dst_off + r * F;
-        a[base + 0] = static_cast<float>(my_chips[r])  / stack_norm_;
-        a[base + 1] = static_cast<float>(opp_chips[r]) / stack_norm_;
-        a[base + 2] = static_cast<float>(raises_in[r]) / raises_norm;
-        a[base + 3] = (last_aggressor[r] == current_player) ? 1.0f : 0.0f;
-    }
-
-    return dst_off + R * F;
 }
 
 // ═════════════════════════════════════════════════════════════════════════════

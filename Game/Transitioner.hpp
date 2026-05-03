@@ -1,9 +1,5 @@
-//
-// Created by Elijah Crain on 10/5/25.
-//
+#pragma once
 
-#ifndef CFR2_TEXAS_GAME_TRANSITIONER_HPP
-#define CFR2_TEXAS_GAME_TRANSITIONER_HPP
 #include <functional>
 #include <variant>
 #include <stdexcept>
@@ -13,6 +9,7 @@
 #include "GameBase.hpp"
 #include "Context/GameContext.hpp"
 #include "GameState.hpp"
+#include "Utility/CardConversion.hpp"
 #include "Utility/Utility.hpp"
 
 namespace Game {
@@ -60,7 +57,10 @@ inline TransitionResult Transitioner::process([[maybe_unused]] const Action& act
 
     ActionState nextState;
     if (state.type == ChanceState::DEAL_HOLE) {
-        nextState = ActionState{.currentBet = 500};
+        // Preflop opens with currentBet = small_blind: SB has already
+        // posted (so it owes BB - SB = small_blind to call), and BB
+        // is the first to act-or-check.
+        nextState = ActionState{.currentBet = context.config().small_blind};
     } else {
         nextState = ActionState{};
     }
@@ -137,7 +137,9 @@ inline TransitionResult Transitioner::process(const Action& action, const GameCo
                     state.raiseCount == 1 &&
                     state.lastRaiser == 1)
                 {
-                    betToCall -= 500;
+                    // SB calling preflop owes BB-SB = small_blind, not
+                    // the full BB — its half-blind is already in the pot.
+                    betToCall -= context.config().small_blind;
                 }
 
                 bool isAllIn = act.amount >= callerStack || act.amount < betToCall;
@@ -202,7 +204,7 @@ inline TransitionResult Transitioner::makeTerminal(const GameContext& context,
     terminal.reason = reason;
 
     if (reason != TerminalState::SHOWDOWN) {
-        terminal.winner = winner;
+        terminal.winner = static_cast<uint8_t>(winner);
     } else {
         // Showdown: evaluate both 7-card hands with the TwoPlusTwo lookup
         // and pick the higher rank. The previous code compared
@@ -210,38 +212,24 @@ inline TransitionResult Transitioner::makeTerminal(const GameContext& context,
         // not strength scores, so the resulting winner was effectively
         // arbitrary. That bug was leaking into the PPO reward signal on
         // every showdown.
-        //
-        // Card encoding conversion: deck.h stores cards as
-        //   id_dh = (rank << 2) | suit_dh    rank ∈ [0, 13), suit ∈ [0, 4)
-        // with suit table "shdc" → suit 0=s, 1=h, 2=d, 3=c.
-        // The TwoPlusTwo evaluator (Ray Wotton's tables) uses
-        //   id_2p2 = (rank * 4) + suit_2p2 + 1
-        // with suit order "cdhs" → suit 0=c, 1=d, 2=h, 3=s. So
-        //   suit_2p2 = 3 - suit_dh
-        //   id_2p2   = (id_dh & ~3) + (3 - (id_dh & 3)) + 1
         const auto& raw = context.cards.rawCards;
-        auto to_2p2 = [](uint8_t c) -> int {
-            const int rank      = c >> 2;
-            const int suit_dh   = c & 3;
-            const int suit_2p2  = 3 - suit_dh;
-            return rank * 4 + suit_2p2 + 1;
-        };
+        const auto cv = [](uint8_t c) { return deck_to_two_plus_two(c); };
         int p0_cards[7] = {
-            to_2p2(raw[0]), to_2p2(raw[1]),                  // hole
-            to_2p2(raw[4]), to_2p2(raw[5]), to_2p2(raw[6]),  // flop
-            to_2p2(raw[7]),                                  // turn
-            to_2p2(raw[8]),                                  // river
+            cv(raw[0]), cv(raw[1]),               // hole
+            cv(raw[4]), cv(raw[5]), cv(raw[6]),   // flop
+            cv(raw[7]),                           // turn
+            cv(raw[8]),                           // river
         };
         int p1_cards[7] = {
-            to_2p2(raw[2]), to_2p2(raw[3]),
-            to_2p2(raw[4]), to_2p2(raw[5]), to_2p2(raw[6]),
-            to_2p2(raw[7]),
-            to_2p2(raw[8]),
+            cv(raw[2]), cv(raw[3]),
+            cv(raw[4]), cv(raw[5]), cv(raw[6]),
+            cv(raw[7]),
+            cv(raw[8]),
         };
         const int w = Utility::getWinner(p0_cards, p1_cards);
-        // Utility::getWinner returns 0, 1, or 3 (tie). The Game's terminal
-        // convention is winner=2 for tie.
-        terminal.winner = (w == 3) ? 2 : w;
+        // Utility::getWinner returns 0, 1, or 3 (tie); we normalise to
+        // {0, 1, TIE_WINNER} so getUtility's tie path picks up cleanly.
+        terminal.winner = (w == 3) ? TIE_WINNER : static_cast<uint8_t>(w);
     }
     return {
         .nextState = terminal,
@@ -250,5 +238,3 @@ inline TransitionResult Transitioner::makeTerminal(const GameContext& context,
 }
 
 }  // namespace Game
-
-#endif  // CFR2_TEXAS_GAME_TRANSITIONER_HPP

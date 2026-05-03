@@ -1,9 +1,5 @@
-//
-// Created by Elijah Crain on 12/31/25.
-//
+#pragma once
 
-#ifndef POKER_INFOSETDATA_HPP
-#define POKER_INFOSETDATA_HPP
 #include "HashUtil.hpp"
 
 namespace Game {
@@ -99,5 +95,3 @@ struct InfoSetData {
     }
 };
 }
-
-#endif //POKER_INFOSETDATA_HPP

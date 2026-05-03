@@ -1,36 +1,41 @@
 #pragma once
+//
+// ppo.h — PPO trainer orchestrator.
+//
+// PPOTrainer composes a `RolloutCollector` (handles env stepping + buffer
+// + bootstrap) and an `OpponentManager` (handles the past-policy pool
+// for self-play stabilisation). It owns the network + optimiser, runs
+// the training loop, performs the optimiser step in `update()`, and
+// hands instrumentation back to the caller via the log callback.
+//
+// Self-play: the same ActorCritic plays both seats. Rewards stored in
+// the buffer are always from the perspective of the acting player (sign-
+// flipped on seat 1).
+//
+// Usage:
+//   1. Implement IPokerEnvironment + IPokerEnvironmentFactory.
+//   2. Construct a PPOTrainer with your factory and device. Hyperparams
+//      are read from `config::kPPOConfig`.
+//   3. Optionally call `set_rollout_fn(...)` and `set_log_callback(...)`.
+//   4. Call `train()`.
+//
 
-#include "types.h"
 #include "config.h"
 #include "environment.h"
 #include "network.h"
-#include "rollout_buffer.h"
+#include "rollout_collector.h"
 
 #include <torch/torch.h>
+
 #include <functional>
 #include <memory>
-#include <random>
 #include <string>
 #include <utility>
 #include <vector>
 
 namespace poker_ppo {
 
-class StepThreadPool;  // fwd-decl; full type lives in rollout_pool.h
-class OpponentPool;    // fwd-decl; full type lives in opponent_pool.h
-
-// ─────────────────────────────────────────────────────────────────────────────
-// PPOTrainer
-// ─────────────────────────────────────────────────────────────────────────────
-//
-// Usage:
-//   1. Implement IPokerEnvironment & IPokerEnvironmentFactory.
-//   2. Create a PPOTrainer with your factory, BetConfig, and PPOConfig.
-//   3. Call train().  Optionally register a callback for logging.
-//
-// The trainer runs self-play: the same ActorCritic network plays both seats.
-// Rewards stored in the buffer are always from the perspective of the acting
-// player (flipped sign when seat == 1).
+class OpponentManager;    // fwd-decl; full type lives in opponent_manager.h
 
 class PPOTrainer {
 public:
@@ -51,35 +56,32 @@ public:
 
     using LogCallback = std::function<void(const UpdateStats&)>;
 
-    // The trainer reads its hyperparameters from `config::kPPOConfig` and
-    // its bet abstraction from `config::kBetConfig` — both compile-time
-    // constants. The constructor only needs runtime-only inputs: the env
-    // factory and the device.
+    /// Hyperparameters come from `config::kPPOConfig` and `config::kBetConfig`
+    /// (compile-time constants). The constructor only takes runtime-only
+    /// inputs: the env factory and the device.
     explicit PPOTrainer(IPokerEnvironmentFactory& env_factory,
                         torch::Device device = torch::kCPU);
 
-    // Out-of-line so the implicit destructor doesn't need StepThreadPool's
-    // full definition at every PPOTrainer use site.
+    // Out-of-line so callers don't need OpponentManager / RolloutCollector
+    // fully defined at every PPOTrainer use site.
     ~PPOTrainer();
 
-    /// Pluggable rollout-collection strategy. Pass any callable matching
-    /// this signature into set_rollout_fn() to swap how train() collects.
-    using RolloutFn = std::function<void(PPOTrainer&)>;
+    /// Pluggable rollout-collection strategy used by `train()`. The default
+    /// is `Strategy::Threadpool`; call `set_rollout_strategy()` to change.
+    using Strategy = RolloutCollector::Strategy;
 
-    /// Run the full training loop.
-    /// Uses the rollout function set via set_rollout_fn(); defaults to the
+    /// Run the full training loop until `total_timesteps` is reached.
     void train();
 
-    /// Choose the rollout strategy used by train().
-    /// Convenience helpers for the three built-in strategies are below.
-    void set_rollout_fn(RolloutFn fn) { rollout_fn_ = std::move(fn); }
+    /// Choose the rollout strategy used by `train()` and the convenience
+    /// `collect_rollout_*` shims below.
+    void set_rollout_strategy(Strategy s) noexcept { strategy_ = s; }
 
-    // ── Built-in rollout strategies ─────────────────────────────────────
-    // Each is a self-contained collect_* method that fills the buffer for
-    // one rollout. They are public so they can be wired into set_rollout_fn,
-    // benchmarked, or invoked manually.
-    void collect_rollout_serial();      // single-thread loop, matches b601e0e
-    void collect_rollout_threadpool();  // persistent thread pool, batched fwd
+    // ── Built-in rollout entry points ───────────────────────────────────
+    // Thin shims around `collector_->collect(strategy, ...)` kept so callers
+    // (benchmarks, tests) don't need to know about `OpponentManager` etc.
+    void collect_rollout_serial();
+    void collect_rollout_threadpool();
 
     /// Aggregate rollout-time stats for one strategy.
     struct BenchmarkResult {
@@ -99,13 +101,14 @@ public:
         }
     };
 
-    /// A/B-time the three built-in strategies (serial, threadpool).
-    /// Iterations are interleaved per round so each strategy faces a similar
-    /// env distribution. Does not call update() — measures rollout only.
+    /// A/B-time the two built-in strategies (serial, threadpool).
+    /// Iterations are interleaved per round so each strategy faces a
+    /// similar env distribution. Does not call update().
     BenchmarkResult benchmark_rollouts(int iters = 20, int warmup = 3,
                                        bool verbose = true);
 
     /// Generalised version: bench any user-supplied list of strategies.
+    using RolloutFn = std::function<void(PPOTrainer&)>;
     BenchmarkResult benchmark_strategies(
         const std::vector<std::pair<std::string, RolloutFn>>& strategies,
         int iters = 20, int warmup = 3, bool verbose = true);
@@ -116,8 +119,7 @@ public:
     /// Access the trained network (e.g. for evaluation / saving).
     ActorCritic& network() { return network_; }
 
-    /// Number of snapshots currently in the opponent pool. 0 if disabled or
-    /// not yet warmed up.
+    /// Number of snapshots currently in the opponent pool. 0 if disabled.
     int opponent_pool_size() const;
 
     /// Save / load model weights.
@@ -125,71 +127,24 @@ public:
     void load(const std::string& path);
 
 private:
-    void init_carry_state();         // resets envs and seeds carry_* tensors
-    UpdateStats update();            // PPO update; returns per-update stats
-    void ensure_step_pool();         // lazy-init for the threadpool strategy
+    [[nodiscard]] UpdateStats update();   // PPO optimiser step; per-update stats
 
-    // Opponent-pool helpers. No-ops when cfg_.opp_pool.enabled == false.
-    void maybe_snapshot();           // called by train() each update
-    void prepare_rollout_pool_ids(); // called at the start of each rollout
-    void roll_episode_assignment(int env_idx);  // re-sample learner_seat / opp_id
-    void apply_pool_overrides(
-        const torch::Tensor& cur_obs,        // [N, D] device
-        const torch::Tensor& cur_mask,       // [N, A] device
-        const torch::Tensor& cur_player_cpu, // [N] int32 CPU
-        torch::Tensor& actions_cpu);         // [N] int64 CPU — modified in place
-
-    // Runtime cfg_ is gone — the trainer now reads its hyperparameters
-    // straight off `config::kPPOConfig` (compile-time). The reference is
-    // kept as `cfg_` so existing call-sites (`cfg_.gamma` etc.) keep
-    // working unchanged AND constexpr-friendly contexts (`if constexpr`)
-    // can use them. The `inline` makes it a non-ODR definition.
+    // Compile-time hyperparameter sources. Kept as `cfg_` / `bet_cfg_`
+    // references so `if constexpr (cfg_.flag)` reads cleanly; the `inline`
+    // makes them non-ODR definitions.
     static inline constexpr const PPOConfig& cfg_      = config::kPPOConfig;
     static inline constexpr const BetConfig& bet_cfg_  = config::kBetConfig;
     torch::Device device_;
 
-    ActorCritic  network_;
-    std::unique_ptr<torch::optim::Adam> optimizer_;
-    std::unique_ptr<VectorizedEnv>      vec_env_;
-    std::unique_ptr<RolloutBuffer>      buffer_;
+    ActorCritic                          network_;
+    std::unique_ptr<torch::optim::Adam>  optimizer_;
+    std::unique_ptr<RolloutCollector>    collector_;
+    std::unique_ptr<OpponentManager>     opp_mgr_;
 
-    // State carried between rollouts (CPU — consumed by the
-    // scheduler, which does one batched transfer to device per inference).
-    torch::Tensor carry_obs_;           // [num_envs, obs_dim]      float
-    torch::Tensor carry_legal_mask_;    // [num_envs, action_count] float
-    torch::Tensor carry_current_player_;  // [num_envs]             int32
-    torch::Tensor carry_done_;          // [num_envs]               float
-
-    int global_step_ = 0;
-    int update_idx_  = 0;
+    int update_idx_ = 0;
 
     LogCallback log_cb_;
-
-    // Pluggable rollout strategy used by train(). Defaulted in train() if
-    // the caller hasn't installed one explicitly.
-    RolloutFn rollout_fn_;
-
-    // Persistent worker pool used by collect_rollout_threadpool(). Created
-    // on first call; reused across rollouts to avoid per-step thread spawn.
-    std::unique_ptr<StepThreadPool> step_pool_;
-
-    // ── Opponent pool (self-play stabilisation) ─────────────────────────
-    // opp_pool_ is null when cfg_.opp_pool.enabled == false. learner_seat_
-    // and opp_id_ are sized num_envs and re-rolled at episode boundaries:
-    //   learner_seat_[i] ∈ {0, 1}    — which seat is the live policy
-    //   opp_id_[i]                   — 0: pure self-play (no override)
-    //                                  else: SnapshotId of the pool member
-    //                                  that plays the non-learner seat
-    // Stale IDs (snapshot dropped between sample and use) fall through to
-    // live policy via OpponentPool::has_id().
-    std::unique_ptr<OpponentPool> opp_pool_;
-    std::vector<int>              learner_seat_;
-    std::vector<uint64_t>         opp_id_;
-    // Pool IDs eligible for assignment in the *current* rollout. Sampled at
-    // rollout start, sized at most cfg_.opp_pool.max_unique_per_rollout. Empty
-    // means "fall back to full-pool sampling" (warmup, disabled, etc.).
-    std::vector<uint64_t>         rollout_pool_ids_;
-    std::mt19937                  episode_rng_;
+    Strategy    strategy_ = Strategy::Threadpool;
 };
 
 } // namespace poker_ppo

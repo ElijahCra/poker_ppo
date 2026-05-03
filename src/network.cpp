@@ -7,7 +7,7 @@
 namespace poker_ppo {
 
 namespace {
-constexpr float kNegInfMask = -1e9f;  // additive mask for masked-out keys
+// kAttentionMaskLogit lives in network.h so callers/tests can reference it.
 } // namespace
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -19,15 +19,19 @@ TowerImpl::TowerImpl(int obs_dim, int output_dim,
                      float head_init_std,
                      BetHistoryConfig    hist,
                      RoundSummaryConfig  round_summary)
-    : hist_(hist), round_summary_(round_summary)
+    : hist_(hist),
+      round_summary_(round_summary),
+      layout_(ObservationLayout::build(hist, round_summary))
 {
-    static_dim_ = obs_dim - round_summary_.dim() - hist_.history_block_dim();
-    if (static_dim_ <= 0) {
+    if (layout_.total_dim != obs_dim) {
         throw std::invalid_argument(
-            "Tower: obs_dim is smaller than the optional feature blocks");
+            "Tower: obs_dim does not match ObservationLayout::build(hist, round_summary)");
     }
-
-    int trunk_in_dim = static_dim_ + round_summary_.dim();
+    // Static block read by Tower = card one-hots + numeric features.
+    // (The split between cards and static features doesn't matter for the
+    // trunk; both are dense floats fed in unchanged.)
+    const int tower_static_dim = layout_.static_off + ObservationLayout::FEAT_STATIC;
+    int trunk_in_dim = tower_static_dim + layout_.round_summary_dim;
 
     // Attention-encoder construction. The entire `if constexpr` block —
     // module registrations, parameter allocations, and the trunk-dim
@@ -144,7 +148,7 @@ TowerImpl::encode_history(const torch::Tensor& history_block) {
 
     x = x + pos_embed_;
 
-    auto add_mask = (1.0 - attn_mask).unsqueeze(1).unsqueeze(1) * kNegInfMask;
+    auto add_mask = (1.0 - attn_mask).unsqueeze(1).unsqueeze(1) * kAttentionMaskLogit;
 
     const int64_t L = T + 1;
     for (int b = 0; b < hist_.num_blocks; ++b) {
@@ -180,21 +184,24 @@ TowerImpl::encode_history(const torch::Tensor& history_block) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 torch::Tensor TowerImpl::forward(torch::Tensor obs) {
-    int64_t off = 0;
-    auto static_feats = obs.narrow(/*dim=*/1, off, static_dim_);
-    off += static_dim_;
+    // Slice the obs into its sub-blocks via the shared `ObservationLayout`
+    // — same struct the env writes through. No more parallel offset
+    // arithmetic between writer and reader.
+    const int tower_static_dim =
+        layout_.static_off + ObservationLayout::FEAT_STATIC;
+
+    auto static_feats = obs.narrow(/*dim=*/1, /*start=*/0, tower_static_dim);
 
     std::vector<torch::Tensor> parts;
     parts.reserve(3);
     parts.push_back(static_feats);
 
     // Round-summary parse: dual-tier gated. When the build flag is off,
-    // RoundSummaryConfig::dim() also returns 0, so the obs simply doesn't
-    // have these features and the parts list omits them.
+    // layout_.round_summary_dim is 0, so the read site is never reached.
     if constexpr (features::ROUND_SUMMARY) {
         if (round_summary_.enabled) {
-            parts.push_back(obs.narrow(1, off, round_summary_.dim()));
-            off += round_summary_.dim();
+            parts.push_back(obs.narrow(1, layout_.round_summary_off,
+                                       layout_.round_summary_dim));
         }
     }
 
@@ -203,12 +210,11 @@ torch::Tensor TowerImpl::forward(torch::Tensor obs) {
     // pipeline is dead.
     if constexpr (features::ATTENTION_ENCODER) {
         if (hist_.enabled) {
-            auto history_blk = obs.narrow(1, off, hist_.history_block_dim());
-            off += hist_.history_block_dim();
+            auto history_blk = obs.narrow(1, layout_.history_off,
+                                          layout_.history_dim);
             parts.push_back(encode_history(history_blk));
         }
     }
-    (void)off;
 
     torch::Tensor trunk_in = (parts.size() == 1)
         ? parts[0]
@@ -248,13 +254,18 @@ ActorCriticImpl::forward(torch::Tensor obs) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 torch::Tensor ActorCriticImpl::get_value(torch::Tensor obs) {
-    return critic_->forward(std::move(obs)).squeeze(-1);
+    // No std::move on `obs` — torch::Tensor is shared-pointer-ish, so
+    // moving is a no-op cost-wise but signals (incorrectly) that the
+    // local is being consumed. Keep the by-value parameter (libtorch
+    // convention; torch::nn::Module::forward takes a Tensor, not const
+    // ref) but pass it through unchanged.
+    return critic_->forward(obs).squeeze(-1);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 torch::Tensor
 ActorCriticImpl::apply_mask(torch::Tensor logits, torch::Tensor mask) {
-    return logits + (1.0f - mask) * (-1e8f);
+    return logits + (1.0f - mask) * kIllegalActionLogit;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -278,8 +289,8 @@ ActorCriticImpl::get_action(torch::Tensor obs, torch::Tensor legal_mask) {
 ActorCriticImpl::EvalResult
 ActorCriticImpl::evaluate(torch::Tensor obs, torch::Tensor legal_mask,
                           const torch::Tensor &action) {
-    auto [logits, value] = forward(std::move(obs));
-    const auto masked = apply_mask(logits, std::move(legal_mask));
+    auto [logits, value] = forward(obs);
+    const auto masked = apply_mask(logits, legal_mask);
 
     const auto dist     = torch::softmax(masked, -1);
     const auto log_dist = torch::log_softmax(masked, -1);
@@ -287,6 +298,39 @@ ActorCriticImpl::evaluate(torch::Tensor obs, torch::Tensor legal_mask,
     const auto entropy  = -(dist * log_dist).sum(-1);
 
     return {log_prob, value, entropy};
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+ActorCritic clone_actor_critic(const ActorCritic&  src,
+                               int                 obs_dim,
+                               int                 action_count,
+                               int                 hidden_dim,
+                               int                 num_layers,
+                               BetHistoryConfig    hist,
+                               RoundSummaryConfig  round_summary,
+                               torch::Device       device)
+{
+    ActorCritic dst(obs_dim, action_count, hidden_dim, num_layers,
+                    hist, round_summary);
+    dst->to(device);
+
+    torch::NoGradGuard ng;
+    auto sp = src->parameters();
+    auto dp = dst->parameters();
+    TORCH_CHECK(sp.size() == dp.size(),
+                "clone_actor_critic: parameter count mismatch");
+    for (size_t i = 0; i < sp.size(); ++i) {
+        dp[i].copy_(sp[i].detach().to(device));
+    }
+    auto sb = src->buffers();
+    auto db = dst->buffers();
+    TORCH_CHECK(sb.size() == db.size(),
+                "clone_actor_critic: buffer count mismatch");
+    for (size_t i = 0; i < sb.size(); ++i) {
+        db[i].copy_(sb[i].detach().to(device));
+    }
+    dst->eval();   // clones are always frozen targets — never trained directly
+    return dst;
 }
 
 } // namespace poker_ppo

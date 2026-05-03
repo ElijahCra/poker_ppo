@@ -18,32 +18,6 @@ OpponentPool::OpponentPool(int obs_dim, int action_count,
       device_(device), max_size_(std::max(0, max_size)),
       rng_(seed ? seed : std::random_device{}()) {}
 
-ActorCritic OpponentPool::clone_network(const ActorCritic& src) {
-    // Same shape as the trainer's network — must stay in sync if the trainer's
-    // architecture flags ever drift from ppo_cfg.
-    ActorCritic dst(obs_dim_, action_count_, hidden_dim_, num_layers_,
-                    hist_, round_summary_);
-    dst->to(device_);
-
-    torch::NoGradGuard ng;
-    auto sp = src->parameters();
-    auto dp = dst->parameters();
-    TORCH_CHECK(sp.size() == dp.size(),
-                "OpponentPool::clone_network: parameter count mismatch");
-    for (size_t i = 0; i < sp.size(); ++i) {
-        dp[i].copy_(sp[i].detach().to(device_));
-    }
-    auto sb = src->buffers();
-    auto db = dst->buffers();
-    TORCH_CHECK(sb.size() == db.size(),
-                "OpponentPool::clone_network: buffer count mismatch");
-    for (size_t i = 0; i < sb.size(); ++i) {
-        db[i].copy_(sb[i].detach().to(device_));
-    }
-    dst->eval();
-    return dst;
-}
-
 OpponentPool::SnapshotId OpponentPool::add_snapshot(const ActorCritic& src) {
     if (max_size_ <= 0) return 0;
 
@@ -56,7 +30,9 @@ OpponentPool::SnapshotId OpponentPool::add_snapshot(const ActorCritic& src) {
     // Pool not yet full — accept unconditionally.
     if (static_cast<int>(snapshots_.size()) < max_size_) {
         const SnapshotId id = next_id_++;
-        snapshots_.push_back({id, clone_network(src)});
+        snapshots_.push_back({id, clone_actor_critic(src, obs_dim_, action_count_,
+                                        hidden_dim_, num_layers_,
+                                        hist_, round_summary_, device_)});
         return id;
     }
 
@@ -72,7 +48,9 @@ OpponentPool::SnapshotId OpponentPool::add_snapshot(const ActorCritic& src) {
     std::uniform_int_distribution<int> us(0, max_size_ - 1);
     const int slot = us(rng_);
     const SnapshotId id = next_id_++;
-    snapshots_[slot] = {id, clone_network(src)};
+    snapshots_[slot] = {id, clone_actor_critic(src, obs_dim_, action_count_,
+                                        hidden_dim_, num_layers_,
+                                        hist_, round_summary_, device_)};
     return id;
 }
 
