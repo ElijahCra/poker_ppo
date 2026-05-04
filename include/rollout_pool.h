@@ -1,16 +1,10 @@
 #pragma once
 //
-//  rollout_pool.h — minimal persistent worker pool used by the
-//  thread-pool rollout strategy in PPOTrainer.
-//
-//  Design: workers wait on a generation counter. parallel_for(n, body) bumps
-//  the generation, wakes everyone, and they all steal work via an atomic
-//  index counter. Caller blocks on a separate "active" CV until the last
-//  worker finishes its slice.
-//
-//  Why generation-based instead of a per-call queue: the rollout loop calls
-//  parallel_for(num_envs, …) once per step, hundreds of times per rollout.
-//  Avoiding a per-job allocation keeps overhead near the syscall floor.
+//  rollout_pool.h — persistent worker pool for the thread-pool rollout
+//  strategy. Generation-based (not a per-call queue): parallel_for bumps
+//  a generation counter, wakes all workers, and they steal work via an
+//  atomic index. Avoiding a per-job allocation keeps overhead near the
+//  syscall floor — the rollout loop calls parallel_for hundreds of times.
 //
 
 #include <atomic>

@@ -2,34 +2,22 @@
 //
 // opponent_pool.h — frozen past-policy pool for self-play stabilisation.
 //
-// Pure self-play (current vs current) cycles: the policy collapses to exploit
-// its current self, then diverges into a different collapsed mode, etc. The
-// signature is entropy oscillation, return-variance swings, and regression
-// against fixed anchors mid-training.
+// Pure self-play (current vs current) cycles: the policy collapses to
+// exploit its current self, diverges into a different collapsed mode,
+// etc. Mitigation: keep a reservoir-sampled pool of K past snapshots and,
+// with probability `p_use_pool`, play an env's opponent seat from a
+// uniformly-sampled pool member. Only live-seat transitions are recorded.
 //
-// Standard fix: maintain a reservoir-sampled pool of K past snapshots. Each
-// rollout, with probability `p_use_pool`, an env's opponent seat plays a
-// uniformly-sampled pool snapshot instead of the live policy. The live seat's
-// transitions are the only ones the buffer records — opponent transitions are
-// never learned from. This forces the learner to be robust against past
-// versions of itself.
+// Reservoir sampling (Vitter's Algorithm R) gives every snapshot ever
+// offered an equal probability max_size/seen_count of being in the pool.
+// Unlike FIFO, easy post-warmup snapshots aren't evicted as the pool
+// fills, so the pool's effective difficulty doesn't rise monotonically
+// and the learner doesn't over-fold-collapse against rising opponents.
 //
-// Reservoir sampling (Vitter's Algorithm R) means every snapshot ever offered
-// has equal probability max_size/seen_count of currently being in the pool.
-// In contrast to FIFO, this preserves easy post-warmup snapshots throughout
-// training instead of evicting them as soon as the pool fills — the pool's
-// effective difficulty no longer rises monotonically and over-fold collapse
-// of the learner is avoided.
-//
-// Snapshots are deep-copied at add_snapshot() time so subsequent training
-// updates can't mutate them. Inference is always under NoGradGuard.
-//
-// Snapshots are addressed by a monotonically-increasing SnapshotId rather
-// than by container index. When the pool replaces a snapshot, its ID is
-// simply retired — any env that still holds a stale ID falls through to the
-// live policy via has_id() returning false. This avoids "opponent silently
-// swaps mid-episode" if a replacement happens between when an env sampled
-// its opponent and when its episode ends.
+// Snapshots are addressed by a monotonically-increasing SnapshotId, not
+// container index — when a snapshot is replaced its ID is retired, and
+// any env still holding the stale ID falls through to the live policy
+// via has_id() returning false (no mid-episode opponent swaps).
 //
 
 #include "config.h"

@@ -3,18 +3,6 @@
 // length so a concrete instance can be a constexpr value, suitable for
 // `inline constexpr` globals and `if constexpr` gating on its fields.
 //
-// Pattern: ./PPO_CFR/TexasGame/Utils.hpp — std::array sized by template
-// parameter, default-initialised POD fields, constexpr factories.
-//
-// Notes on the simplification vs. the prior runtime-typed BettingConfig:
-//   - DISCRETE_OPTIONS (with std::vector<uint32_t> discreteAmounts),
-//     GEOMETRIC_SIZING (with geometricBase / maxGeometricSteps), and
-//     CUSTOM_FUNCTION (with std::function<...>) were never wired up to
-//     anything that actually called them. They were dead fields blocking
-//     constexpr-construction. Dropped here. If/when a non-FIXED_FRACTIONS
-//     strategy is needed it can be added back behind an `if constexpr`
-//     gate against a new feature flag.
-//
 // Card encoding & blinds remain delegated to GameConfig / GameContext;
 // BettingConfig only describes the abstracted action menu exposed to the
 // learner.
@@ -160,9 +148,7 @@ using DefaultBettingConfig = BettingConfig<DEFAULT_NUM_POT_FRACTIONS>;
 
 // Build a BettingConfig that mirrors `gcfg`'s pot-fraction menu and
 // betting structure. `constexpr` so the result can be an `inline
-// constexpr` global next to `kPokerConfig`. Keeping the bridge here
-// (rather than at the call site in poker_env.cpp) means the runtime
-// `.assign()` step is gone — both sides are now `std::array`.
+// constexpr` global next to `kPokerConfig`.
 [[nodiscard]] constexpr DefaultBettingConfig make_default_betting_config(
     const DefaultGameConfig& gcfg = kGameConfig) noexcept
 {

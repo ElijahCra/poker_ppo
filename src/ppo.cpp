@@ -12,10 +12,6 @@
 
 namespace poker_ppo {
 
-// ═════════════════════════════════════════════════════════════════════════════
-// VectorizedEnv
-// ═════════════════════════════════════════════════════════════════════════════
-
 VectorizedEnv::VectorizedEnv(IPokerEnvironmentFactory& factory,
                              const BetConfig& cfg, int num_envs) {
     envs_.reserve(num_envs);
@@ -40,10 +36,6 @@ torch::Tensor VectorizedEnv::reset_all() {
     }
     return obs;
 }
-
-// ═════════════════════════════════════════════════════════════════════════════
-// PPOTrainer
-// ═════════════════════════════════════════════════════════════════════════════
 
 PPOTrainer::PPOTrainer(IPokerEnvironmentFactory& env_factory,
                        torch::Device device)
@@ -78,7 +70,6 @@ int PPOTrainer::opponent_pool_size() const {
     return opp_mgr_ ? opp_mgr_->size() : 0;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 void PPOTrainer::train() {
     collector_->init_carry();
     opp_mgr_->reset_assignments(cfg_.num_envs);
@@ -135,11 +126,9 @@ void PPOTrainer::train() {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // Rollout entry points — thin shims around RolloutCollector::collect, kept
 // so external callers (benchmarks, tests) don't need to know about
 // OpponentManager.
-// ─────────────────────────────────────────────────────────────────────────────
 void PPOTrainer::collect_rollout_serial() {
     collector_->collect(Strategy::Serial, network_, *opp_mgr_,
                         update_idx_, cfg_.gamma, cfg_.gae_lambda);
@@ -150,10 +139,8 @@ void PPOTrainer::collect_rollout_threadpool() {
                         update_idx_, cfg_.gamma, cfg_.gae_lambda);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // Generic N-way interleaved benchmark. Iters of each strategy are interleaved
 // per round so they all see a similar distribution of env states / cache temp.
-// ─────────────────────────────────────────────────────────────────────────────
 PPOTrainer::BenchmarkResult
 PPOTrainer::benchmark_strategies(
     const std::vector<std::pair<std::string, RolloutFn>>& strategies,
@@ -241,9 +228,7 @@ PPOTrainer::benchmark_strategies(
     return r;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // Convenience wrapper: A/B-time the two built-in strategies.
-// ─────────────────────────────────────────────────────────────────────────────
 PPOTrainer::BenchmarkResult
 PPOTrainer::benchmark_rollouts(int iters, int warmup, bool verbose) {
     return benchmark_strategies({
@@ -252,7 +237,6 @@ PPOTrainer::benchmark_rollouts(int iters, int warmup, bool verbose) {
     }, iters, warmup, verbose);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 PPOTrainer::UpdateStats PPOTrainer::update() {
     network_->train();
 
@@ -419,7 +403,6 @@ PPOTrainer::UpdateStats PPOTrainer::update() {
     };
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 void PPOTrainer::save(const std::string& path) {
     torch::save(network_, path);
 }

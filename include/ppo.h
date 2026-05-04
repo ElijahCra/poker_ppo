@@ -1,23 +1,9 @@
 #pragma once
 //
-// ppo.h — PPO trainer orchestrator.
-//
-// PPOTrainer composes a `RolloutCollector` (handles env stepping + buffer
-// + bootstrap) and an `OpponentManager` (handles the past-policy pool
-// for self-play stabilisation). It owns the network + optimiser, runs
-// the training loop, performs the optimiser step in `update()`, and
-// hands instrumentation back to the caller via the log callback.
-//
-// Self-play: the same ActorCritic plays both seats. Rewards stored in
-// the buffer are always from the perspective of the acting player (sign-
-// flipped on seat 1).
-//
-// Usage:
-//   1. Implement IPokerEnvironment + IPokerEnvironmentFactory.
-//   2. Construct a PPOTrainer with your factory and device. Hyperparams
-//      are read from `config::kPPOConfig`.
-//   3. Optionally call `set_rollout_fn(...)` and `set_log_callback(...)`.
-//   4. Call `train()`.
+// ppo.h — PPO trainer orchestrator. Composes a RolloutCollector and an
+// OpponentManager, owns the network + optimiser, runs the training loop.
+// Self-play: the same ActorCritic plays both seats; buffered rewards are
+// always from the acting player's perspective (sign-flipped on seat 1).
 //
 
 #include "config.h"

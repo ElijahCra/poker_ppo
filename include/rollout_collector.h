@@ -2,17 +2,13 @@
 //
 // rollout_collector.h — owns the rollout phase of PPO training.
 //
-// Responsibilities lifted out of PPOTrainer:
+// Responsibilities:
 //   - VectorizedEnv (one env per slot, factory-built)
 //   - RolloutBuffer (lives on device)
 //   - StepThreadPool (lazy; only created if a Threadpool rollout is run)
 //   - Per-rollout carry state (last obs/mask/player/done) between calls
 //   - The rollout loop itself (serial OR threadpool, single shared body)
 //   - Bootstrap + GAE return computation at rollout end
-//
-// PPOTrainer now hands off `collect()` and only handles the optimiser
-// step. The strategy is a plain enum — no more std::function indirection
-// in the hot path.
 //
 
 #include "config.h"

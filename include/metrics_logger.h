@@ -1,14 +1,7 @@
 #pragma once
 //
-//  metrics_logger.h — append per-update PPO metrics and per-snapshot
-//  league-evaluation results to two CSVs inside a per-run directory.
-//
-//  The plot_live.py sidecar tails these files and re-renders matplotlib
-//  panels every couple of seconds, giving live training curves without
-//  pulling TensorBoard / wandb into the build.
-//
-//  league.csv is in *long* format (one row per (snapshot, anchor) pair)
-//  so anchors can be added or removed without changing the schema.
+//  metrics_logger.h — append PPO/league/BR metrics to per-run CSVs.
+//  tools/plot_live.py tails these for live training curves.
 //
 
 #include "best_response.h"

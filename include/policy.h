@@ -22,9 +22,6 @@
 
 namespace poker_ppo {
 
-// ─────────────────────────────────────────────────────────────────────────────
-// IPolicy
-// ─────────────────────────────────────────────────────────────────────────────
 class IPolicy {
 public:
     virtual ~IPolicy() = default;
@@ -38,14 +35,12 @@ public:
                                          const torch::Tensor& legal_mask) = 0;
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
 // NetworkPolicy — wraps an ActorCritic.
 //
 // Moves the batch to the network's device, runs masked-softmax sampling, and
 // returns the actions on CPU.  Used for the trained model under evaluation
 // and for the "random_init" anchor (which is just a freshly-built ActorCritic
 // with the original orthogonal initialisation, never trained).
-// ─────────────────────────────────────────────────────────────────────────────
 class NetworkPolicy : public IPolicy {
 public:
     NetworkPolicy(ActorCritic net, torch::Device device, std::string name)
@@ -72,12 +67,10 @@ private:
     std::string   name_;
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
 // UniformPolicy — sample one of the legal actions with equal probability.
 //
 // No network involved; this is the principled "random" baseline (every
 // trained model should beat it by a wide margin).
-// ─────────────────────────────────────────────────────────────────────────────
 class UniformPolicy : public IPolicy {
 public:
     [[nodiscard]] std::string name() const override { return "uniform"; }
@@ -93,13 +86,11 @@ public:
     }
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
 // Helper: walk the legal mask in priority order and return the first legal
 // slot.  All rule-based policies use this to build a *guaranteed-legal*
 // fallback — the env doesn't always offer Fold (e.g., unraised flop where
 // you can check for free), so a hard-coded "fall back to fold" wedge would
 // crash with "agent selected an illegal action".
-// ─────────────────────────────────────────────────────────────────────────────
 inline int64_t first_legal(const torch::TensorAccessor<float, 1>& mask,
                            int64_t A,
                            std::initializer_list<int64_t> priority) {
@@ -114,10 +105,8 @@ inline int64_t first_legal(const torch::TensorAccessor<float, 1>& mask,
     return 0;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // AlwaysCallPolicy — prefer Check/Call (1); fall back to fold (0) or any
 // legal action.
-// ─────────────────────────────────────────────────────────────────────────────
 class AlwaysCallPolicy : public IPolicy {
 public:
     [[nodiscard]] std::string name() const override { return "always_call"; }
@@ -137,10 +126,8 @@ public:
     }
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
 // AlwaysRaisePolicy — prefer the smallest legal raise, then call/check, then
 // fold; finally any legal action as a last-resort safety net.
-// ─────────────────────────────────────────────────────────────────────────────
 class AlwaysRaisePolicy : public IPolicy {
 public:
     [[nodiscard]] std::string name() const override { return "always_raise"; }
@@ -165,7 +152,6 @@ public:
     }
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
 // PairAllInPolicy — shove with any pocket pair, fold otherwise.
 //
 // Reads the acting player's hole-card one-hot from obs[0:52]; two cards share
@@ -182,7 +168,6 @@ public:
 // "Fold when not paired" is the intent; if the env doesn't expose Fold (no
 // bet faced — e.g., BB preflop unraised) we fall through to Check, which is
 // the cheapest way to stay in for free.
-// ─────────────────────────────────────────────────────────────────────────────
 class PairAllInPolicy : public IPolicy {
 public:
     [[nodiscard]] std::string name() const override { return "pair_all_in"; }

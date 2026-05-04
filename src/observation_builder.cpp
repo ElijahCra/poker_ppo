@@ -2,7 +2,7 @@
 
 #include "BettingConfig.hpp"          // pulls Game::MAX_BET_ACTIONS for InfoSetData
 #include "Context/GameContext.hpp"
-#include "Utility/HandAbstraction/hand_index.h"
+#include "Utility/HandStrength.hpp"
 
 #include <algorithm>
 
@@ -21,23 +21,6 @@ ObservationBuilder::ObservationBuilder(BetHistoryConfig    hist_cfg,
       layout_(ObservationLayout::build(hist_cfg, rs_cfg))
 {}
 
-void ObservationBuilder::ensure_indexer_norm() const {
-    if constexpr (!features::HAND_STRENGTH) return;
-    if (indexer_norm_[0] != 0.0f) return;  // already populated
-
-    for (int r = 0; r < 4; ++r) {
-        const uint64_t sz = hand_indexer_size(
-            &::Game::CardData::flopIndexer,
-            static_cast<uint_fast32_t>(r));
-        if (sz == 0) {
-            // Indexer not yet populated — leave the cache empty so the
-            // next call retries.
-            indexer_norm_.fill(0.0f);
-            return;
-        }
-        indexer_norm_[r] = 1.0f / static_cast<float>(sz);
-    }
-}
 
 torch::Tensor ObservationBuilder::build(
     const Game::GameContext&             ctx,
@@ -75,23 +58,94 @@ torch::Tensor ObservationBuilder::build(
 
     a[off++] = static_cast<float>(me);
 
-    // Per-round normalised hand_indexer bucket ids. The indexer's
-    // suit-isomorphic clustering is hard for a small MLP to derive from
-    // raw card one-hots, so this is a meaningful inductive bias for
-    // free. Future-round buckets are masked to 0 so we don't leak
-    // unseen community cards. Stripped from the binary when
+    // Per-round hand-info block. 4 features per round × 4 rounds = 16
+    // floats. Future-round slots are masked to 0 so we never leak unseen
+    // community cards. Stripped from the binary when
     // `features::HAND_STRENGTH` is false.
+    //
+    // Feature layout per round (see ObservationLayout::HAND_FEATS_PER_ROUND):
+    //   0  made-hand category (monotonic strength: high card → str-flush)
+    //   1  flush_draw     — 1 if 4-of-suit visible AND flush not yet made.
+    //                       Tells the network "I have a 1-card flush draw,
+    //                       ~36% to hit by the river" — equity invisible
+    //                       from `category` alone.
+    //   2  straight_draw  — rank-outs / 8 (continuous). Distinguishes
+    //                       gutshot (1 rank-out → 0.125) from open-ended
+    //                       (2 rank-outs → 0.25) from rare multi-way
+    //                       draws; monotonic equity proxy. Suppressed
+    //                       once a straight is already made. Returns 0
+    //                       preflop (needs ≥ 4 visible cards).
+    //   3  connectedness  — straight_alive_windows / 4. The only
+    //                       straight feature meaningful preflop: counts
+    //                       5-rank windows still reachable given
+    //                       remaining streets. Distinguishes 67 (4
+    //                       windows) from 6J (0 windows) and from AK
+    //                       (1 window). Suppressed when a straight is
+    //                       already made (no further "progress" to track).
+    //   4  overcards      — # hole cards strictly above the highest board
+    //                       card, / 2. Captures the canonical "AK on a
+    //                       low flop facing a pair" situation.
     if constexpr (features::HAND_STRENGTH) {
-        ensure_indexer_norm();
-        const auto& handHashes = ctx.cards.handHashes;
-        const int   round_now  = ctx.getRoundNumber();
+        const auto hole       = ctx.getHoleCards(me);
+        const int  round_now  = ctx.getRoundNumber();
+
+        // Number of community cards visible at the end of round r:
+        //   r=0 (preflop) → 0,  r=1 (flop) → 3,  r=2 (turn) → 4,  r=3 (river) → 5.
+        constexpr int kCommByRound[4] = {0, 3, 4, 5};
+
         for (int r = 0; r < 4; ++r) {
-            if (r <= round_now) {
-                a[off++] = static_cast<float>(handHashes[me * 4 + r])
-                         * indexer_norm_[r];
-            } else {
-                a[off++] = 0.0f;
+            if (r > round_now) {
+                // Mask all 4 features to 0 — never leak unseen cards.
+                for (int k = 0; k < ObservationLayout::HAND_FEATS_PER_ROUND; ++k) {
+                    a[off++] = 0.0f;
+                }
+                continue;
             }
+
+            uint8_t   cards[7];
+            uint8_t   community[5];
+            cards[0] = hole[0];
+            cards[1] = hole[1];
+            const int n_comm_r = kCommByRound[r];
+            for (int i = 0; i < n_comm_r; ++i) {
+                const auto c    = ctx.getCommunityCard(i);
+                cards[2 + i]    = c;
+                community[i]    = c;
+            }
+            const int n_total = 2 + n_comm_r;
+
+            const int category = ::Game::hand_category(cards, n_total);
+            const int max_suit = ::Game::max_suit_count(cards, n_total);
+            const int n_overs  = ::Game::overcard_count(hole.data(), community, n_comm_r);
+
+            // 0: made-hand category, monotonic in strength.
+            a[off++] = static_cast<float>(category)
+                     / static_cast<float>(::Game::kHandCategoryCount);
+
+            // 1: flush draw — 4-of-suit AND flush not yet made (cat 6 / 9).
+            const bool flush_made = (category == 6 || category == 9);
+            a[off++] = (max_suit == 4 && !flush_made) ? 1.0f : 0.0f;
+
+            // 2: straight draw — rank-outs / 8. Suppressed if a straight
+            // is already made (cat 5 = straight, 9 = straight flush).
+            const bool straight_made = (category == 5 || category == 9);
+            const int  s_outs        = straight_made
+                ? 0
+                : ::Game::straight_draw_outs(cards, n_total);
+            a[off++] = std::min(1.0f, static_cast<float>(s_outs) / 8.0f);
+
+            // 3: connectedness — alive 5-windows / 4. Generalises
+            // straight progress to all rounds (incl. preflop), giving
+            // the network a signal that 67 (4 windows) is closer to a
+            // straight than 6J (0 windows) even with only 2 cards
+            // visible.
+            const int s_alive = straight_made
+                ? 0
+                : ::Game::straight_alive_windows(cards, n_total);
+            a[off++] = std::min(1.0f, static_cast<float>(s_alive) / 4.0f);
+
+            // 4: overcards — # hole cards strictly > max board rank, / 2.
+            a[off++] = static_cast<float>(n_overs) / 2.0f;
         }
     }
 

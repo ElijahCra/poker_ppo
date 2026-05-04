@@ -36,15 +36,15 @@ OpponentPool::SnapshotId OpponentPool::add_snapshot(const ActorCritic& src) {
         return id;
     }
 
-    // Pool full — accept with probability max_size_/seen_count_.
+    // Accept with probability max_size_/seen_count_ — preserves Vitter's
+    // uniform-sample invariant.
     std::uniform_int_distribution<uint64_t> ui(1, seen_count_);
     if (ui(rng_) > static_cast<uint64_t>(max_size_)) {
-        return 0;  // rejected; offered snapshot is discarded without cloning.
+        return 0;
     }
 
-    // Accept: replace a uniformly-random existing slot. The replaced entry's
-    // ID is retired — any env still holding it falls through to live policy
-    // via has_id() returning false.
+    // Replace a uniformly-random existing slot; the replaced ID is retired
+    // (envs holding it fall through to live policy via has_id()).
     std::uniform_int_distribution<int> us(0, max_size_ - 1);
     const int slot = us(rng_);
     const SnapshotId id = next_id_++;

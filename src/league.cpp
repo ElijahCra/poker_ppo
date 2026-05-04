@@ -7,10 +7,6 @@
 
 namespace poker_ppo {
 
-// ═════════════════════════════════════════════════════════════════════════════
-// Construction
-// ═════════════════════════════════════════════════════════════════════════════
-
 League::League(IPokerEnvironmentFactory& factory,
                const BetConfig& bet_cfg,
                int obs_dim,
@@ -31,10 +27,6 @@ League::League(IPokerEnvironmentFactory& factory,
       hist_(hist),
       round_summary_(round_summary),
       device_(device) {}
-
-// ═════════════════════════════════════════════════════════════════════════════
-// Anchor registration
-// ═════════════════════════════════════════════════════════════════════════════
 
 void League::add_anchor(std::unique_ptr<IPolicy> policy) {
     anchors_.push_back(std::move(policy));
@@ -88,10 +80,6 @@ ActorCritic League::make_random_network() {
     net->eval();
     return net;
 }
-
-// ═════════════════════════════════════════════════════════════════════════════
-// Match play
-// ═════════════════════════════════════════════════════════════════════════════
 
 League::MatchResult League::play_match(IPolicy& a, IPolicy& b) {
     const int P      = cfg_.num_parallel_envs;
@@ -212,10 +200,6 @@ League::evaluate(const ActorCritic& trained) {
     }
     return out;
 }
-
-// ═════════════════════════════════════════════════════════════════════════════
-// Display
-// ═════════════════════════════════════════════════════════════════════════════
 
 void League::print_results(const std::vector<MatchResult>& rs,
                            std::ostream& os) const {

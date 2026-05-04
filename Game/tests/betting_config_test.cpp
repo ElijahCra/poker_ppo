@@ -1,23 +1,6 @@
-// Tests for the templated `Game::BettingConfig`.
-//
-// What we're verifying after the constexpr templating refactor:
-//   1. The class can be constructed in a constant-evaluated context
-//      (necessary for `inline constexpr` globals to compile).
-//   2. The compile-time `kNumPotFractions` parameter is exposed and
-//      threads correctly through `std::array<double, N>`.
-//   3. `make_default_betting_config(gcfg)` populates the fields from a
-//      `DefaultGameConfig` 1:1 — this replaced the hand-rolled
-//      `.assign()` bridge that used to live in poker_env.cpp.
-//   4. The runtime methods (`getAllowedBetSizes`, `generateRaiseActions`)
-//      still behave the same way they did before the refactor:
-//      • respect `maxRaisesPerRound`
-//      • emit the all-in slot only when `allowAllIn`, distinct, and
-//        the player isn't already covered
-//      • clamp by `minBet` / `playerStack`
-//   5. A non-default template instantiation (`BettingConfig<3>`) works,
-//      proving the parameter isn't accidentally hard-wired anywhere.
-//   6. The struct can be plugged into `DiscreteGame` without compile or
-//      runtime error.
+// Tests for the templated `Game::BettingConfig`: constexpr-friendly
+// construction, runtime bet-sizing methods, and a non-default template
+// instantiation.
 
 #include <gtest/gtest.h>
 

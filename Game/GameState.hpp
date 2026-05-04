@@ -5,7 +5,6 @@
 #include "GameBase.hpp"   // for INVALID_PLAYER, TIE_WINNER
 
 namespace Game {
-// State data structures - each holds its own state-specific data
 struct ChanceState {
     static constexpr auto name = "chance";
     bool cardsDealt = false;
@@ -28,6 +27,5 @@ struct TerminalState {
     enum Reason { SHOWDOWN, FOLD, ALL_IN } reason = SHOWDOWN;
 };
 
-// Variant holding all possible states
 using GameState = std::variant<ChanceState, ActionState, TerminalState>;
 }

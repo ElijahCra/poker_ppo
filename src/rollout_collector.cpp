@@ -16,10 +16,9 @@ struct BootstrapTensors {
     torch::Tensor terminal;   // [2, N] float32 CPU
 };
 
-// Assemble the [2, N] bootstrap_values / bootstrap_terminal tensors
-// compute_returns expects. Forwards `cur_obs` through the critic to get V
-// at the rollout-end state (from the *next* acting player's view), and
-// uses zero-sum negation to derive V from the other player's view.
+// V at rollout-end for the GAE bootstrap. Critic-forwards `cur_obs` (from
+// the next acting player's view), then uses zero-sum negation for the
+// other player's view to fill the [2, N] tensors compute_returns expects.
 BootstrapTensors build_bootstrap(
     ActorCritic&                            network,
     const torch::Tensor&                    cur_obs,           // [N, D] device

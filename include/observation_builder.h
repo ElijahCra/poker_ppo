@@ -1,13 +1,10 @@
 #pragma once
 //
-// observation_builder.h — owns the obs-tensor construction logic that
-// PokerEnvironment used to inline. One builder per env; one obs tensor
-// returned per `build()` call.
-//
-// The builder reads from a Game::GameContext + a hand-local bet-history
-// vector + the env's normaliser constants; it writes through an
-// `ObservationLayout` shared with the network so the two sides cannot
-// drift on offsets.
+// observation_builder.h — builds the obs tensor for PokerEnvironment.
+// One builder per env; one obs tensor per `build()`. Reads from a
+// Game::GameContext + a hand-local bet-history vector + the env's
+// normaliser constants; writes through the shared `ObservationLayout`
+// so env-write and network-read offsets cannot drift.
 //
 
 #include "config.h"
@@ -63,23 +60,12 @@ private:
                        const std::vector<BetHistoryEntry>& bet_history,
                        int current_player) const;
 
-    // Lazily populate `indexer_norm_` from the static hand_indexer's
-    // per-round canonical-bucket counts. The indexer is initialised on
-    // first DiscreteGame construction, so we wait until first build()
-    // call to read it.
-    void ensure_indexer_norm() const;
-
     BetHistoryConfig    hist_cfg_;
     RoundSummaryConfig  rs_cfg_;
     float               stack_norm_;
     float               pot_norm_;
     int                 max_raises_norm_;
     ObservationLayout   layout_;
-
-    // 1 / per-round hand_indexer bucket count, populated lazily on first
-    // build() call. Mutable because it's a pure memoisation cache — no
-    // observable state change for callers.
-    mutable std::array<float, 4> indexer_norm_{};
 };
 
 } // namespace poker_ppo

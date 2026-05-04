@@ -17,8 +17,10 @@
 
 #include "types.h"
 #include "features.h"
+#include "GameConfig.hpp"
 
 #include <cstdint>
+#include <random>
 
 namespace poker_ppo {
 
@@ -179,6 +181,34 @@ struct PPOConfig {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Env-side PokerConfig
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Wraps a Game::DefaultGameConfig (the poker variant) plus PPO-side knobs.
+// All poker-rule tuning lives in `game`; only per-run seeding and adapter
+// flags belong on PokerConfig itself.
+//
+// `kPokerConfig` (below) is the live compile-time instance threaded through
+// PokerEnvironment / PokerEnvironmentFactory / cmd_train. The trainer-side
+// feature gates (`hist`, `round_summary`) are pulled directly from
+// `kPPOConfig` so the env's observation layout and the network's input
+// layout cannot drift.
+//
+struct PokerConfig {
+    Game::DefaultGameConfig  game{};           // deck, stacks, blinds, betting structure
+    BetHistoryConfig    hist{};                // attention-encoder layout (T, F, ...)
+    RoundSummaryConfig  round_summary{};       // per-round summary feature block
+
+    // Seed used as a base — each created env gets seed ^ instance hash.
+    // Default is non-deterministic; the constexpr instance below pins it
+    // to a fixed value for reproducible training runs.
+    uint64_t seed = std::random_device()();
+
+    [[nodiscard]] constexpr int num_raise_slots() const noexcept { return game.num_raise_slots(); }
+    [[nodiscard]] constexpr int action_count()    const noexcept { return game.action_count(); }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Best-response (approximate exploitability) evaluator config
 // ─────────────────────────────────────────────────────────────────────────────
 //
@@ -225,7 +255,7 @@ struct BestResponseConfig {
     int   eval_hands         = 5000;
 
     float bb_per_unit_reward = 10.0f;  // matches PokerEnvironment::reward_norm
-    uint64_t seed            = 0;
+    uint64_t seed            = std::random_device()();
 };
 
 namespace config {
@@ -233,7 +263,7 @@ namespace config {
 // ─── Bet abstraction ────────────────────────────────────────────────────
 // Discrete-action layout exposed to PPO. Must match the chosen game
 // variant's GameConfig (validated at PokerEnvironment construction).
-inline constexpr BetConfig kBetConfig{
+static constexpr BetConfig kBetConfig{
     .num_raise_sizes    = 12,    // 11 pot fractions + AI; matches main.cpp
     .min_raise          = 0.5,
     .geometric_ratio    = 1.5,
@@ -241,15 +271,14 @@ inline constexpr BetConfig kBetConfig{
 };
 
 // ─── PPO trainer ────────────────────────────────────────────────────────
-// Hyperparameters captured from the most recent main.cpp configuration.
-// Tweak here, rebuild, and the trainer picks them up. Code uses
+// Tweak values, rebuild, and the trainer picks them up. Code uses
 // `if constexpr (kPPOConfig.flag)` to strip dead branches.
-inline constexpr PPOConfig kPPOConfig{
+static constexpr PPOConfig kPPOConfig{
     // Core PPO
     .gamma            = 1.0f,
-    .gae_lambda       = 1.0f,
+    .gae_lambda       = 0.975f,
     .clip_coef        = 0.1f,
-    .ent_coef         = 0.06f,    // higher than typical RL — see Rudolph et al. 2026
+    .ent_coef         = 0.05f,
     .vf_coef          = 0.5f,
     .max_grad_norm    = 0.5f,
     .clip_vloss       = true,
@@ -258,10 +287,10 @@ inline constexpr PPOConfig kPPOConfig{
     // Optimiser
     .learning_rate    = 3.0e-4f,
     .anneal_lr        = true,
-    .min_lr_frac      = 0.1f,
+    .min_lr_frac      = 0.2f,
 
     // Entropy schedule (cosine to ent_coef_min)
-    .anneal_ent_coef  = true,
+    .anneal_ent_coef  = false,
     .ent_coef_min     = 0.01f,
 
     // Rollout
@@ -274,8 +303,8 @@ inline constexpr PPOConfig kPPOConfig{
     .total_timesteps  = 300'000'000,
 
     // Network
-    .hidden_dim       = 256,
-    .num_layers       = 2,
+    .hidden_dim       = 512,
+    .num_layers       = 3,
     .hist             = BetHistoryConfig{
         .enabled         = false,    // build-time gate is features::ATTENTION_ENCODER
         .max_history_len = 32,
@@ -290,7 +319,7 @@ inline constexpr PPOConfig kPPOConfig{
 
     // Opponent pool (reservoir-sampled past selves)
     .opp_pool         = OpponentPoolConfig{
-        .enabled                 = true,
+        .enabled                 = false,
         .max_size                = 20,
         .snapshot_every          = 200,
         .warmup_updates          = 400,
@@ -304,10 +333,10 @@ inline constexpr PPOConfig kPPOConfig{
 // Used by main.cpp to instrument approximate exploitability during
 // training. All knobs are compile-time. Set `enabled = false` to remove
 // BR overhead from the binary.
-inline constexpr BestResponseConfig kBRConfig{
-    .enabled            = true,
+static constexpr BestResponseConfig kBRConfig{
+    .enabled            = false,
     .eval_every         = 1000,
-    .updates_per_eval   = 1000,
+    .updates_per_eval   = 2000,
     .num_envs           = 32,
     .num_steps          = 128,
     .update_epochs      = 4,
@@ -329,4 +358,31 @@ inline constexpr BestResponseConfig kBRConfig{
 };
 
 }  // namespace config
+
+// ─── Live env-side PokerConfig ──────────────────────────────────────────
+// Threaded through PokerEnvironment / PokerEnvironmentFactory / cmd_train.
+// `hist` and `round_summary` are pinned to `kPPOConfig` so the env's
+// observation layout and the network's input layout can never drift.
+//
+// Lives in `poker_ppo` directly (not `poker_ppo::config`) since it's the
+// canonical thing main / cmd_* pass into the environment factory — keeping
+// the config sub-namespace for the trainer-side hyperparameter bag.
+static constexpr PokerConfig kPokerConfig{
+    .game          = Game::kGameConfig,
+    .hist          = config::kPPOConfig.hist,
+    .round_summary = config::kPPOConfig.round_summary,
+    .seed          = 0x12345ULL,
+};
+
+// Compile-time invariants. These mirror the runtime check in the
+// PokerEnvironment constructor — having them as static_asserts means
+// any drift between BetConfig and the game's action layout fails to
+// build instead of throwing at runtime.
+static_assert(kPokerConfig.action_count() == config::kBetConfig.action_count(),
+              "kBetConfig.action_count() must match kPokerConfig.action_count() "
+              "(2 + num_raise_slots)");
+static_assert(kPokerConfig.game.max_raises_per_round
+              == static_cast<uint8_t>(config::kBetConfig.max_bets_per_round),
+              "BetConfig.max_bets_per_round must match game.max_raises_per_round");
+
 }  // namespace poker_ppo

@@ -13,10 +13,6 @@
 //     suit_2p2 = 3 - suit_dh
 //     id_2p2   = (id_dh & ~3) + (3 - (id_dh & 3)) + 1
 //
-// Both Transitioner::makeTerminal and the showdown test used to inline
-// this conversion locally. Centralising it here ensures any future
-// encoding tweak is a single-site fix.
-//
 
 #include <cstdint>
 

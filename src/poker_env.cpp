@@ -9,18 +9,12 @@
 
 namespace poker_ppo {
 
-// ═════════════════════════════════════════════════════════════════════════════
-// PokerEnvironment
-// ═════════════════════════════════════════════════════════════════════════════
-
 PokerEnvironment::PokerEnvironment(const PokerConfig& poker_cfg,
                                    const BetConfig&   bet_cfg,
                                    uint64_t           seed)
     : poker_cfg_(poker_cfg),
       bet_cfg_(bet_cfg),
       rng_(seed),
-      // Both sides are now std::array — straight constexpr factory call,
-      // no more iterator-bridge between vector/array.
       game_betting_cfg_(::Game::make_default_betting_config(poker_cfg.game)),
       game_(std::make_unique<::Game::DiscreteGame>(rng_, poker_cfg.game, game_betting_cfg_)),
       // Norms: stack_norm = initial_stack, pot_norm = 2*initial_stack so
@@ -229,10 +223,6 @@ torch::Tensor PokerEnvironment::compute_mask() const {
     }
     return mask;
 }
-
-// ═════════════════════════════════════════════════════════════════════════════
-// PokerEnvironmentFactory
-// ═════════════════════════════════════════════════════════════════════════════
 
 PokerEnvironmentFactory::PokerEnvironmentFactory(PokerConfig poker_cfg)
     : poker_cfg_(std::move(poker_cfg)) {}

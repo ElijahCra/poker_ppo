@@ -8,7 +8,6 @@
 
 namespace poker_ppo {
 
-// ─────────────────────────────────────────────────────────────────────────────
 // cmd_play — interactive REPL exposing one PokerEnvironment + the trained
 // network over stdin/stdout. Driven by tools/play.py for the UI.
 //
@@ -28,7 +27,6 @@ namespace poker_ppo {
 //   QUIT                — exit cleanly.
 //
 // Errors: emit a single `ERR <message>` line followed by `OK`.
-// ─────────────────────────────────────────────────────────────────────────────
 
 int cmd_play(IPokerEnvironmentFactory& factory,
              const BetConfig&          bet_cfg,

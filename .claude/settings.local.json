@@ -30,7 +30,14 @@
       "Bash(cmake --build /Users/elijahcrain/CLionProjects/ppo_poker/cmake-build-release)",
       "Bash(ctest)",
       "Bash(cmake -S /Users/elijahcrain/CLionProjects/ppo_poker -B /Users/elijahcrain/CLionProjects/ppo_poker/cmake-build-release)",
-      "Bash(ctest --output-on-failure --rerun-failed)"
+      "Bash(ctest --output-on-failure --rerun-failed)",
+      "Bash(command -v pdftoppm)",
+      "Bash(pdftoppm -v)",
+      "Bash(pdftotext -layout /Users/elijahcrain/Downloads/PolicyGradientForIIGames.pdf /tmp/paper.txt)",
+      "Read(//tmp/**)",
+      "Bash(grep -n -E \"^\\(//\\\\s*\\(═|─\\){8,}|// ─── |// ═══ \\)\" --include=\"*.h\" --include=\"*.hpp\" --include=\"*.cpp\" /Users/elijahcrain/CLionProjects/ppo_poker/include/policy.h /Users/elijahcrain/CLionProjects/ppo_poker/include/types.h /Users/elijahcrain/CLionProjects/ppo_poker/include/network.h /Users/elijahcrain/CLionProjects/ppo_poker/include/rollout_buffer.h /Users/elijahcrain/CLionProjects/ppo_poker/include/config.h)",
+      "Bash(awk 'NR==27 || NR==29' /Users/elijahcrain/CLionProjects/ppo_poker/include/config.h)",
+      "Bash(grep -n -E \"^// [A-Z][a-zA-Z ]+$\" --include=\"*.h\" --include=\"*.hpp\" --include=\"*.cpp\" -r /Users/elijahcrain/CLionProjects/ppo_poker/include /Users/elijahcrain/CLionProjects/ppo_poker/src /Users/elijahcrain/CLionProjects/ppo_poker/Game/Utility/HandStrength.hpp)"
     ]
   }
 }

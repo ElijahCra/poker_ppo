@@ -58,9 +58,18 @@ target_link_libraries(poker_config_test PRIVATE
     GTest::gtest_main
 )
 
+# HandStrength tests. Pure header-only helper — no dependencies beyond
+# the Game include root, so we just need the interface lib here.
+add_executable(hand_strength_test hand_strength_test.cpp)
+target_link_libraries(hand_strength_test PRIVATE
+    Game
+    GTest::gtest_main
+)
+
 # Register with CTest so `ctest` discovers the cases automatically.
 include(GoogleTest)
 gtest_discover_tests(showdown_test)
 gtest_discover_tests(attention_test)
 gtest_discover_tests(betting_config_test)
 gtest_discover_tests(poker_config_test)
+gtest_discover_tests(hand_strength_test)

@@ -1,30 +1,9 @@
 #pragma once
 //
-// league.h — anchor-relative progress tracking for self-play training.
+// league.h — anchor-relative progress tracking. Plays the trained policy
+// against a fixed set of "anchor" baselines and reports BB/hand per
+// match-up. See add_default_anchors() for the built-in anchor set.
 //
-// Plays the trained policy against a fixed set of "anchor" baselines and
-// reports BB/hand for each match-up.  Replaces the earlier Elo league: a
-// rising BB/hand differential against a frozen baseline is a more direct,
-// less interpretable-as-noise signal of strength than a head-to-head Elo
-// rating, especially for short evaluation windows.
-//
-// Default anchors (registered by add_default_anchors()):
-//   uniform        — equal-probability sample over legal actions
-//   random_init    — freshly-built ActorCritic with random orthogonal init
-//   always_call    — picks Check/Call; folds if illegal
-//   always_raise   — picks the smallest legal raise; falls through to
-//                    call/check, then fold
-//   pair_caller    — calls iff hole cards form a pocket pair, else folds
-//
-// Typical use:
-//   League league(factory, bet_cfg, obs_dim, action_count,
-//                 hidden_dim, num_layers, hist, League::Config{}, device);
-//   league.add_default_anchors();          // registers all five above
-//   ...
-//   auto results = league.evaluate(trainer.network());
-//   for (const auto& r : results) {
-//     std::cout << r.anchor_name << ": " << r.bb_per_hand_a << " bb/hand\n";
-//   }
 
 #include "config.h"
 #include "environment.h"

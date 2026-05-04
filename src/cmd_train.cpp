@@ -138,34 +138,39 @@ int cmd_train(IPokerEnvironmentFactory& factory,
                       << "  duration=" << eval_ms << "ms]\n";
             league.print_results(results);
 
-            // Action mix (vs uniform anchor — first registered) for visual
-            // mode-collapse check.
-            if (!results.empty()) {
-                int uniform_idx = -1;
+            // Action mix vs `uniform` (sanity baseline) and `pair_all_in`
+            // (folds ~94% preflop — a healthy exploiter shows high
+            // raise/all-in % and low fold % against it).
+            auto print_action_mix = [&](const char* anchor_name) {
+                int idx = -1;
                 for (size_t i = 0; i < results.size(); ++i) {
-                    if (results[i].anchor_name == "uniform") {
-                        uniform_idx = static_cast<int>(i);
+                    if (results[i].anchor_name == anchor_name) {
+                        idx = static_cast<int>(i);
                         break;
                     }
                 }
-                if (uniform_idx >= 0) {
-                    const auto& vs_u = results[uniform_idx];
-                    int64_t total = 0;
-                    for (auto c : vs_u.action_counts_a) total += c;
-                    if (total > 0) {
-                        std::cout << "  action mix (vs uniform):"
-                                  << std::fixed << std::setprecision(1);
-                        for (size_t a = 0; a < vs_u.action_counts_a.size(); ++a) {
-                            const float pct = 100.0f
-                                * static_cast<float>(vs_u.action_counts_a[a])
-                                / static_cast<float>(total);
-                            std::cout << "  " << action_label(static_cast<int>(a))
-                                      << "=" << pct << "%";
-                        }
-                        std::cout.unsetf(std::ios::fixed);
-                        std::cout << "\n";
-                    }
+                if (idx < 0) return;
+
+                const auto& r = results[idx];
+                int64_t total = 0;
+                for (auto c : r.action_counts_a) total += c;
+                if (total <= 0) return;
+
+                std::cout << "  action mix (vs " << anchor_name << "):"
+                          << std::fixed << std::setprecision(1);
+                for (size_t a = 0; a < r.action_counts_a.size(); ++a) {
+                    const float pct = 100.0f
+                        * static_cast<float>(r.action_counts_a[a])
+                        / static_cast<float>(total);
+                    std::cout << "  " << action_label(static_cast<int>(a))
+                              << "=" << pct << "%";
                 }
+                std::cout.unsetf(std::ios::fixed);
+                std::cout << "\n";
+            };
+            if (!results.empty()) {
+                print_action_mix("uniform");
+                print_action_mix("pair_all_in");
             }
             std::cout << "\n";
         }
@@ -204,8 +209,6 @@ int cmd_train(IPokerEnvironmentFactory& factory,
     metrics.log_league(/*update=*/-1, /*step=*/-1, final_results);
     league.print_results(final_results);
 
-    // poker_cfg.game.name is now a std::string_view (constexpr-friendly);
-    // bridge to std::string explicitly for the path concatenation.
     const std::string model_path =
         std::string("poker_ppo_model_") + std::string(poker_cfg.game.name) + ".pt";
     trainer.save(model_path);

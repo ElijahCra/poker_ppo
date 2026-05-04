@@ -18,8 +18,6 @@
 
 namespace poker_ppo {
 
-struct PokerConfig;  // fwd-decl; full type in poker_env.h (avoid circular)
-
 // Train the PPO self-play loop end-to-end. Sets up the league + BR
 // evaluator + metrics logging, runs for `kPPOConfig.total_timesteps`, and
 // saves the trained model on exit.

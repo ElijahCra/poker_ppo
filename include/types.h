@@ -1,13 +1,7 @@
 #pragma once
 //
-// types.h — env↔PPO interaction types only.
-//
-// The env exchanges three things with the trainer: a `BetConfig` describing
-// the discrete action space, an `Action` index encoding, and a `StepResult`
-// per step. Everything else (PPO hyperparameters, attention/round-summary
-// feature configs, opponent-pool settings) lives in `config.h` so this
-// header stays light — it's included by `environment.h` and downstream by
-// pretty much every TU.
+// types.h — env↔PPO interaction types only (BetConfig, Action,
+// StepResult). PPO hyperparameters and feature configs live in config.h.
 //
 
 #include <torch/torch.h>
@@ -16,10 +10,6 @@
 #include <vector>
 
 namespace poker_ppo {
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Betting configuration
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// Controls the discrete action space for betting.
 ///
@@ -50,10 +40,6 @@ struct BetConfig {
     }
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Action encoding
-// ─────────────────────────────────────────────────────────────────────────────
-
 /// Action indices:
 ///   0         → Fold
 ///   1         → Check / Call
@@ -70,10 +56,6 @@ namespace Action {
         return action_id - 2;
     }
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Step result
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// Returned by `IPokerEnvironment::reset()` and `step()`.
 struct StepResult {

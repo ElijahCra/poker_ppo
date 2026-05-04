@@ -27,13 +27,11 @@ inline constexpr float kAttentionMaskLogit = -1e9f;
 // normalisation in the PPO update.
 inline constexpr float kAdvantageEps = 1e-8f;
 
-// ─────────────────────────────────────────────────────────────────────────────
 // Tower — one half of an actor-critic pair: optional bet-history attention
 //         encoder + MLP trunk + linear output head. Used twice by ActorCritic
 //         (once for the policy logits, once for the state value) so that the
 //         value-loss gradient does not flow into the actor's representation.
 //         Matches the OpenSpiel/CleanRL single-agent convention.
-// ─────────────────────────────────────────────────────────────────────────────
 class TowerImpl : public torch::nn::Module {
 public:
     TowerImpl(int obs_dim, int output_dim,
@@ -68,9 +66,7 @@ private:
 };
 TORCH_MODULE(Tower);
 
-// ─────────────────────────────────────────────────────────────────────────────
 // ActorCritic — two independent Towers (actor + critic), no shared parameters.
-// ─────────────────────────────────────────────────────────────────────────────
 //
 // Observation layout (built by PokerEnvironment::compute_observation):
 //   [0          : S]                static features (cards, stacks, pot, ...)
@@ -139,9 +135,7 @@ private:
 
 TORCH_MODULE(ActorCritic);
 
-// ─────────────────────────────────────────────────────────────────────────────
 // clone_actor_critic — deep-copy an ActorCritic by shape + parameters.
-// ─────────────────────────────────────────────────────────────────────────────
 //
 // libtorch's `clone()` on a Module does NOT do what we want here — it
 // returns a base `Module`, not a typed `ActorCritic`, and it requires

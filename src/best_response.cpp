@@ -7,10 +7,6 @@
 
 namespace poker_ppo {
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Construction
-// ─────────────────────────────────────────────────────────────────────────────
-
 BestResponseEvaluator::BestResponseEvaluator(
     IPokerEnvironmentFactory& factory,
     const BetConfig&    bet_cfg,
@@ -51,9 +47,7 @@ void BestResponseEvaluator::init_exploiter() {
         torch::optim::AdamOptions(cfg_.learning_rate).eps(1e-5));
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // evaluate
-// ─────────────────────────────────────────────────────────────────────────────
 
 BestResponseEvaluator::Result
 BestResponseEvaluator::evaluate(const ActorCritic& target,
@@ -62,8 +56,7 @@ BestResponseEvaluator::evaluate(const ActorCritic& target,
     using ms    = std::chrono::duration<double, std::milli>;
     const auto t0 = clock::now();
 
-    // Snapshot the target once — every seed plays against the same frozen
-    // copy, so subsequent main-trainer updates can't race with our forwards.
+    // Freeze target once so all seeds play the same opponent.
     ActorCritic frozen_target = clone_actor_critic(
         target, obs_dim_, action_count_, hidden_dim_, num_layers_,
         hist_, round_summary_, device_);
@@ -137,12 +130,10 @@ BestResponseEvaluator::evaluate(const ActorCritic& target,
     return r;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // run_one_seed — train the (already-initialised) exploiter for
 // cfg_.updates_per_eval PPO updates against the frozen target, then run the
 // eval-match. The caller (evaluate) is responsible for initialising the
 // exploiter before each call so different seeds are independent.
-// ─────────────────────────────────────────────────────────────────────────────
 
 BestResponseEvaluator::EvalStats
 BestResponseEvaluator::run_one_seed(ActorCritic& frozen_target) {
@@ -382,12 +373,10 @@ BestResponseEvaluator::run_one_seed(ActorCritic& frozen_target) {
     return es;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // eval_match — the trained exploiter vs the frozen target, no learning, no
 // recording. Partitions envs by acting seat each step (as League does) so
 // each network forwards only on the sub-batch that needs its decision —
 // avoids running both networks redundantly on every env.
-// ─────────────────────────────────────────────────────────────────────────────
 
 BestResponseEvaluator::EvalStats
 BestResponseEvaluator::eval_match(ActorCritic& target) {

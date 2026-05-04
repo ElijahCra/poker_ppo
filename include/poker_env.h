@@ -1,10 +1,9 @@
 #pragma once
 
-#include "config.h"
+#include "config.h"          // PokerConfig + kPokerConfig live here
 #include "environment.h"
 #include "observation_builder.h"
 #include "Game.hpp"
-#include "GameConfig.hpp"
 
 #include <array>
 #include <atomic>
@@ -15,67 +14,19 @@
 
 namespace poker_ppo {
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Poker environment adapter
-// ─────────────────────────────────────────────────────────────────────────────
-//
-// Wraps Game::DiscreteGame (heads-up no-limit hold'em from the Poker project) in
-// the IPokerEnvironment interface used by PPO.
+// PokerEnvironment — wraps Game::DiscreteGame (HU NLHE) in the
+// IPokerEnvironment interface. Construction knobs come from PokerConfig
+// (config.h). Auto-advances through ChanceState transitions, so PPO only
+// sees ActionState or terminal snapshots.
 //
 // Action space (indices into the PPO policy's categorical):
 //   0                       → Fold
 //   1                       → Check or Call (whichever is legal)
-//   2 .. 1+K                → K pot-fraction raises defined in PokerConfig
-//   2+K  (if allow_all_in)  → All-in raise (only exposed when distinct)
+//   2 .. 1+K                → K pot-fraction raises from PokerConfig
+//   2+K  (if allow_all_in)  → All-in raise (only when distinct)
 //
-// The adapter auto-advances through ChanceState transitions (which in the
-// Poker implementation just flip the round marker; all cards are dealt at hand
-// start).  PPO therefore only ever sees ActionState or terminal snapshots.
-//
-// Reward: the terminal reward is the utility delta for seat 0 (in "mbb" /
-// millibigblinds as stored by Poker), normalised by INITIAL_STACK so it sits in
-// a reasonable range for the critic.  PPO handles the sign-flip for seat 1.
-
-// Wraps a Game::DefaultGameConfig (the poker variant) plus PPO-side knobs.
-// All poker-rule tuning lives in `game`; only per-run seeding and adapter
-// flags belong on PokerConfig itself.
-struct PokerConfig {
-    ::Game::DefaultGameConfig  game{};           // deck, stacks, blinds, betting structure
-    BetHistoryConfig    hist{};           // attention-encoder layout (T, F, ...)
-    RoundSummaryConfig  round_summary{};  // per-round summary feature block
-
-    // Seed used as a base — each created env gets seed ^ instance hash.
-    uint64_t seed = 0x9E3779B97F4A7C15ull;
-
-    [[nodiscard]] constexpr int num_raise_slots() const noexcept { return game.num_raise_slots(); }
-    [[nodiscard]] constexpr int action_count()    const noexcept { return game.action_count(); }
-};
-
-// ─── Live constexpr instance ──────────────────────────────────────────
-//
-// Single compile-time PokerConfig consumed by PokerEnvironment /
-// PokerEnvironmentFactory / main.cpp. The trainer-side feature gates
-// (`hist`, `round_summary`) are pulled directly from `kPPOConfig` so the
-// env's observation layout and the network's input layout can never
-// drift apart. The seed is the PRNG base — each env XORs an instance
-// hash on top.
-inline constexpr PokerConfig kPokerConfig{
-    .game          = ::Game::kGameConfig,
-    .hist          = config::kPPOConfig.hist,
-    .round_summary = config::kPPOConfig.round_summary,
-    .seed          = 0x12345ULL,
-};
-
-// Compile-time invariants. These mirror the runtime check in the
-// PokerEnvironment constructor — having them as static_asserts means
-// any drift between BetConfig and the game's action layout fails to
-// build instead of throwing at runtime.
-static_assert(kPokerConfig.action_count() == config::kBetConfig.action_count(),
-              "kBetConfig.action_count() must match kPokerConfig.action_count() "
-              "(2 + num_raise_slots)");
-static_assert(kPokerConfig.game.max_raises_per_round
-              == static_cast<uint8_t>(config::kBetConfig.max_bets_per_round),
-              "BetConfig.max_bets_per_round must match game.max_raises_per_round");
+// Reward: the terminal reward is seat-0's utility delta in mbb,
+// normalised by 10·big_blind. PPO handles the sign-flip for seat 1.
 
 class PokerEnvironment : public IPokerEnvironment {
 public:

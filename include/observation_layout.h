@@ -16,12 +16,8 @@
 //     `write_round_summary_block` / `write_history_block`.
 //   - `TowerImpl::forward` reads them via `obs.narrow(...)` to split the
 //     obs back into the parts each network sub-module consumes.
-//
-// Pre-refactor each side computed its own offsets locally — the network
-// even derived `static_dim` by *subtraction* (`obs_dim - rs - hist`), so a
-// new sub-block silently shifted the read positions on the network side.
-// `ObservationLayout` collapses both sides onto the same constexpr struct;
-// the env asks for write offsets and the network asks for read offsets.
+// The env asks for write offsets and the network asks for read offsets;
+// they cannot drift.
 //
 
 #include "config.h"   // BetHistoryConfig, RoundSummaryConfig
@@ -34,9 +30,22 @@ struct ObservationLayout {
     static constexpr int CARD_SLOTS              = 52;  // 1 slot per card id
     // stacks(2) + pot + cur_bet + raises + round one-hot(4) + seat = 10
     static constexpr int FEAT_BASIC              = 10;
-    // Per-round normalised hand_indexer bucket id; 4 rounds = 4 floats.
+    // Per-round hand-info block:
+    //   0  made-hand category / 9       (monotonic in made-hand strength)
+    //   1  flush_draw                    (1 if 4-of-suit visible & not yet made)
+    //   2  straight_draw_outs / 8        (rank-outs; OESD vs gutshot — postflop)
+    //   3  straight_alive_windows / 4    (long-term straight progress; the only
+    //                                      straight feature meaningful preflop —
+    //                                      distinguishes 67 from 6J)
+    //   4  overcards / 2                 (hole cards > max board rank)
+    // 4 rounds × 5 features = 20 floats. Stripped from the binary when
+    // `features::HAND_STRENGTH` is false.
+    static constexpr int HAND_FEATS_PER_ROUND    = 5;
+    static constexpr int HAND_FEAT_ROUNDS        = 4;
     static constexpr int FEAT_HAND_STRENGTH      =
-        features::HAND_STRENGTH ? 4 : 0;
+        features::HAND_STRENGTH
+            ? HAND_FEATS_PER_ROUND * HAND_FEAT_ROUNDS
+            : 0;
     static constexpr int FEAT_STATIC             =
         FEAT_BASIC + FEAT_HAND_STRENGTH;
 

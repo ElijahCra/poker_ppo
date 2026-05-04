@@ -6,9 +6,7 @@
 
 namespace poker_ppo {
 
-// ─────────────────────────────────────────────────────────────────────────────
 // RolloutBuffer  — per-player rollout storage for alternating self-play
-// ─────────────────────────────────────────────────────────────────────────────
 //
 // every env transition
 // is pushed into the buffer for the player who acted at that step, and each
@@ -97,7 +95,6 @@ private:
     std::vector<int32_t> counts_[2];  // [N]
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
 // PlayerRolloutState — per-env bookkeeping for the per-player buffer.
 //
 // Each rollout strategy instantiates one PlayerRolloutState per env and drives
@@ -114,7 +111,6 @@ private:
 //     transition for p was followed by an episode terminal (true) or merely
 //     by another action (false). Read by the trainer at rollout-end to pick
 //     the right bootstrap V for compute_returns.
-// ─────────────────────────────────────────────────────────────────────────────
 struct PlayerRolloutState {
     struct Pending {
         bool           has = false;

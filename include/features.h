@@ -1,26 +1,9 @@
 #pragma once
 //
-// features.h — compile-time feature flags.
-//
-// Each flag is an `inline constexpr bool`. Code paths gated on these flags
-// via `if constexpr (features::FOO)` are eliminated at compile time when
-// the flag is false — no branch, no instructions, no register pressure.
-//
-// Combined with the matching runtime flag in PPOConfig (e.g.
-// `BetHistoryConfig::enabled`), this gives two-tier control:
-//
-//   compile-time (here)         — include or exclude the feature entirely
-//   runtime (PPOConfig)         — toggle within compiled-in features
-//
-// In particular, when a flag here is `false`, the runtime flag becomes a
-// no-op: the corresponding work simply isn't in the binary. Useful for
-// (a) micro-benchmarking the "no plumbing" baseline, (b) shipping a
-// stripped binary that physically can't run a feature, (c) sanity-
-// checking that a feature is purely additive (flipping the constexpr
-// off should never break a no-feature run).
-//
-// Defaults below match the current main.cpp configuration so a normal
-// build sees no behaviour change. Flip a flag to `false` to strip.
+// features.h — compile-time feature flags. Two-tier control with
+// PPOConfig: the constexpr below decides what's in the binary; the
+// runtime flag toggles within compiled-in features. Setting a flag here
+// to false makes the runtime flag a no-op.
 //
 
 namespace poker_ppo::features {

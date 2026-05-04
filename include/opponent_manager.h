@@ -1,22 +1,10 @@
 #pragma once
 //
-// opponent_manager.h — owns the opponent-pool *state* the trainer needs
-// during a rollout, so PPOTrainer can stay focused on the optimisation
-// loop. Composition over inheritance: the trainer holds one of these and
-// asks it three things during a rollout
-//
-//   prepare_rollout(update_idx)            // at the start of each rollout
-//   apply_action_overrides(...)            // each step, before env.step()
-//   on_episode_terminal(env_idx, update_idx)   // when env i finishes a hand
-//
-// And one thing per training-loop tick
-//
-//   maybe_snapshot(update_idx, network)    // after PPOTrainer::update()
-//
-// All entry points are no-ops when the pool is disabled (cfg.enabled
-// == false) or empty (warmup phase).
-//
-// The actual reservoir + snapshot inference lives in `opponent_pool.h`.
+// opponent_manager.h — opponent-pool state used by the trainer during a
+// rollout. Entry points: prepare_rollout, apply_action_overrides,
+// on_episode_terminal, maybe_snapshot. All no-op when the pool is
+// disabled or empty (warmup). The reservoir + snapshot inference lives
+// in opponent_pool.h.
 //
 
 #include "config.h"

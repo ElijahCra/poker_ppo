@@ -36,9 +36,7 @@ explicit Game(std::mt19937& engine,
     m_context.initializeCards(m_rng);
 }
 
-// Process any action type
 void transition(const Action& action) {
-    // Validate action
     if (!isValidAction(action)) {
         throw std::invalid_argument("Invalid action for current state");
     }
@@ -48,41 +46,33 @@ void transition(const Action& action) {
 
     updateInfoSets(action);
 
-    // Execute side effects
     if (sideEffect) {
         sideEffect(m_context);
     }
 
-    // Update state
     m_current_state = nextState;
 
-    // Generate available actions using policy
     updateAvailableActions();
 }
 
-// Reset game to initial state
 void reInitialize() {
     m_context.reset(m_rng);
     m_current_state = ChanceState{};
     m_available_actions = ActionPolicy::makeChanceActionSet();
 }
 
-// Get available actions with their parameters
 [[nodiscard]] const ActionSet& getActions() const noexcept {
     return m_available_actions;
 }
 
-// For continuous policy: get bounds directly
 [[nodiscard]] ActionBounds getActionBounds() const noexcept {
     if constexpr (std::is_same_v<ActionPolicy, ContinuousActionPolicy>) {
         return m_available_actions;
     } else {
-        // Convert discrete actions to bounds
         return discreteToBounds(m_available_actions);
     }
 }
 
-// State queries
 [[nodiscard]] std::string getType() const {
     return std::visit([](const auto& state) {
         return std::string(state.name);
@@ -109,7 +99,6 @@ void reInitialize() {
     return 0;
 }
 
-// Getters
 [[nodiscard]] int getCurrentPlayer() const noexcept { return m_context.getCurrentPlayer(); }
 [[nodiscard]] int getCurrentRound() const noexcept { return m_context.getRoundNumber(); }
 
@@ -141,7 +130,6 @@ void reInitialize() {
     return 0;
 }
 
-// Get number of available actions
 [[nodiscard]] size_t numActions() const noexcept {
     return ActionPolicy::numActions(m_available_actions);
 }
@@ -205,7 +193,6 @@ void updateInfoSets(const Action& action) {
     return m_context.getRaiseNum();
 }
 
-// Helper to convert discrete actions to bounds (for getActionBounds compatibility)
 [[nodiscard]] static ActionBounds discreteToBounds(const std::vector<Action>& actions) {
     ActionBounds bounds;
     for (const auto& action : actions) {
@@ -235,7 +222,6 @@ void updateInfoSets(const Action& action) {
 }
 };
 
-// Type aliases for convenience
 using DiscreteGame = Game<DiscreteActionPolicy>;
 using ContinuousGame = Game<ContinuousActionPolicy>;
 

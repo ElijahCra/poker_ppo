@@ -10,10 +10,6 @@ namespace {
 // kAttentionMaskLogit lives in network.h so callers/tests can reference it.
 } // namespace
 
-// ═════════════════════════════════════════════════════════════════════════════
-// TowerImpl
-// ═════════════════════════════════════════════════════════════════════════════
-
 TowerImpl::TowerImpl(int obs_dim, int output_dim,
                      int hidden_dim, int num_layers,
                      float head_init_std,
@@ -27,9 +23,6 @@ TowerImpl::TowerImpl(int obs_dim, int output_dim,
         throw std::invalid_argument(
             "Tower: obs_dim does not match ObservationLayout::build(hist, round_summary)");
     }
-    // Static block read by Tower = card one-hots + numeric features.
-    // (The split between cards and static features doesn't matter for the
-    // trunk; both are dense floats fed in unchanged.)
     const int tower_static_dim = layout_.static_off + ObservationLayout::FEAT_STATIC;
     int trunk_in_dim = tower_static_dim + layout_.round_summary_dim;
 
@@ -125,7 +118,6 @@ TowerImpl::TowerImpl(int obs_dim, int output_dim,
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 torch::Tensor
 TowerImpl::encode_history(const torch::Tensor& history_block) {
     // history_block: [B, T*(1+F)]
@@ -182,7 +174,6 @@ TowerImpl::encode_history(const torch::Tensor& history_block) {
     return x.select(/*dim=*/1, /*index=*/0);   // [B, D]
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 torch::Tensor TowerImpl::forward(torch::Tensor obs) {
     // Slice the obs into its sub-blocks via the shared `ObservationLayout`
     // — same struct the env writes through. No more parallel offset
@@ -223,10 +214,6 @@ torch::Tensor TowerImpl::forward(torch::Tensor obs) {
     return head_->forward(features);
 }
 
-// ═════════════════════════════════════════════════════════════════════════════
-// ActorCriticImpl
-// ═════════════════════════════════════════════════════════════════════════════
-
 ActorCriticImpl::ActorCriticImpl(int obs_dim, int action_count,
                                  int hidden_dim, int num_layers,
                                  BetHistoryConfig    hist,
@@ -244,7 +231,6 @@ ActorCriticImpl::ActorCriticImpl(int obs_dim, int action_count,
                                     hist, round_summary));
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 std::pair<torch::Tensor, torch::Tensor>
 ActorCriticImpl::forward(torch::Tensor obs) {
     auto logits = actor_->forward(obs);
@@ -252,7 +238,6 @@ ActorCriticImpl::forward(torch::Tensor obs) {
     return {logits, value};
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 torch::Tensor ActorCriticImpl::get_value(torch::Tensor obs) {
     // No std::move on `obs` — torch::Tensor is shared-pointer-ish, so
     // moving is a no-op cost-wise but signals (incorrectly) that the
@@ -262,13 +247,11 @@ torch::Tensor ActorCriticImpl::get_value(torch::Tensor obs) {
     return critic_->forward(obs).squeeze(-1);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 torch::Tensor
 ActorCriticImpl::apply_mask(torch::Tensor logits, torch::Tensor mask) {
     return logits + (1.0f - mask) * kIllegalActionLogit;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 ActorCriticImpl::ActionResult
 ActorCriticImpl::get_action(torch::Tensor obs, torch::Tensor legal_mask) {
     auto [logits, value] = forward(obs);
@@ -285,7 +268,6 @@ ActorCriticImpl::get_action(torch::Tensor obs, torch::Tensor legal_mask) {
     return {action, log_prob, value, entropy};
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 ActorCriticImpl::EvalResult
 ActorCriticImpl::evaluate(torch::Tensor obs, torch::Tensor legal_mask,
                           const torch::Tensor &action) {
@@ -300,7 +282,6 @@ ActorCriticImpl::evaluate(torch::Tensor obs, torch::Tensor legal_mask,
     return {log_prob, value, entropy};
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 ActorCritic clone_actor_critic(const ActorCritic&  src,
                                int                 obs_dim,
                                int                 action_count,

@@ -1,30 +1,17 @@
 #pragma once
 //
-// best_response.h — approximate best response (ABR) evaluator for tracking
-// approximate exploitability of the trained policy during training.
+// best_response.h — approximate best response (ABR) evaluator: a vanilla
+// PPO exploiter trained against a frozen snapshot of the target. Its
+// terminal reward is a valid lower bound on the target's exploitability
+// (Timbers et al. 2020). Warm-started across evaluate() calls by default.
 //
-// Approach: the first paragraph of Section 3 of [Timbers et al. 2020,
-// "Approximate Exploitability: Learning a Best Response"] observes that
-// fixing the opponent's policy turns the env into a stationary single-agent
-// problem; an RL-trained best responder's reward is then a valid lower bound
-// on the target's true exploitability. We use vanilla PPO as the responder
-// rather than the paper's IS-MCTS-BR variant — the search-based variant
-// costs ~100k learning steps per evaluation, while a vanilla PPO exploiter
-// trained for K updates (K << 1k) fits inside a 1000-update training-evaluation
-// cadence at modest overhead.
-//
-// Warm-start: the exploiter's weights persist across evaluate() calls by
-// default, so each evaluation continues training from where the previous one
-// left off, but against a fresh frozen target. Set warm_start = false to
-// re-init on every call.
-//
-// Correctness note: the exploiter is a single-agent learner in the MDP where
-// the target is part of the env dynamics. Only the exploiter-seat
-// transitions are stored in the rollout buffer; opponent transitions are
-// absorbed into the next exploiter-action's accumulated reward. We treat
-// rollout-end truncations as terminals (V_next = 0) rather than bootstrapping
-// from V(carry_obs), since the exploiter's value head is only trained on
-// exploiter-acting states and is OOD on target-acting carry states.
+// Correctness note: the exploiter is a single-agent learner in the MDP
+// where the target is part of the env dynamics. Only exploiter-seat
+// transitions are stored; opponent transitions are absorbed into the
+// next exploiter-action's accumulated reward. Rollout-end truncations
+// are treated as terminals (V_next = 0) rather than bootstrapping from
+// V(carry_obs), since the value head is only trained on exploiter-
+// acting states and is OOD on target-acting carry states.
 //
 
 #include "config.h"
