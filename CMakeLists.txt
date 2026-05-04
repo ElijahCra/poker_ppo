@@ -37,13 +37,11 @@ find_package(Torch REQUIRED)
 add_library(poker_ppo_lib
     src/network.cpp
     src/ppo.cpp
-    src/rollout_buffer.cpp
-    src/rollout_collector.cpp
+    src/rollout.cpp
     src/poker_env.cpp
     src/observation_builder.cpp
     src/league.cpp
     src/metrics_logger.cpp
-    src/opponent_pool.cpp
     src/opponent_manager.cpp
     src/best_response.cpp
     src/cmd_train.cpp
@@ -57,6 +55,45 @@ target_link_libraries(poker_ppo_lib PUBLIC
     "${TORCH_LIBRARIES}"
     Game
 )
+
+# libtorch ≥ 2.8 references free / memcpy / numeric_limits<> / lock_guard<>
+# in c10/ATen headers without including <cstdlib>/<cstring>/<limits>/<mutex>,
+# relying on transitive includes that aren't guaranteed. Force-include them
+# here. (`features.h` first so glibc feature-test macros are defined before
+# any libstdc++ header that gates on them.)
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+    # libtorch ≥ 2.8 references free / memcpy / numeric_limits<> / lock_guard<>
+    # in c10/ATen headers without #include <cstdlib>/<cstring>/<limits>/<mutex>,
+    # relying on transitive includes that aren't guaranteed across
+    # libstdc++ versions. Force-include them.
+    #
+    # `sys/cdefs.h` is force-included first so glibc's __GLIBC_PREREQ /
+    # __GLIBC_USE macros are defined before any libstdc++ header that
+    # gates on them. We use sys/cdefs.h instead of features.h because
+    # this project has its own include/features.h that would shadow the
+    # glibc one.
+    #
+    # SHELL: prefix prevents CMake from de-duplicating the repeated
+    # -include flag (it would otherwise collapse all filenames into a
+    # single -include and drop all but the first).
+    # Absolute path for features.h because this project has its own
+    # include/features.h that would otherwise shadow glibc's.
+    find_path(GLIBC_FEATURES_H features.h
+        PATHS /usr/include
+        NO_DEFAULT_PATH
+        REQUIRED
+    )
+    # PUBLIC so consumers (the main exe + libtorch-using tests) inherit
+    # the same workaround when compiling their own TUs against
+    # poker_ppo_lib's headers (which transitively pull libtorch).
+    target_compile_options(poker_ppo_lib PUBLIC
+        "SHELL:-include ${GLIBC_FEATURES_H}/features.h"
+        "SHELL:-include cstring"
+        "SHELL:-include cstdlib"
+        "SHELL:-include limits"
+        "SHELL:-include mutex"
+    )
+endif()
 
 # ── Example binary ────────────────────────────────────────────────────────────
 add_executable(poker_ppo src/main.cpp)

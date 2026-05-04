@@ -7,12 +7,10 @@
 
 namespace poker_ppo {
 
-// Two-player zero-sum self-play poker env. One hand per instance. The
-// observation vector is from the acting player's perspective; reward is
-// from player 1's perspective (player 2 gets -reward). Action 0=Fold,
-// 1=Check/Call, 2..2+N=raises per BetConfig (mask all raises once the
-// player hits max_bets_per_round).
-
+// Two-player zero-sum self-play poker env. One hand per instance.
+// Obs is from the acting player's perspective; reward is in player 1's
+// frame (player 2 negates). Action 0=Fold, 1=Check/Call, 2..2+N=raises;
+// raises mask out once max_bets_per_round is reached.
 class IPokerEnvironment {
 public:
     virtual ~IPokerEnvironment() = default;
@@ -35,9 +33,8 @@ public:
     virtual std::unique_ptr<IPokerEnvironment> create(const BetConfig& cfg) = 0;
 };
 
-// Owns N independent envs and runs them in lockstep on a single thread —
-// these games are tiny enough that batched-inference dominates step time.
-
+// N independent envs stepped lockstep on one thread. Game step is cheap
+// enough that batched inference dominates.
 class VectorizedEnv {
 public:
     VectorizedEnv(IPokerEnvironmentFactory& factory,
@@ -48,36 +45,29 @@ public:
     int  obs_dim()      const { return envs_[0]->obs_dim(); }
     int  action_count() const { return envs_[0]->bet_config().action_count(); }
 
-    /// Reset all environments.  Returns stacked observations [num_envs, obs_dim].
     torch::Tensor reset_all();
 
-    /// Step each environment with its corresponding action.
-    /// actions: vector of int, length num_envs.
-    /// Returns: observations [N, obs_dim], rewards [N], dones [N], masks [N, A].
     struct BatchStepResult {
-        torch::Tensor observations;      // [N, obs_dim]
-        torch::Tensor rewards;           // [N]
-        torch::Tensor dones;             // [N]  float (0/1)
+        torch::Tensor observations;       // [N, obs_dim]
+        torch::Tensor rewards;            // [N]
+        torch::Tensor dones;              // [N]  float (0/1)
         torch::Tensor legal_action_masks; // [N, action_count]
-        torch::Tensor current_players;   // [N]  int (0 or 1)
+        torch::Tensor current_players;    // [N]  int (0 or 1)
     };
     BatchStepResult step(const std::vector<int>& actions);
 
-    /// Access individual envs (e.g. for current_player queries).
     IPokerEnvironment& env(int i) { return *envs_[i]; }
-
-    /// Raw access to the owning vector of envs
     std::vector<std::unique_ptr<IPokerEnvironment>>& envs_mut() { return envs_; }
 
 private:
     std::vector<std::unique_ptr<IPokerEnvironment>> envs_;
 
-    // Pre-allocated CPU output tensors — reused every step to avoid heap allocs
-    torch::Tensor obs_buf_;      // [N, obs_dim]
-    torch::Tensor rewards_buf_;  // [N]
-    torch::Tensor dones_buf_;    // [N]
-    torch::Tensor masks_buf_;    // [N, A]
-    torch::Tensor players_buf_;  // [N]  int32
+    // Pre-allocated CPU buffers, reused every step.
+    torch::Tensor obs_buf_;
+    torch::Tensor rewards_buf_;
+    torch::Tensor dones_buf_;
+    torch::Tensor masks_buf_;
+    torch::Tensor players_buf_;
 };
 
 } // namespace poker_ppo

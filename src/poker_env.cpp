@@ -17,8 +17,8 @@ PokerEnvironment::PokerEnvironment(const PokerConfig& poker_cfg,
       rng_(seed),
       game_betting_cfg_(::Game::make_default_betting_config(poker_cfg.game)),
       game_(std::make_unique<::Game::DiscreteGame>(rng_, poker_cfg.game, game_betting_cfg_)),
-      // Norms: stack_norm = initial_stack, pot_norm = 2*initial_stack so
-      // both sit in roughly [0, 1]; max_raises_norm guards against div-by-0.
+      // stack_norm = initial_stack, pot_norm = 2*initial_stack so both
+      // sit in ~[0, 1]. max_raises_norm guards against div-by-0.
       obs_builder_(
           poker_cfg.hist,
           poker_cfg.round_summary,
@@ -40,10 +40,8 @@ PokerEnvironment::PokerEnvironment(const PokerConfig& poker_cfg,
         ? 2 + static_cast<int>(gcfg.pot_fractions.size())
         : -1;
 
-    // Reward is scaled separately from the obs so per-hand rewards land
-    // in O(0.1) range (≈ utility_in_mbb / 10·big_blind). Avoids both
-    // vanishing gradients (stack-normalised) and mode collapse
-    // (big_blind-normalised).
+    // Reward scaling lands per-hand rewards in O(0.1) — avoids vanishing
+    // gradients (stack-normalised) and mode collapse (BB-normalised).
     reward_norm_ = 10.0f * static_cast<float>(gcfg.big_blind);
 
     action_table_.assign(A_, std::nullopt);
@@ -52,8 +50,6 @@ PokerEnvironment::PokerEnvironment(const PokerConfig& poker_cfg,
 int PokerEnvironment::current_player() const {
     return game_->getCurrentPlayer();
 }
-
-// ── public state accessors ─────────────────────────────────────────────────
 
 std::array<int, 2> PokerEnvironment::hole_cards(int player) const {
     auto h = game_->getContext().getHoleCards(player);
@@ -90,8 +86,6 @@ bool PokerEnvironment::is_terminal() const {
 }
 
 int PokerEnvironment::obs_dim() const {
-    // Defined here for completeness even though the inline override in
-    // poker_env.h would suffice — kept for docstring locality.
     return obs_builder_.obs_dim();
 }
 
@@ -124,8 +118,8 @@ StepResult PokerEnvironment::step(int action_idx) {
     const int seat_before  = game_->getCurrentPlayer();
     const int round_before = game_->getContext().getRoundNumber();
 
-    // Record the action into the bet-history sequence *before*
-    // transitioning, so player and round reflect the pre-step state.
+    // Record into bet_history before transition so player/round reflect
+    // the pre-step state.
     {
         BetHistoryEntry e{};
         e.player = static_cast<uint8_t>(seat_before);
@@ -155,9 +149,8 @@ StepResult PokerEnvironment::step(int action_idx) {
     }
 
     if (game_->isTerminal()) {
-        // Terminal reward for seat 0 in mbb / reward_norm.
         const float r = static_cast<float>(game_->getUtility(0)) / reward_norm_;
-        // Obs/mask are unused after terminal; PPO calls reset() next.
+        // Obs/mask unused after terminal; PPO resets next.
         auto obs  = torch::zeros({obs_builder_.obs_dim()});
         auto mask = torch::zeros({A_});
         return { obs, r, true, mask };
@@ -166,8 +159,6 @@ StepResult PokerEnvironment::step(int action_idx) {
     rebuild_action_table();
     return { observation(), 0.0f, false, compute_mask() };
 }
-
-// ── internals ────────────────────────────────────────────────────────────────
 
 void PokerEnvironment::auto_advance_chance() {
     while (!game_->isTerminal() && game_->getType() == "chance") {
@@ -208,8 +199,6 @@ void PokerEnvironment::rebuild_action_table() {
                 if (!matched && allin_slot_ >= 0) {
                     action_table_[allin_slot_] = act;
                 }
-            } else {
-                // Chance never appears in an action state; ignore.
             }
         }, act);
     }

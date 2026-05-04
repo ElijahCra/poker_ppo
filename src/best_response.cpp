@@ -73,9 +73,8 @@ BestResponseEvaluator::evaluate(const ActorCritic& target,
     float  best_bb        = -std::numeric_limits<float>::infinity();
 
     for (int s = 0; s < num_seeds; ++s) {
-        // Multi-seed always re-inits (each seed must be independent for the
-        // max-over-seeds bound to be meaningful). Single-seed honours
-        // warm_start.
+        // Multi-seed always re-inits — seeds must be independent for the
+        // max-over-seeds bound to mean anything.
         if (multi_seed || !cfg_.warm_start || !warm_started_) {
             init_exploiter();
             warm_started_ = true;
@@ -97,7 +96,6 @@ BestResponseEvaluator::evaluate(const ActorCritic& target,
         }
     }
 
-    // ── Aggregate across seeds ─────────────────────────────────────────
     float bb_sum = 0.0f;
     float bb_min = std::numeric_limits<float>::infinity();
     for (float x : bb_per_seed) {
@@ -113,7 +111,7 @@ BestResponseEvaluator::evaluate(const ActorCritic& target,
     r.update         = update;
     r.global_step    = global_step;
     r.br_updates_run = cfg_.updates_per_eval;
-    // Best-seed (= max-bb) stats: this is the tightest measured lower bound.
+    // Best seed = tightest measured lower bound.
     r.num_hands      = best_num_hands;
     r.avg_reward_a   = best_num_hands > 0
                        ? static_cast<float>(best_total_rew / best_num_hands) : 0.0f;
@@ -126,14 +124,9 @@ BestResponseEvaluator::evaluate(const ActorCritic& target,
     r.bb_per_hand_min  = bb_min;
     r.bb_per_hand_std  = bb_std;
     r.wall_ms        = ms(clock::now() - t0).count();
-    (void)best_idx;  // tracked above but not exposed; kept for future use
+    (void)best_idx;
     return r;
 }
-
-// run_one_seed — train the (already-initialised) exploiter for
-// cfg_.updates_per_eval PPO updates against the frozen target, then run the
-// eval-match. The caller (evaluate) is responsible for initialising the
-// exploiter before each call so different seeds are independent.
 
 BestResponseEvaluator::EvalStats
 BestResponseEvaluator::run_one_seed(ActorCritic& frozen_target) {
@@ -144,12 +137,10 @@ BestResponseEvaluator::run_one_seed(ActorCritic& frozen_target) {
     auto f_cpu   = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
     auto i32_cpu = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU);
 
-    // Per-env exploiter seat — alternates per episode for position bias
-    // cancellation. HU NLHE is asymmetric (BB vs SB).
+    // Alternate per episode to cancel BB/SB position bias.
     std::vector<int> exploiter_seat(N);
     for (int i = 0; i < N; ++i) exploiter_seat[i] = i % 2;
 
-    // Reset all envs and seed carry state.
     auto carry_obs    = torch::zeros({N, D}, f_cpu);
     auto carry_mask   = torch::zeros({N, A}, f_cpu);
     auto carry_player = torch::zeros({N},    i32_cpu);
@@ -166,7 +157,6 @@ BestResponseEvaluator::run_one_seed(ActorCritic& frozen_target) {
     int    wins = 0, ties = 0;
 
     for (int update_i = 0; update_i < cfg_.updates_per_eval; ++update_i) {
-        // ── ROLLOUT ──────────────────────────────────────────────────────
         exploiter_->eval();
         frozen_target->eval();
         buffer_->clear();
@@ -180,11 +170,9 @@ BestResponseEvaluator::run_one_seed(ActorCritic& frozen_target) {
         {
             torch::NoGradGuard ng;
             for (int step = 0; step < cfg_.num_steps; ++step) {
-                // Forward both networks on the full batch — wasteful (one of
-                // the two outputs is unused per env), but simpler than
-                // splitting the batch by acting seat. The cost is dominated
-                // by env stepping for this small MLP, and BR runs only
-                // every `eval_every` main updates anyway.
+                // Forward both networks on the full batch. Wasteful (one
+                // output is unused per env) but simpler than splitting
+                // by acting seat, and env stepping dominates anyway.
                 auto er = exploiter_->get_action(cur_obs, cur_mask);
                 auto tr = frozen_target->get_action(cur_obs, cur_mask);
 
@@ -215,13 +203,13 @@ BestResponseEvaluator::run_one_seed(ActorCritic& frozen_target) {
                     int64_t action;
                     if (exploiter_acting) {
                         action = ea[i];
-                        // Record only the exploiter's transitions.
+                        // Only record exploiter transitions.
                         player_state[i].record_step(
                             acting, i, *buffer_,
                             cur_obs_cpu[i], cur_mask_cpu[i],
                             ea[i], el[i], ev[i]);
                     } else {
-                        action = ta[i];  // target acts; not recorded
+                        action = ta[i];
                     }
 
                     auto res = envs_[i]->step(static_cast<int>(action));
@@ -230,8 +218,6 @@ BestResponseEvaluator::run_one_seed(ActorCritic& frozen_target) {
                     if (res.done) {
                         player_state[i].flush_on_terminal(i, *buffer_);
 
-                        // Track per-hand reward from the exploiter's
-                        // perspective for the bb/hand metric.
                         const float exp_r =
                             (exploiter_seat[i] == 0) ? res.reward : -res.reward;
                         total_reward += exp_r;
@@ -243,7 +229,7 @@ BestResponseEvaluator::run_one_seed(ActorCritic& frozen_target) {
                         next_obs[i]   = rr.observation;
                         next_mask[i]  = rr.legal_action_mask;
                         np[i]         = static_cast<int32_t>(envs_[i]->current_player());
-                        // Alternate exploiter seat after each completed hand.
+                        // Alternate seats per hand.
                         exploiter_seat[i] = 1 - exploiter_seat[i];
                     } else {
                         next_obs[i]   = res.observation;
@@ -257,31 +243,25 @@ BestResponseEvaluator::run_one_seed(ActorCritic& frozen_target) {
                 cur_player = next_player.to(device_);
             }
 
-            // Drain pending pendings (truncated tails).
             for (int i = 0; i < N; ++i)
                 player_state[i].flush_on_rollout_end(i, *buffer_);
         }
 
-        // Truncated tails are bootstrapped at V_next = 0 (treat as terminal).
-        // Rationale: the exploiter's value head is trained only on
-        // exploiter-acting states; its V at the carry_obs is OOD when the
-        // target is about to act, so a clean V=0 bootstrap avoids injecting
-        // garbage signal at the tail. This biases the very last transition
-        // per (player, env) track, but that's at most one transition out of
-        // many in a num_steps=128 rollout.
+        // Treat truncated tails as terminals (V_next = 0). The exploiter's
+        // value head is only trained on exploiter-acting states, so V at
+        // a target-acting carry_obs is OOD — V=0 avoids injecting garbage.
+        // Biases ≤ 1 tail transition per (player, env) per rollout.
         auto bs_values   = torch::zeros({2, N}, f_cpu);
-        auto bs_terminal = torch::zeros({2, N}, f_cpu);  // 0 = treat as truncation
-        // Set terminal=1 so compute_returns picks the V=0 branch outright.
+        auto bs_terminal = torch::zeros({2, N}, f_cpu);
         bs_terminal.fill_(1.0f);
         buffer_->compute_returns(cfg_.gamma, cfg_.gae_lambda,
                                  bs_values, bs_terminal);
 
-        // Roll the carry tensors forward for the next rollout.
         carry_obs    = cur_obs.to(torch::kCPU);
         carry_mask   = cur_mask.to(torch::kCPU);
         carry_player = cur_player.to(torch::kCPU).contiguous();
 
-        // ── PPO UPDATE on exploiter ──────────────────────────────────────
+        // PPO update on the exploiter.
         exploiter_->train();
         auto batch = buffer_->flatten();
         const int B = static_cast<int>(batch.obs.size(0));
@@ -292,7 +272,7 @@ BestResponseEvaluator::run_one_seed(ActorCritic& frozen_target) {
         auto& b_obs     = batch.obs;
         auto& b_actions = batch.actions;
         auto& b_logp    = batch.log_probs;
-        auto  b_adv     = batch.advantages;  // by-value: we mutate via norm
+        auto  b_adv     = batch.advantages;  // copy: normalisation mutates it
         auto& b_ret     = batch.returns;
         auto& b_val     = batch.values;
         auto& b_masks   = batch.legal_masks;
@@ -351,20 +331,15 @@ BestResponseEvaluator::run_one_seed(ActorCritic& frozen_target) {
         }
     }
 
-    // ── POST-TRAINING EVAL ──────────────────────────────────────────────
-    // Run a deterministic, no-learning match between the trained exploiter
-    // and the frozen target — this is the canonical BR measurement.
-    // Averaging the exploiter's *training* rewards biases the bound
-    // downward because it includes the early-rollout phase when the
-    // exploiter is still randomly initialised. The post-training match
-    // measures only the trained exploiter's bb/hand, matching the spirit
-    // of the paper's "average over the last few network updates" reporting
-    // (Timbers et al. 2020, Section 4).
+    // Post-training eval match. Averaging training rewards would bias
+    // the bound downward (early-training exploiter plays badly); the
+    // match measures only the trained exploiter — matches the spirit of
+    // Timbers et al. (2020) §4's "last few updates" reporting.
     EvalStats es;
     if (cfg_.eval_hands > 0) {
         es = eval_match(frozen_target);
     } else {
-        // Fallback: use training-time stats (looser bound; debug only).
+        // Looser bound; debug only.
         es.num_hands    = total_hands;
         es.wins         = wins;
         es.ties         = ties;
@@ -373,11 +348,8 @@ BestResponseEvaluator::run_one_seed(ActorCritic& frozen_target) {
     return es;
 }
 
-// eval_match — the trained exploiter vs the frozen target, no learning, no
-// recording. Partitions envs by acting seat each step (as League does) so
-// each network forwards only on the sub-batch that needs its decision —
-// avoids running both networks redundantly on every env.
-
+// Trained exploiter vs frozen target, no learning. Partitions envs by
+// acting seat (like League) so each net forwards only on its sub-batch.
 BestResponseEvaluator::EvalStats
 BestResponseEvaluator::eval_match(ActorCritic& target) {
     EvalStats stats{};
@@ -393,7 +365,6 @@ BestResponseEvaluator::eval_match(ActorCritic& target) {
     target->eval();
     torch::NoGradGuard ng;
 
-    // Reset envs and seed per-env state.
     std::vector<int> exploiter_seat(N);
     auto cur_obs    = torch::zeros({N, D}, f_cpu);
     auto cur_mask   = torch::zeros({N, A}, f_cpu);
@@ -404,10 +375,9 @@ BestResponseEvaluator::eval_match(ActorCritic& target) {
         cur_mask[i]   = rr.legal_action_mask;
         cur_player.accessor<int32_t, 1>()[i] =
             static_cast<int32_t>(envs_[i]->current_player());
-        exploiter_seat[i] = i % 2;  // initial seat alternation
+        exploiter_seat[i] = i % 2;
     }
 
-    // Reusable [N, ·] sub-batch staging tensors.
     auto sub_obs  = torch::zeros({N, D}, f_cpu);
     auto sub_mask = torch::zeros({N, A}, f_cpu);
 

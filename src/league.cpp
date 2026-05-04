@@ -33,17 +33,14 @@ void League::add_anchor(std::unique_ptr<IPolicy> policy) {
 }
 
 void League::add_default_anchors() {
-    // 1. Uniform-over-legal-actions: principled "no information" baseline.
+    // No-info baseline.
     add_anchor(std::make_unique<UniformPolicy>());
 
-    // 2. Random-init network: exercises the same architecture but with the
-    //    orthogonal init the trainer starts from.  Beating this proves the
-    //    optimisation moved away from the random-init manifold, not just that
-    //    we beat noise.
+    // Same architecture, orthogonal-init weights — beating this proves
+    // training moved off the random-init manifold (vs. just beating noise).
     add_anchor(std::make_unique<NetworkPolicy>(
         make_random_network(), device_, "random_init"));
 
-    // 3-5. Rule-based anchors (no network, deterministic).
     add_anchor(std::make_unique<AlwaysCallPolicy>());
     add_anchor(std::make_unique<AlwaysRaisePolicy>());
     add_anchor(std::make_unique<PairAllInPolicy>());
@@ -90,15 +87,11 @@ League::MatchResult League::play_match(IPolicy& a, IPolicy& b) {
     mr.action_counts_a.assign(action_count_, 0);
     if (P <= 0 || target <= 0) return mr;
 
-    // ── set up parallel environments ────────────────────────────────────
     std::vector<std::unique_ptr<IPokerEnvironment>> envs;
     envs.reserve(P);
     for (int i = 0; i < P; ++i) envs.push_back(factory_.create(bet_cfg_));
 
-    // Alternate seat assignment so A plays seat 0 in half of envs and seat 1
-    // in the other half; flip after every completed hand for further bias
-    // cancellation.  Heads-up NLHE is positionally asymmetric (BB / SB) so
-    // bias cancellation matters.
+    // Alternate seats and flip after each hand so HU NLHE position bias cancels.
     std::vector<int> a_seat(P);
     for (int i = 0; i < P; ++i) a_seat[i] = i % 2;
 
@@ -113,12 +106,11 @@ League::MatchResult League::play_match(IPolicy& a, IPolicy& b) {
     int    wins_a = 0, losses_a = 0, ties_a = 0;
     int    hands_done = 0;
 
-    // Reusable [P, ·] CPU staging tensors — IPolicy contract takes CPU input.
+    // IPolicy takes CPU input.
     auto obs_buf  = torch::zeros({P, obs_dim_},      torch::kFloat32);
     auto mask_buf = torch::zeros({P, action_count_}, torch::kFloat32);
 
     while (hands_done < target) {
-        // Partition envs by which policy must act this step.
         std::vector<int> a_idxs, b_idxs;
         a_idxs.reserve(P); b_idxs.reserve(P);
         for (int i = 0; i < P; ++i) {
@@ -147,19 +139,18 @@ League::MatchResult League::play_match(IPolicy& a, IPolicy& b) {
         run_batch(a, a_idxs);
         run_batch(b, b_idxs);
 
-        // Tally A's chosen actions for the mode-collapse diagnostic.
+        // Mode-collapse diagnostic.
         for (int idx : a_idxs) {
             const int act = actions[idx];
             if (act >= 0 && act < action_count_) ++mr.action_counts_a[act];
         }
 
-        // Step each env with its selected action; close out finished hands.
         for (int i = 0; i < P; ++i) {
             if (hands_done >= target) break;
 
             auto r = envs[i]->step(actions[i]);
             if (r.done) {
-                // Env reward is from seat 0's perspective; flip if A is seat 1.
+                // Env reward is in seat 0's frame; flip when A is seat 1.
                 const float raw      = r.reward;
                 const float a_reward = (a_seat[i] == 0) ? raw : -raw;
                 total_reward_a += a_reward;
@@ -189,8 +180,7 @@ League::MatchResult League::play_match(IPolicy& a, IPolicy& b) {
 
 std::vector<League::MatchResult>
 League::evaluate(const ActorCritic& trained) {
-    // Snapshot the trained net so subsequent training updates can't race with
-    // play_match's forward calls.
+    // Snapshot so further training can't race with play_match's forwards.
     NetworkPolicy trained_pol(clone_network(trained), device_, "trained");
 
     std::vector<MatchResult> out;
@@ -203,7 +193,7 @@ League::evaluate(const ActorCritic& trained) {
 
 void League::print_results(const std::vector<MatchResult>& rs,
                            std::ostream& os) const {
-    // Sort descending by bb/hand for at-a-glance reading.
+    // Sorted descending by bb/hand.
     std::vector<int> order(rs.size());
     for (size_t i = 0; i < rs.size(); ++i) order[i] = static_cast<int>(i);
     std::sort(order.begin(), order.end(),
@@ -216,7 +206,7 @@ void League::print_results(const std::vector<MatchResult>& rs,
     for (int idx : order) {
         const auto& r = rs[idx];
 
-        // Top-action share — flag if >90%.
+        // Flag if any one action is >90% of the policy's choices.
         int64_t total = 0, top = 0;
         for (auto c : r.action_counts_a) { total += c; if (c > top) top = c; }
         const float top_pct = (total > 0)

@@ -1,7 +1,7 @@
 #pragma once
 //
-//  metrics_logger.h — append PPO/league/BR metrics to per-run CSVs.
-//  tools/plot_live.py tails these for live training curves.
+// Append PPO/league/BR metrics to per-run CSVs. tools/plot_live.py tails
+// these for live training curves.
 //
 
 #include "best_response.h"
@@ -17,20 +17,18 @@ namespace poker_ppo {
 
 class MetricsLogger {
 public:
-    // Creates `run_dir` (and parents) if missing, then opens the two CSVs
-    // and writes their header rows.
+    // Creates run_dir (and parents) if missing, opens CSVs, writes headers.
     explicit MetricsLogger(const std::string& run_dir);
     ~MetricsLogger();
 
-    // High-frequency: one row per PPO update.
+    // One row per PPO update.
     void log_update(const PPOTrainer::UpdateStats& s);
 
-    // Sparse: one row per (snapshot, anchor) pair.  Long format, so adding a
-    // new anchor doesn't require a schema migration.
+    // One row per (snapshot, anchor). Long format so adding an anchor
+    // doesn't need a schema migration.
     void log_league(int update, int global_step,
                     const std::vector<League::MatchResult>& results);
 
-    // Sparse: one row per BR evaluation.
     void log_best_response(const BestResponseEvaluator::Result& r);
 
     const std::string& run_dir() const { return run_dir_; }
@@ -40,12 +38,12 @@ private:
     std::ofstream metrics_;
     std::ofstream league_;
     std::ofstream br_;
-    // Both CSVs may be written from different threads (e.g. background eval).
-    // Serialise so a partial-line interleave can't corrupt the file.
+    // CSVs may be written from background eval threads — serialise to
+    // avoid partial-line interleaving.
     std::mutex    mu_;
 };
 
-// Convenience: returns "runs/YYYYMMDD_HHMMSS" using local time.
+// "runs/YYYYMMDD_HHMMSS" using local time.
 std::string make_run_dir();
 
 }  // namespace poker_ppo

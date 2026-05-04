@@ -37,7 +37,9 @@
       "Read(//tmp/**)",
       "Bash(grep -n -E \"^\\(//\\\\s*\\(═|─\\){8,}|// ─── |// ═══ \\)\" --include=\"*.h\" --include=\"*.hpp\" --include=\"*.cpp\" /Users/elijahcrain/CLionProjects/ppo_poker/include/policy.h /Users/elijahcrain/CLionProjects/ppo_poker/include/types.h /Users/elijahcrain/CLionProjects/ppo_poker/include/network.h /Users/elijahcrain/CLionProjects/ppo_poker/include/rollout_buffer.h /Users/elijahcrain/CLionProjects/ppo_poker/include/config.h)",
       "Bash(awk 'NR==27 || NR==29' /Users/elijahcrain/CLionProjects/ppo_poker/include/config.h)",
-      "Bash(grep -n -E \"^// [A-Z][a-zA-Z ]+$\" --include=\"*.h\" --include=\"*.hpp\" --include=\"*.cpp\" -r /Users/elijahcrain/CLionProjects/ppo_poker/include /Users/elijahcrain/CLionProjects/ppo_poker/src /Users/elijahcrain/CLionProjects/ppo_poker/Game/Utility/HandStrength.hpp)"
+      "Bash(grep -n -E \"^// [A-Z][a-zA-Z ]+$\" --include=\"*.h\" --include=\"*.hpp\" --include=\"*.cpp\" -r /Users/elijahcrain/CLionProjects/ppo_poker/include /Users/elijahcrain/CLionProjects/ppo_poker/src /Users/elijahcrain/CLionProjects/ppo_poker/Game/Utility/HandStrength.hpp)",
+      "Bash(cmake ..)",
+      "Bash(wsl bash *)"
     ]
   }
 }

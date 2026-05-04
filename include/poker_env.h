@@ -1,6 +1,6 @@
 #pragma once
 
-#include "config.h"          // PokerConfig + kPokerConfig live here
+#include "config.h"
 #include "environment.h"
 #include "observation_builder.h"
 #include "Game.hpp"
@@ -14,20 +14,14 @@
 
 namespace poker_ppo {
 
-// PokerEnvironment — wraps Game::DiscreteGame (HU NLHE) in the
-// IPokerEnvironment interface. Construction knobs come from PokerConfig
-// (config.h). Auto-advances through ChanceState transitions, so PPO only
-// sees ActionState or terminal snapshots.
+// Action space:
+//   0                       Fold
+//   1                       Check / Call
+//   2 .. 1+K                K pot-fraction raises from PokerConfig
+//   2+K  (if allow_all_in)  All-in raise (only when distinct)
 //
-// Action space (indices into the PPO policy's categorical):
-//   0                       → Fold
-//   1                       → Check or Call (whichever is legal)
-//   2 .. 1+K                → K pot-fraction raises from PokerConfig
-//   2+K  (if allow_all_in)  → All-in raise (only when distinct)
-//
-// Reward: the terminal reward is seat-0's utility delta in mbb,
-// normalised by 10·big_blind. PPO handles the sign-flip for seat 1.
-
+// Terminal reward: seat-0 utility delta in mbb / (10 * big_blind).
+// PPO handles the sign flip for seat 1.
 class PokerEnvironment : public IPokerEnvironment {
 public:
     PokerEnvironment(const PokerConfig& poker_cfg,
@@ -45,9 +39,7 @@ public:
     torch::Tensor legal_action_mask() const override;
     bool is_terminal() const override;
 
-    // ── public state accessors (used by the interactive play CLI) ──────
-    // All values are in mbb (millibigblinds) where applicable, matching
-    // the game engine's internal units.
+    // State accessors used by the play CLI. mbb where applicable.
     std::array<int, 2> hole_cards(int player) const;
     int community_count() const;
     int community_card(int idx) const;
@@ -56,7 +48,7 @@ public:
     int stack(int player) const;
     int round() const;
     int raise_num() const;
-    /// Terminal utility for `player` in mbb. Undefined if !is_terminal().
+    // Undefined if !is_terminal().
     int terminal_utility(int player) const;
     const ::Game::DefaultGameConfig& game_config() const { return poker_cfg_.game; }
 
@@ -71,19 +63,15 @@ private:
     ::Game::DefaultBettingConfig          game_betting_cfg_;
     std::unique_ptr<::Game::DiscreteGame> game_;
 
-    // Obs construction is delegated to ObservationBuilder. The env owns
-    // the bet-history buffer + the layout/normalisers; the builder owns
-    // the per-tensor write logic.
     ObservationBuilder obs_builder_;
 
     int   A_              = 0;
     int   allin_slot_     = -1;     // -1 if disabled
-    float reward_norm_    = 1.0f;   // = 10 * big_blind; terminal-reward scaling
+    float reward_norm_    = 1.0f;   // 10 * big_blind
 
-    // PPO-action-index → Poker Action, or nullopt if illegal this state.
+    // PPO action index → Game::Action, or nullopt if illegal in current state.
     std::vector<std::optional<::Game::Action>> action_table_;
 
-    // Hand-level bet history (cleared on reset, appended in step).
     std::vector<BetHistoryEntry> bet_history_;
 };
 

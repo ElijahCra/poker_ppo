@@ -77,13 +77,8 @@ void PPOTrainer::train() {
     const int total_updates = cfg_.num_updates();
 
     for (update_idx_ = 0; update_idx_ < total_updates; ++update_idx_) {
-        // Anneal learning rate. Linear from `learning_rate` at update 0 down
-        // to `learning_rate * min_lr_frac` at the final update — the floor
-        // avoids the dead-final-quarter where lr ≈ 0 and updates stop moving
-        // the policy. Gated on `if constexpr` so the entire scheduler block
-        // is dead-code-eliminated when `cfg_.anneal_lr == false` at compile
-        // time (the optimiser then runs at the configured `learning_rate`
-        // for the whole run with no per-update branch).
+        // Linear LR anneal with min_lr_frac floor — without the floor the
+        // last quarter of training does ~no learning.
         if constexpr (cfg_.anneal_lr) {
             const float frac = 1.0f - static_cast<float>(update_idx_) / total_updates;
             constexpr float floor_frac = cfg_.min_lr_frac > 0.0f ? cfg_.min_lr_frac : 0.0f;
@@ -120,15 +115,10 @@ void PPOTrainer::train() {
             std::cout << "\n";
         }
 
-        // Snapshot the post-update weights into the opponent pool. No-op
-        // when disabled or off the snapshot cadence.
         opp_mgr_->maybe_snapshot(update_idx_, network_);
     }
 }
 
-// Rollout entry points — thin shims around RolloutCollector::collect, kept
-// so external callers (benchmarks, tests) don't need to know about
-// OpponentManager.
 void PPOTrainer::collect_rollout_serial() {
     collector_->collect(Strategy::Serial, network_, *opp_mgr_,
                         update_idx_, cfg_.gamma, cfg_.gae_lambda);
@@ -139,8 +129,6 @@ void PPOTrainer::collect_rollout_threadpool() {
                         update_idx_, cfg_.gamma, cfg_.gae_lambda);
 }
 
-// Generic N-way interleaved benchmark. Iters of each strategy are interleaved
-// per round so they all see a similar distribution of env states / cache temp.
 PPOTrainer::BenchmarkResult
 PPOTrainer::benchmark_strategies(
     const std::vector<std::pair<std::string, RolloutFn>>& strategies,
@@ -152,7 +140,7 @@ PPOTrainer::benchmark_strategies(
     opp_mgr_->reset_assignments(cfg_.num_envs);
 
     const int saved_update_idx = update_idx_;
-    update_idx_ = 1;  // not a multiple of 10 — silences the train()-style log
+    update_idx_ = 1;  // not %10 — silences the train() log
 
     auto run_one = [&](const RolloutFn& fn) {
         auto t0 = clock::now();
@@ -160,7 +148,7 @@ PPOTrainer::benchmark_strategies(
         return ms(clock::now() - t0).count();
     };
 
-    // Interleaved warmup so caches/threads stabilise for every path.
+    // Interleaved warmup so each path stabilises caches/threads.
     for (int i = 0; i < warmup; ++i) {
         for (const auto& s : strategies) s.second(*this);
     }
@@ -168,6 +156,7 @@ PPOTrainer::benchmark_strategies(
     std::vector<std::vector<double>> samples(strategies.size());
     for (auto& v : samples) v.reserve(iters);
 
+    // Interleave per-iter so paths see a similar env state distribution.
     for (int i = 0; i < iters; ++i) {
         for (size_t s = 0; s < strategies.size(); ++s) {
             samples[s].push_back(run_one(strategies[s].second));
@@ -197,8 +186,7 @@ PPOTrainer::benchmark_strategies(
     }
 
     if (verbose) {
-        // Use the slowest median as the speedup baseline so every printed
-        // multiplier is ≥ 1×.
+        // Slowest median = baseline → all printed multipliers are ≥ 1×.
         const auto* slowest = &r.by_strategy.front().second;
         for (const auto& kv : r.by_strategy)
             if (kv.second.median_ms > slowest->median_ms) slowest = &kv.second;
@@ -228,7 +216,6 @@ PPOTrainer::benchmark_strategies(
     return r;
 }
 
-// Convenience wrapper: A/B-time the two built-in strategies.
 PPOTrainer::BenchmarkResult
 PPOTrainer::benchmark_rollouts(int iters, int warmup, bool verbose) {
     return benchmark_strategies({
@@ -244,7 +231,6 @@ PPOTrainer::UpdateStats PPOTrainer::update() {
     auto batch   = buffer.flatten();
     int  B       = batch.obs.size(0);
 
-    // Buffer already lives on device — no copy needed
     auto& b_obs     = batch.obs;
     auto& b_actions = batch.actions;
     auto& b_logp    = batch.log_probs;
@@ -261,12 +247,9 @@ PPOTrainer::UpdateStats PPOTrainer::update() {
     auto total_clip_frac   = torch::zeros({}, stat_opts);
     int  num_updates = 0;
 
-    // Cosine-anneal the entropy coefficient if enabled. Held constant across
-    // all minibatches of *this* update (only changes between updates), so the
-    // PPO loss within an update is well-defined. ent(t) starts at
-    // cfg_.ent_coef and decays toward cfg_.ent_coef_min over total updates.
-    // `if constexpr` strips the cosine block when anneal is off — we then
-    // return cfg_.ent_coef as a literal.
+    // Cosine entropy decay. Held constant across this update's
+    // minibatches (only changes between updates) so the loss is well
+    // defined within an update.
     const float ent_coef_now = [&]() {
         if constexpr (!cfg_.anneal_ent_coef) {
             return cfg_.ent_coef;
@@ -282,7 +265,6 @@ PPOTrainer::UpdateStats PPOTrainer::update() {
     }();
 
     for (int epoch = 0; epoch < cfg_.update_epochs; ++epoch) {
-        // Shuffle
         auto indices = torch::randperm(B, torch::TensorOptions().dtype(torch::kInt64).device(device_));
 
         for (int start = 0; start < B; start += cfg_.minibatch_size()) {
@@ -297,9 +279,6 @@ PPOTrainer::UpdateStats PPOTrainer::update() {
             auto mb_val     = b_val.index_select(0, mb_idx);
             auto mb_masks   = b_masks.index_select(0, mb_idx);
 
-            // Normalise advantages. Gated on `if constexpr` so when
-            // `cfg_.norm_advantages` is false at build time the entire
-            // mean/std/divide block is stripped.
             if constexpr (cfg_.norm_advantages) {
                 if (mb_adv.size(0) > 1) {
                     mb_adv = (mb_adv - mb_adv.mean()) /
@@ -307,11 +286,9 @@ PPOTrainer::UpdateStats PPOTrainer::update() {
                 }
             }
 
-            // Actor forward: get new log_probs and entropy for stored actions
-            // Critic forward: get new value estimates
             auto er = network_->evaluate(mb_obs, mb_masks, mb_actions);
 
-            // ── policy loss (clipped surrogate) ─────────────────────
+            // Clipped surrogate.
             auto logratio = er.log_prob - mb_logp;
             auto ratio    = logratio.exp();
 
@@ -320,11 +297,8 @@ PPOTrainer::UpdateStats PPOTrainer::update() {
                 ratio, 1.0f - cfg_.clip_coef, 1.0f + cfg_.clip_coef);
             auto pg_loss  = torch::max(pg_loss1, pg_loss2).mean();
 
-            // ── value loss ──────────────────────────────────────────
-            // Gated on `if constexpr` so only one of the two branches
-            // makes it into the binary — the dispatcher is gone too,
-            // which is meaningful per minibatch (4 epochs × 4 MBs per
-            // update = 16 calls of dead overhead per update otherwise).
+            // 16 minibatches per update — branch in the binary is worth
+            // killing via if constexpr.
             torch::Tensor v_loss;
             if constexpr (cfg_.clip_vloss) {
                 auto v_clipped = mb_val + torch::clamp(
@@ -338,10 +312,8 @@ PPOTrainer::UpdateStats PPOTrainer::update() {
                 v_loss = 0.5f * (er.value - mb_ret).pow(2).mean();
             }
 
-            // ── entropy bonus ───────────────────────────────────────
             auto entropy_loss = er.entropy.mean();
 
-            // ── total loss ──────────────────────────────────────────
             auto loss = pg_loss
                       - ent_coef_now * entropy_loss
                       + cfg_.vf_coef * v_loss;
@@ -351,7 +323,7 @@ PPOTrainer::UpdateStats PPOTrainer::update() {
             torch::nn::utils::clip_grad_norm_(network_->parameters(), cfg_.max_grad_norm);
             optimizer_->step();
 
-            // ── stats (accumulate on device; .item() called once after loop) ──
+            // Accumulate on device; one .item() sync after the loop.
             {
                 torch::NoGradGuard ng;
                 total_policy_loss += pg_loss.detach();
@@ -365,7 +337,6 @@ PPOTrainer::UpdateStats PPOTrainer::update() {
         }
     }
 
-    // ── explained variance ──────────────────────────────────────────────
     float explained_var;
     {
         torch::NoGradGuard ng;
@@ -376,18 +347,15 @@ PPOTrainer::UpdateStats PPOTrainer::update() {
             : 1.0f - var_e.item<float>() / (var_y.item<float>() + kAdvantageEps);
     }
 
-    // ── return stats; train() fills in timings and invokes log_cb_ ──────
     float n  = static_cast<float>(std::max(1, num_updates));
     float lr = cfg_.learning_rate;
     if constexpr (cfg_.anneal_lr) {
-        // Mirror the floor logic from train()'s anneal block so the
-        // reported lr matches what the optimiser actually uses; otherwise
-        // late-training plots show lr→0 even when the floor is active.
+        // Mirror train()'s floor logic so the reported lr matches what
+        // the optimiser actually uses.
         const float frac       = 1.0f - static_cast<float>(update_idx_) / cfg_.num_updates();
         constexpr float floor_frac = cfg_.min_lr_frac > 0.0f ? cfg_.min_lr_frac : 0.0f;
         lr = cfg_.learning_rate * std::max(frac, floor_frac);
     }
-    // Single device→host sync for all stats
     return UpdateStats{
         update_idx_,
         collector_->global_step(),

@@ -1,12 +1,101 @@
 #include "opponent_manager.h"
 
-#include "opponent_pool.h"
-
 #include <algorithm>
+#include <numeric>
 #include <random>
 #include <unordered_map>
 
 namespace poker_ppo {
+
+OpponentPool::OpponentPool(int obs_dim, int action_count,
+                           int hidden_dim, int num_layers,
+                           BetHistoryConfig    hist,
+                           RoundSummaryConfig  round_summary,
+                           torch::Device       device,
+                           int                 max_size,
+                           uint64_t            seed)
+    : obs_dim_(obs_dim), action_count_(action_count),
+      hidden_dim_(hidden_dim), num_layers_(num_layers),
+      hist_(hist), round_summary_(round_summary),
+      device_(device), max_size_(std::max(0, max_size)),
+      rng_(seed ? seed : std::random_device{}()) {}
+
+OpponentPool::SnapshotId OpponentPool::add_snapshot(const ActorCritic& src) {
+    if (max_size_ <= 0) return 0;
+
+    // Algorithm R: seen_count_ is the inclusion-probability denominator.
+    // Increment on every offer (accepted or not).
+    ++seen_count_;
+
+    if (static_cast<int>(snapshots_.size()) < max_size_) {
+        const SnapshotId id = next_id_++;
+        snapshots_.push_back({id, clone_actor_critic(src, obs_dim_, action_count_,
+                                        hidden_dim_, num_layers_,
+                                        hist_, round_summary_, device_)});
+        return id;
+    }
+
+    // Accept with probability max_size/seen_count.
+    std::uniform_int_distribution<uint64_t> ui(1, seen_count_);
+    if (ui(rng_) > static_cast<uint64_t>(max_size_)) {
+        return 0;
+    }
+
+    // Replace a random slot; the replaced ID retires (envs holding it
+    // fall through via has_id()).
+    std::uniform_int_distribution<int> us(0, max_size_ - 1);
+    const int slot = us(rng_);
+    const SnapshotId id = next_id_++;
+    snapshots_[slot] = {id, clone_actor_critic(src, obs_dim_, action_count_,
+                                        hidden_dim_, num_layers_,
+                                        hist_, round_summary_, device_)};
+    return id;
+}
+
+OpponentPool::SnapshotId OpponentPool::sample_id() {
+    if (snapshots_.empty()) return 0;
+    std::uniform_int_distribution<int> ui(
+        0, static_cast<int>(snapshots_.size()) - 1);
+    return snapshots_[ui(rng_)].id;
+}
+
+std::vector<OpponentPool::SnapshotId> OpponentPool::sample_ids(int n) {
+    std::vector<SnapshotId> out;
+    if (snapshots_.empty() || n <= 0) return out;
+
+    const int K = static_cast<int>(snapshots_.size());
+    n = std::min(n, K);
+    std::vector<int> indices(K);
+    std::iota(indices.begin(), indices.end(), 0);
+    std::shuffle(indices.begin(), indices.end(), rng_);
+
+    out.reserve(n);
+    for (int i = 0; i < n; ++i) {
+        out.push_back(snapshots_[indices[i]].id);
+    }
+    return out;
+}
+
+bool OpponentPool::has_id(SnapshotId id) const {
+    if (id == 0) return false;
+    for (const auto& e : snapshots_) {
+        if (e.id == id) return true;
+    }
+    return false;
+}
+
+torch::Tensor OpponentPool::select_actions(SnapshotId id,
+                                           const torch::Tensor& obs,
+                                           const torch::Tensor& legal_mask) {
+    torch::NoGradGuard ng;
+    for (auto& e : snapshots_) {
+        if (e.id == id) {
+            auto ar = e.net->get_action(obs, legal_mask);
+            return ar.action.to(torch::kCPU).contiguous();
+        }
+    }
+    TORCH_CHECK(false, "OpponentPool::select_actions: id not in pool");
+}
 
 OpponentManager::OpponentManager(OpponentPoolConfig  cfg,
                                  int                 obs_dim,
@@ -17,8 +106,7 @@ OpponentManager::OpponentManager(OpponentPoolConfig  cfg,
                                  RoundSummaryConfig  round_summary,
                                  torch::Device       device)
     : cfg_(cfg),
-      // Derived seed so the manager's episode_rng_ and the pool's internal
-      // RNG produce different streams when both are user-seeded.
+      // Different stream from the pool's RNG when both are user-seeded.
       episode_rng_(cfg.seed ? cfg.seed
                             : std::random_device{}())
 {
@@ -49,7 +137,7 @@ void OpponentManager::prepare_rollout(int update_idx) {
 }
 
 void OpponentManager::on_episode_terminal(int env_idx, int update_idx) {
-    // Default: pure self-play (no pool override).
+    // Default: pure self-play.
     learner_seat_[env_idx] = 0;
     opp_id_[env_idx]       = 0;
 
@@ -59,14 +147,13 @@ void OpponentManager::on_episode_terminal(int env_idx, int update_idx) {
     std::uniform_real_distribution<float> u01(0.0f, 1.0f);
     if (u01(episode_rng_) >= cfg_.p_use_pool) return;
 
-    // HU NLHE is positionally asymmetric (BB / SB), so balance which seat
-    // the learner plays to avoid biasing the training distribution.
+    // HU NLHE is positionally asymmetric — balance which seat the learner
+    // plays so we don't bias the training distribution.
     std::uniform_int_distribution<int> ui_seat(0, 1);
     learner_seat_[env_idx] = ui_seat(episode_rng_);
 
-    // Restrict to the rollout's pre-sampled IDs when available, so we
-    // bound the number of distinct pool snapshots used per rollout (and
-    // therefore the number of mini-forwards in apply_action_overrides).
+    // Bound distinct snapshots used per rollout (= mini-forwards in
+    // apply_action_overrides) by drawing from the pre-sampled set.
     if (!rollout_pool_ids_.empty()) {
         std::uniform_int_distribution<size_t> ui(
             0, rollout_pool_ids_.size() - 1);
@@ -78,9 +165,7 @@ void OpponentManager::on_episode_terminal(int env_idx, int update_idx) {
 
 bool OpponentManager::should_record(int env_idx,
                                     int acting_player) const noexcept {
-    // Pure self-play (op_id == 0) → record both seats so the live network
-    // learns from both halves of the experience as before. Pool-active →
-    // only the learner seat's transitions go into the buffer.
+    // Pure self-play: record both seats. Pool-active: learner only.
     const uint64_t op_id = opp_id_[env_idx];
     return (op_id == 0) || (acting_player == learner_seat_[env_idx]);
 }
@@ -96,15 +181,14 @@ void OpponentManager::apply_action_overrides(
     const int N = static_cast<int>(actions_cpu.size(0));
     auto cp_acc = cur_player_cpu.accessor<int32_t, 1>();
 
-    // Group envs needing override by SnapshotId. Stale IDs (snapshot
-    // dropped since the env sampled it) silently fall through to live policy.
+    // Group by SnapshotId. Stale IDs fall through to live policy.
     std::unordered_map<uint64_t, std::vector<int>> by_id;
     by_id.reserve(static_cast<size_t>(pool_->size()));
     for (int i = 0; i < N; ++i) {
         const uint64_t id = opp_id_[i];
         if (id == 0) continue;
         if (cp_acc[i] == learner_seat_[i]) continue;  // learner is acting
-        if (!pool_->has_id(id))            continue;  // stale — fall through
+        if (!pool_->has_id(id))            continue;  // stale
         by_id[id].push_back(i);
     }
     if (by_id.empty()) return;
@@ -114,9 +198,7 @@ void OpponentManager::apply_action_overrides(
 
     for (auto& [id, idxs] : by_id) {
         const int n = static_cast<int>(idxs.size());
-        // Build a Long index tensor on CPU, then move to device for
-        // index_select. Use a clone so the tensor owns its memory (idxs
-        // is a std::vector<int>, not int64).
+        // idxs is int, not int64 — clone so the tensor owns its memory.
         std::vector<int64_t> idx64(idxs.begin(), idxs.end());
         auto idx_cpu = torch::from_blob(idx64.data(), {n}, idx_opts).clone();
         auto idx_dev = idx_cpu.to(cur_obs.device());
@@ -137,14 +219,10 @@ void OpponentManager::maybe_snapshot(int update_idx,
     if (!pool_) return;
     if (cfg_.snapshot_every <= 0) return;
     if (update_idx <= 0) return;
-    // Don't fill the pool until warmup completes — early-training snapshots
-    // are barely-distinguishable-from-random and dilute the gradient signal
-    // once we sample from them.
+    // Pre-warmup snapshots are near-random and dilute the gradient signal
+    // once we start sampling from them.
     if (update_idx < cfg_.warmup_updates) return;
     if (update_idx % cfg_.snapshot_every != 0) return;
-    // Reservoir-sampling rejects an offer with probability max_size /
-    // seen_count once the pool is full; we don't care about the returned
-    // SnapshotId at this site (sampling later goes through sample_id()).
     [[maybe_unused]] const auto _ = pool_->add_snapshot(network);
 }
 

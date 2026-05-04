@@ -1,15 +1,7 @@
-//  main.cpp — CLI dispatcher.
-//
-//  Game variant + hyperparameters are baked in via `include/config.h`
-//  (`kPPOConfig`, `kBetConfig`, `kBRConfig`, `kPokerConfig`). Edit those
-//  and rebuild to change the run.
-//
-//  Recognised forms:
-//    ./poker_ppo                                  → train (default config)
-//    ./poker_ppo --benchmark [iters]              → A/B rollout bench
-//    ./poker_ppo --play <model_path>              → interactive REPL
-//    ./poker_ppo --strategy {serial|threadpool}   → training rollout strategy
-//
+//   ./poker_ppo                                  train (default)
+//   ./poker_ppo --benchmark [iters]              rollout A/B bench
+//   ./poker_ppo --play <model_path>              interactive REPL
+//   ./poker_ppo --strategy {serial|threadpool}   rollout strategy
 
 #include "commands.h"
 #include "poker_env.h"
@@ -80,12 +72,11 @@ bool parse_cli(int argc, char** argv, CliOptions& out) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    std::cout.setf(std::ios::unitbuf);  // flush stdout as it arrives (PTY/log capture)
+    std::cout.setf(std::ios::unitbuf);  // unbuffered for PTY/log capture
 
     CliOptions opt;
     if (!parse_cli(argc, argv, opt)) return 1;
 
-    // ── Compile-time configs ────────────────────────────────────────────
     PokerConfig poker_cfg = kPokerConfig;
     poker_cfg.game.validate();
 
@@ -108,16 +99,14 @@ int main(int argc, char** argv) {
         std::cout << "\n";
     }
 
-    // ── Device ──────────────────────────────────────────────────────────
-    // CPU beats CUDA for the default config (3×256 MLP @ batch≈32):
-    // kernel-launch overhead dominates compute on such a small network.
-    // Revisit once hidden_dim ≥ 512 or num_envs ≥ 128.
+    // CPU has historically beaten CUDA for small configs (3×256 MLP @
+    // batch≈32) — kernel-launch overhead dominates. Revisit at
+    // hidden_dim ≥ 512 or num_envs ≥ 128.
     torch::Device device = torch::cuda::is_available() ? torch::kCUDA : torch::mps::is_available() ? torch::kMPS : torch::kCPU;
     std::cout << "Using device: " << device << "\n";
 
     PokerEnvironmentFactory factory(poker_cfg);
 
-    // ── Dispatch ────────────────────────────────────────────────────────
     if (opt.play_mode) {
         return cmd_play(factory, config::kBetConfig, device, opt.play_model_path);
     }

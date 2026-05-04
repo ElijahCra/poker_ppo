@@ -8,26 +8,6 @@
 
 namespace poker_ppo {
 
-// cmd_play — interactive REPL exposing one PokerEnvironment + the trained
-// network over stdin/stdout. Driven by tools/play.py for the UI.
-//
-// Protocol: each command from the client is a single line. The server
-// responds with multiple `key value...` lines terminated by an `OK` line.
-// All amounts are in mbb; cards are integer ids (rank<<2 | suit) in [0, 52).
-//
-// Commands:
-//   INFO                — emit static config (action_count, obs_dim,
-//                         blinds, pot_fractions, etc.).
-//   STATE               — emit current game state (player, cards, stacks,
-//                         pot, mask, obs, done, utility).
-//   STEP <action_idx>   — apply the given action; emit new STATE.
-//   RESET               — reset to a fresh hand; emit new STATE.
-//   MODEL               — run the trained network on the current obs; emit
-//                         chosen action + full softmax probs + value.
-//   QUIT                — exit cleanly.
-//
-// Errors: emit a single `ERR <message>` line followed by `OK`.
-
 int cmd_play(IPokerEnvironmentFactory& factory,
              const BetConfig&          bet_cfg,
              torch::Device             device,
@@ -44,8 +24,8 @@ int cmd_play(IPokerEnvironmentFactory& factory,
     auto& net = trainer.network();
     net->eval();
 
-    // Single env for play. Need the concrete PokerEnvironment for the
-    // state-inspection accessors (hole_cards, pot, etc.).
+    // Need PokerEnvironment, not just IPokerEnvironment, for the state
+    // accessors (hole_cards, pot, ...).
     auto env_base = factory.create(bet_cfg);
     auto* env = dynamic_cast<PokerEnvironment*>(env_base.get());
     if (!env) {
@@ -113,10 +93,10 @@ int cmd_play(IPokerEnvironmentFactory& factory,
         auto [logits, value] = net->forward(obs);
         const auto masked = logits + (1.0f - mask) * kIllegalActionLogit;
         const auto probs  = torch::softmax(masked, -1).squeeze(0).to(torch::kCPU).contiguous();
-        // Sample one action stochastically (matches training rollout policy).
+        // Stochastic sample (matches the training rollout).
         const auto ar      = net->get_action(obs, mask);
         const auto sampled = ar.action.to(torch::kCPU).item<int64_t>();
-        // Greedy (argmax) action for diagnostics.
+        // Argmax for diagnostics.
         const auto greedy  = std::get<1>(probs.max(0)).item<int64_t>();
         std::cout << "sampled "  << sampled << "\n";
         std::cout << "greedy "   << greedy  << "\n";
@@ -129,7 +109,6 @@ int cmd_play(IPokerEnvironmentFactory& factory,
         std::cout << "OK" << std::endl;
     };
 
-    // Ready signal so the client can sync.
     std::cout << "READY" << std::endl;
 
     std::string line;

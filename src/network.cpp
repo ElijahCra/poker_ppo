@@ -6,10 +6,6 @@
 
 namespace poker_ppo {
 
-namespace {
-// kAttentionMaskLogit lives in network.h so callers/tests can reference it.
-} // namespace
-
 TowerImpl::TowerImpl(int obs_dim, int output_dim,
                      int hidden_dim, int num_layers,
                      float head_init_std,
@@ -26,11 +22,7 @@ TowerImpl::TowerImpl(int obs_dim, int output_dim,
     const int tower_static_dim = layout_.static_off + ObservationLayout::FEAT_STATIC;
     int trunk_in_dim = tower_static_dim + layout_.round_summary_dim;
 
-    // Attention-encoder construction. The entire `if constexpr` block —
-    // module registrations, parameter allocations, and the trunk-dim
-    // contribution — is dead-code-eliminated when the build flag is
-    // false. RoundSummaryConfig::dim()/BetHistoryConfig::history_block_dim()
-    // already handle the corresponding obs-layout sizes consistently.
+    // Whole block dead-code-eliminated when the build flag is off.
     if constexpr (features::ATTENTION_ENCODER) {
         if (hist_.enabled) {
             const int D  = hist_.attn_dim;
@@ -73,14 +65,11 @@ TowerImpl::TowerImpl(int obs_dim, int output_dim,
                     "ffn2_" + s, torch::nn::Linear(FF, D)));
             }
 
-            // The history encoder contributes its CLS embedding (dim D)
-            // to the trunk input. round_summary, if enabled, contributes
-            // its own features in parallel — accumulate, don't overwrite.
+            // CLS embedding (D) feeds the trunk alongside round_summary if both on.
             trunk_in_dim += D;
         }
     }
 
-    // ── trunk + head ────────────────────────────────────────────────────
     torch::nn::Sequential trunk;
     int in_dim = trunk_in_dim;
     for (int i = 0; i < num_layers; ++i) {
@@ -91,7 +80,7 @@ TowerImpl::TowerImpl(int obs_dim, int output_dim,
     trunk_ = register_module("trunk", trunk);
     head_  = register_module("head",  torch::nn::Linear(hidden_dim, output_dim));
 
-    // ── init: orthogonal for trunk/head, xavier for attention ───────────
+    // Orthogonal for trunk/head, xavier for attention.
     for (auto& m : trunk_->modules(/*include_self=*/false)) {
         if (auto* lin = m->as<torch::nn::Linear>()) {
             torch::nn::init::orthogonal_(lin->weight, std::sqrt(2.0));
@@ -171,13 +160,10 @@ TowerImpl::encode_history(const torch::Tensor& history_block) {
         x = x + ff;
     }
 
-    return x.select(/*dim=*/1, /*index=*/0);   // [B, D]
+    return x.select(/*dim=*/1, /*index=*/0);   // CLS, [B, D]
 }
 
 torch::Tensor TowerImpl::forward(torch::Tensor obs) {
-    // Slice the obs into its sub-blocks via the shared `ObservationLayout`
-    // — same struct the env writes through. No more parallel offset
-    // arithmetic between writer and reader.
     const int tower_static_dim =
         layout_.static_off + ObservationLayout::FEAT_STATIC;
 
@@ -187,8 +173,6 @@ torch::Tensor TowerImpl::forward(torch::Tensor obs) {
     parts.reserve(3);
     parts.push_back(static_feats);
 
-    // Round-summary parse: dual-tier gated. When the build flag is off,
-    // layout_.round_summary_dim is 0, so the read site is never reached.
     if constexpr (features::ROUND_SUMMARY) {
         if (round_summary_.enabled) {
             parts.push_back(obs.narrow(1, layout_.round_summary_off,
@@ -196,9 +180,6 @@ torch::Tensor TowerImpl::forward(torch::Tensor obs) {
         }
     }
 
-    // Bet-history attention parse: same dual-tier gating. When the build
-    // flag is off, encode_history is never called and the entire encoder
-    // pipeline is dead.
     if constexpr (features::ATTENTION_ENCODER) {
         if (hist_.enabled) {
             auto history_blk = obs.narrow(1, layout_.history_off,
@@ -239,11 +220,6 @@ ActorCriticImpl::forward(torch::Tensor obs) {
 }
 
 torch::Tensor ActorCriticImpl::get_value(torch::Tensor obs) {
-    // No std::move on `obs` — torch::Tensor is shared-pointer-ish, so
-    // moving is a no-op cost-wise but signals (incorrectly) that the
-    // local is being consumed. Keep the by-value parameter (libtorch
-    // convention; torch::nn::Module::forward takes a Tensor, not const
-    // ref) but pass it through unchanged.
     return critic_->forward(obs).squeeze(-1);
 }
 
@@ -310,7 +286,7 @@ ActorCritic clone_actor_critic(const ActorCritic&  src,
     for (size_t i = 0; i < sb.size(); ++i) {
         db[i].copy_(sb[i].detach().to(device));
     }
-    dst->eval();   // clones are always frozen targets — never trained directly
+    dst->eval();
     return dst;
 }
 

@@ -1,8 +1,5 @@
 #pragma once
-//
-// types.h — env↔PPO interaction types only (BetConfig, Action,
-// StepResult). PPO hyperparameters and feature configs live in config.h.
-//
+// Env↔PPO interaction types. Hyperparameters live in config.h.
 
 #include <torch/torch.h>
 #include <cassert>
@@ -11,23 +8,17 @@
 
 namespace poker_ppo {
 
-/// Controls the discrete action space for betting.
-///
-/// Non-raise actions are always: {Fold, Check/Call}.
-/// Raise actions use geometrically-spaced bet sizes:
-///   bet_i = min_raise * ratio^i   for i in [0, num_raise_sizes)
-///
+// Discrete action space: {Fold, Check/Call, Raise_0, ..., Raise_{N-1}}.
+// Raise sizes are geometric: bet_i = min_raise * ratio^i.
 struct BetConfig {
-    int    num_raise_sizes    = 4;     // distinct raise amounts
-    double min_raise          = 1.0;   // smallest raise (in your unit)
-    double geometric_ratio    = 2.0;   // multiplier between successive raises
-    int    max_bets_per_round = 4;     // cap on raises per player per round
+    int    num_raise_sizes    = 4;
+    double min_raise          = 1.0;
+    double geometric_ratio    = 2.0;
+    int    max_bets_per_round = 4;
 
-    /// Total discrete actions = fold + check/call + raises.
     constexpr int action_count() const noexcept { return 2 + num_raise_sizes; }
 
-    /// Raise amount for raise index i ∈ [0, num_raise_sizes). Not constexpr
-    /// because std::pow isn't constexpr until C++26.
+    // Not constexpr — std::pow isn't until C++26.
     double raise_amount(int i) const {
         assert(i >= 0 && i < num_raise_sizes);
         return min_raise * std::pow(geometric_ratio, i);
@@ -40,11 +31,6 @@ struct BetConfig {
     }
 };
 
-/// Action indices:
-///   0         → Fold
-///   1         → Check / Call
-///   2 .. 2+N  → Raise(raise_amount(i - 2))
-///
 namespace Action {
     constexpr int Fold      = 0;
     constexpr int CheckCall = 1;
@@ -57,9 +43,8 @@ namespace Action {
     }
 }
 
-/// Returned by `IPokerEnvironment::reset()` and `step()`.
 struct StepResult {
-    torch::Tensor observation;        // [obs_dim]    float
+    torch::Tensor observation;
     float         reward  = 0.0f;     // for the acting player
     bool          done    = false;
     torch::Tensor legal_action_mask;  // [action_count]  1=legal, 0=illegal

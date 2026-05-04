@@ -1,13 +1,171 @@
-#include "rollout_collector.h"
+#include "rollout.h"
 
 #include "opponent_manager.h"
-#include "rollout_pool.h"
 
 #include <algorithm>
 #include <thread>
 #include <vector>
 
 namespace poker_ppo {
+
+RolloutBuffer::RolloutBuffer(int num_steps, int num_envs,
+                             int obs_dim, int action_count,
+                             torch::Device device)
+    : num_steps_(num_steps), num_envs_(num_envs),
+      obs_dim_(obs_dim), action_count_(action_count),
+      device_(device)
+{
+    // Storage on CPU: pushes come from per-env worker threads and per-
+    // transition device writes would serialise on CUDA's launch queue.
+    // One batched H2D copy in flatten().
+    auto cpu_f = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
+    auto cpu_i = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU);
+
+    for (int p = 0; p < 2; ++p) {
+        obs_[p]         = torch::zeros({num_steps, num_envs, obs_dim},     cpu_f);
+        actions_[p]     = torch::zeros({num_steps, num_envs},              cpu_i);
+        log_probs_[p]   = torch::zeros({num_steps, num_envs},              cpu_f);
+        rewards_[p]     = torch::zeros({num_steps, num_envs},              cpu_f);
+        dones_[p]       = torch::zeros({num_steps, num_envs},              cpu_f);
+        values_[p]      = torch::zeros({num_steps, num_envs},              cpu_f);
+        legal_masks_[p] = torch::zeros({num_steps, num_envs, action_count}, cpu_f);
+        advantages_[p]  = torch::zeros({num_steps, num_envs},              cpu_f);
+        returns_[p]     = torch::zeros({num_steps, num_envs},              cpu_f);
+        counts_[p].assign(num_envs, 0);
+    }
+}
+
+void RolloutBuffer::clear() {
+    for (int p = 0; p < 2; ++p) {
+        std::fill(counts_[p].begin(), counts_[p].end(), 0);
+    }
+}
+
+void RolloutBuffer::push(int player, int env_idx,
+                         torch::Tensor obs,
+                         int64_t action,
+                         float log_prob,
+                         float reward,
+                         float done,
+                         float value,
+                         torch::Tensor mask) {
+    const int t = counts_[player][env_idx]++;
+
+    // Serial collector keeps state on device; force CPU for storage.
+    if (obs.device()  != torch::kCPU) obs  = obs.to(torch::kCPU);
+    if (mask.device() != torch::kCPU) mask = mask.to(torch::kCPU);
+
+    obs_[player][t][env_idx]         = obs;
+    legal_masks_[player][t][env_idx] = mask;
+    actions_[player]  .accessor<int64_t, 2>()[t][env_idx] = action;
+    log_probs_[player].accessor<float,   2>()[t][env_idx] = log_prob;
+    rewards_[player]  .accessor<float,   2>()[t][env_idx] = reward;
+    dones_[player]    .accessor<float,   2>()[t][env_idx] = done;
+    values_[player]   .accessor<float,   2>()[t][env_idx] = value;
+}
+
+void RolloutBuffer::compute_returns(
+    float gamma, float lam,
+    const torch::Tensor& bootstrap_values,
+    const torch::Tensor& bootstrap_terminal) {
+
+    TORCH_CHECK(bootstrap_values.dim() == 2 &&
+                bootstrap_values.size(0) == 2 &&
+                bootstrap_values.size(1) == num_envs_,
+                "bootstrap_values must be [2, num_envs]");
+    TORCH_CHECK(bootstrap_terminal.sizes() == bootstrap_values.sizes(),
+                "bootstrap_terminal shape must match bootstrap_values");
+
+    auto bv = bootstrap_values.to(torch::kCPU).contiguous();
+    auto bt = bootstrap_terminal.to(torch::kCPU).contiguous();
+    auto bv_a = bv.accessor<float, 2>();
+    auto bt_a = bt.accessor<float, 2>();
+
+    for (int p = 0; p < 2; ++p) {
+        advantages_[p].zero_();
+        returns_[p].zero_();
+
+        auto rewards_a = rewards_[p].accessor<float, 2>();
+        auto dones_a   = dones_[p].accessor<float, 2>();
+        auto values_a  = values_[p].accessor<float, 2>();
+        auto advs_a    = advantages_[p].accessor<float, 2>();
+
+        for (int e = 0; e < num_envs_; ++e) {
+            const int T = counts_[p][e];
+            if (T == 0) continue;
+            float lastgae = 0.0f;
+            for (int t = T - 1; t >= 0; --t) {
+                float next_nonterminal, next_value;
+                if (t == T - 1) {
+                    if (bt_a[p][e] > 0.5f) {
+                        // Terminal: V_next = 0.
+                        next_nonterminal = 0.0f;
+                        next_value       = 0.0f;
+                    } else {
+                        // Truncation: bootstrap from carry_obs.
+                        next_nonterminal = 1.0f;
+                        next_value       = bv_a[p][e];
+                    }
+                } else {
+                    next_nonterminal = 1.0f - dones_a[t + 1][e];
+                    next_value       = values_a[t + 1][e];
+                }
+                const float delta =
+                    rewards_a[t][e] + gamma * next_value * next_nonterminal
+                    - values_a[t][e];
+                lastgae = delta + gamma * lam * next_nonterminal * lastgae;
+                advs_a[t][e] = lastgae;
+            }
+        }
+        returns_[p] = advantages_[p] + values_[p];
+    }
+}
+
+RolloutBuffer::FlatBatch RolloutBuffer::flatten() const {
+    std::vector<torch::Tensor> obs_list, actions_list, logp_list;
+    std::vector<torch::Tensor> advs_list, rets_list, vals_list, masks_list;
+
+    for (int p = 0; p < 2; ++p) {
+        for (int e = 0; e < num_envs_; ++e) {
+            const int T = counts_[p][e];
+            if (T == 0) continue;
+            obs_list    .push_back(obs_[p]        .slice(0, 0, T).select(1, e));
+            actions_list.push_back(actions_[p]    .slice(0, 0, T).select(1, e));
+            logp_list   .push_back(log_probs_[p]  .slice(0, 0, T).select(1, e));
+            advs_list   .push_back(advantages_[p] .slice(0, 0, T).select(1, e));
+            rets_list   .push_back(returns_[p]    .slice(0, 0, T).select(1, e));
+            vals_list   .push_back(values_[p]     .slice(0, 0, T).select(1, e));
+            masks_list  .push_back(legal_masks_[p].slice(0, 0, T).select(1, e));
+        }
+    }
+
+    auto to_dev = [this](torch::Tensor t) {
+        return t.to(device_, /*non_blocking=*/false, /*copy=*/false);
+    };
+
+    if (obs_list.empty()) {
+        auto f = torch::TensorOptions().dtype(torch::kFloat32).device(device_);
+        auto i = torch::TensorOptions().dtype(torch::kInt64).device(device_);
+        return {
+            torch::zeros({0, obs_dim_},      f),
+            torch::zeros({0},                i),
+            torch::zeros({0},                f),
+            torch::zeros({0},                f),
+            torch::zeros({0},                f),
+            torch::zeros({0},                f),
+            torch::zeros({0, action_count_}, f),
+        };
+    }
+    return {
+        to_dev(torch::cat(obs_list,     0)),
+        to_dev(torch::cat(actions_list, 0)),
+        to_dev(torch::cat(logp_list,    0)),
+        to_dev(torch::cat(advs_list,    0)),
+        to_dev(torch::cat(rets_list,    0)),
+        to_dev(torch::cat(vals_list,    0)),
+        to_dev(torch::cat(masks_list,   0)),
+    };
+}
 
 namespace {
 
@@ -16,9 +174,8 @@ struct BootstrapTensors {
     torch::Tensor terminal;   // [2, N] float32 CPU
 };
 
-// V at rollout-end for the GAE bootstrap. Critic-forwards `cur_obs` (from
-// the next acting player's view), then uses zero-sum negation for the
-// other player's view to fill the [2, N] tensors compute_returns expects.
+// Critic-forwards cur_obs (next acting player's view), then zero-sum
+// negates for the other player to fill compute_returns' [2, N] tensors.
 BootstrapTensors build_bootstrap(
     ActorCritic&                            network,
     const torch::Tensor&                    cur_obs,           // [N, D] device
@@ -28,7 +185,7 @@ BootstrapTensors build_bootstrap(
     const int N = static_cast<int>(cur_obs.size(0));
     auto f_cpu = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
 
-    // Critic-only forward; NoGrad is in scope at the call site.
+    // NoGrad is in scope at the call site.
     auto V_carry = network->get_value(cur_obs).detach().to(torch::kCPU).contiguous();
 
     auto values   = torch::zeros({2, N}, f_cpu);
@@ -42,8 +199,6 @@ BootstrapTensors build_bootstrap(
     for (int i = 0; i < N; ++i) {
         const int   next_actor = cp_acc[i];
         const float v          = v_acc[i];
-        // V at carry obs is from the next-acting player's perspective; the
-        // other player's V is its zero-sum negation.
         bv_acc[next_actor][i]     = v;
         bv_acc[1 - next_actor][i] = -v;
         bt_acc[0][i] = player_state[i].tail_was_terminal[0] ? 1.0f : 0.0f;
@@ -120,9 +275,8 @@ void RolloutCollector::collect(Strategy         strategy,
     auto f_cpu   = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
     auto i32_cpu = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU);
 
-    // Per-env per-player rollout state. Seeded from carry_done_ so the
-    // first transition after a previous-rollout reset carries the
-    // new-episode marker.
+    // Seed from carry_done_ so the first transition after a previous-
+    // rollout reset carries the new-episode marker.
     std::vector<PlayerRolloutState> player_state(N);
     for (int i = 0; i < N; ++i) {
         const float d = carry_done_.accessor<float, 1>()[i];
@@ -137,8 +291,7 @@ void RolloutCollector::collect(Strategy         strategy,
     std::vector<uint8_t> did_reset(N, 0);
 
     for (int step = 0; step < num_steps_; ++step) {
-        // Full-batch forward on the calling thread (single inference call
-        // per step regardless of strategy).
+        // One full-batch forward per step regardless of strategy.
         auto ar = network->get_action(cur_obs, cur_mask);
 
         auto actions_cpu    = ar.action.to(torch::kCPU).contiguous();
@@ -148,8 +301,6 @@ void RolloutCollector::collect(Strategy         strategy,
         auto cur_mask_cpu   = cur_mask.to(torch::kCPU).contiguous();
         auto cur_player_cpu = cur_player.to(torch::kCPU).contiguous();
 
-        // Override actions for envs where a pool snapshot is acting as the
-        // non-learner seat. No-op when the pool is disabled or empty.
         opp_mgr.apply_action_overrides(
             cur_obs, cur_mask, cur_player_cpu, actions_cpu);
 
@@ -165,9 +316,8 @@ void RolloutCollector::collect(Strategy         strategy,
 
         std::fill(did_reset.begin(), did_reset.end(), 0);
 
-        // Per-env body. Per-i state is disjoint (envs[i], player_state[i],
-        // next_*[i], did_reset[i]) so the body is safe to parallelise across
-        // i. RolloutBuffer pushes at (player, i) are also disjoint.
+        // Per-i state is disjoint, so step_body is safe to parallelise
+        // across i. Buffer pushes at (player, i) are also disjoint.
         auto step_body = [&](int i) {
             const int acting = cp_acc[i];
 
@@ -201,8 +351,7 @@ void RolloutCollector::collect(Strategy         strategy,
             for (int i = 0; i < N; ++i) step_body(i);
         }
 
-        // Re-roll opponent assignments serially: opp_mgr's RNG isn't
-        // thread-safe.
+        // Serial: opp_mgr's RNG isn't thread-safe.
         for (int i = 0; i < N; ++i) {
             if (did_reset[i]) opp_mgr.on_episode_terminal(i, update_idx);
         }
@@ -212,8 +361,7 @@ void RolloutCollector::collect(Strategy         strategy,
         cur_player = next_player.to(device_);
     }
 
-    // Drain remaining pending transitions; these are truncations, not
-    // terminals — compute_returns will bootstrap them from V(carry_obs).
+    // Truncations, not terminals — bootstrapped from V(carry_obs).
     for (int i = 0; i < N; ++i) {
         player_state[i].flush_on_rollout_end(i, *buffer_);
     }
@@ -226,10 +374,7 @@ void RolloutCollector::collect(Strategy         strategy,
     carry_obs_            = cur_obs.to(torch::kCPU);
     carry_legal_mask_     = cur_mask.to(torch::kCPU);
     carry_current_player_ = cur_player_cpu;
-    // Reset carry_done_ — per-player episode-boundary state is re-seeded
-    // at the next rollout's start from this tensor, and we've already
-    // flushed the pending transitions whose done flag it would have
-    // affected.
+    // Pending transitions are already flushed; clear the boundary state.
     carry_done_.zero_();
 
     global_step_ += num_envs_ * num_steps_;

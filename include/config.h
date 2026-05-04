@@ -1,19 +1,6 @@
 #pragma once
-//
-// config.h — single source of truth for compile-time training/eval config.
-//
-// Holds both the *type* definitions for the trainer-side configs (PPO,
-// bet-history attention, round-summary features, opponent pool) and the
-// `inline constexpr` instances of those configs that the binary is
-// compiled against. Edit values, rebuild, branches conditioned on
-// `if constexpr (config::kFoo.flag)` are dead-code-eliminated.
-//
-// Game-rule config (`Game::kGameConfig`, `Game::kBettingConfig`) lives
-// alongside its types in `Game/GameConfig.hpp` / `Game/BettingConfig.hpp`.
-// The env-side `kPokerConfig` is in `poker_env.h` and references
-// `kPPOConfig.hist` / `kPPOConfig.round_summary` here, so the env
-// observation layout cannot drift from the network input layout.
-//
+// Compile-time training/eval config. Edit values, rebuild.
+// Game-rule config lives in Game/GameConfig.hpp.
 
 #include "types.h"
 #include "features.h"
@@ -24,109 +11,59 @@
 
 namespace poker_ppo {
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Bet-history attention encoder config
-// ─────────────────────────────────────────────────────────────────────────────
-//
-// The env exposes a variable-length sequence of past betting actions (this
-// hand) as a fixed-size, padded block at the tail of the observation
-// vector. The network slices that block back into a [T, F] token tensor
-// and runs a small Transformer encoder over it. A learnable CLS token is
-// prepended so attention has a well-defined output for empty histories.
-//
-// Per-action features (F = 8):
+// Bet-history attention encoder. Per-action features (F=8):
 //   0  amount / initial_stack
-//   1  amount / (2 * initial_stack)        (≈ pot-scale)
-//   2  is_my_action  (1 if the *current* acting player made it)
-//   3  is_aggressive (1 = Raise, 0 = Call/Check/Fold)
-//   4  round one-hot[0]  (preflop)
-//   5  round one-hot[1]  (flop)
-//   6  round one-hot[2]  (turn)
-//   7  round one-hot[3]  (river)
-//
+//   1  amount / (2 * initial_stack)
+//   2  is_my_action
+//   3  is_aggressive
+//   4..7  round one-hot
 struct BetHistoryConfig {
     static constexpr int feat_per_action = 8;
 
-    bool enabled         = true;  // master switch for the attention encoder
-    int  max_history_len = 32;    // T — padded length of the action sequence
-    int  attn_dim        = 64;    // D — token embedding & attention model dim
-    int  attn_heads      = 4;     // H — multi-head attention heads (D % H == 0)
-    int  ffn_mult        = 4;     // FFN inner dim = ffn_mult * attn_dim
-    int  num_blocks      = 1;     // stacked attention blocks
+    bool enabled         = true;
+    int  max_history_len = 32;    // T
+    int  attn_dim        = 64;    // D, must be divisible by attn_heads
+    int  attn_heads      = 4;
+    int  ffn_mult        = 4;
+    int  num_blocks      = 1;
 
-    /// Total trailing block in the observation vector:
-    ///   T (mask) + T * F (token features)   = T * (1 + F)
-    /// Returns 0 unconditionally when the build-time flag
-    /// `features::ATTENTION_ENCODER` is false, so the entire history block
-    /// is stripped from the obs layout in that build.
+    // T mask + T*F tokens. Returns 0 when features::ATTENTION_ENCODER is off.
     [[nodiscard]] constexpr int history_block_dim() const noexcept {
         if constexpr (!features::ATTENTION_ENCODER) return 0;
         return enabled ? max_history_len * (1 + feat_per_action) : 0;
     }
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Round-summary feature block
-// ─────────────────────────────────────────────────────────────────────────────
-//
-// A hand-engineered, fixed-size alternative (or complement) to the
-// attention encoder. For each of the four betting rounds, the env emits
-// four features computed from the current hand's bet history:
-//   0  my_chips_in     — chip delta I put in this round  / initial_stack
-//   1  opp_chips_in    — chip delta opponent put in      / initial_stack
-//   2  raises_count    — total raises this round         / max_raises_per_round
-//   3  i_am_aggressor  — 1 if I was the last to raise this round, else 0
-//
-// All features are computed from the acting player's perspective, so the
-// shared network can be used for both seats. Block size = 4 rounds × 4 =
-// 16 floats (when enabled), appended to the obs after the static features.
-//
+// Per-round summary block. 4 features × 4 rounds = 16 floats.
+//   0  my_chips_in / initial_stack
+//   1  opp_chips_in / initial_stack
+//   2  raises_count / max_raises_per_round
+//   3  i_am_aggressor
 struct RoundSummaryConfig {
     static constexpr int feat_per_round = 4;
     static constexpr int num_rounds     = 4;
 
     bool enabled = false;
 
-    /// Block size in floats. Returns 0 unconditionally when the build-
-    /// time flag `features::ROUND_SUMMARY` is false.
     [[nodiscard]] constexpr int dim() const noexcept {
         if constexpr (!features::ROUND_SUMMARY) return 0;
         return enabled ? num_rounds * feat_per_round : 0;
     }
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Opponent pool — frozen past-policy snapshots for self-play stabilisation
-// ─────────────────────────────────────────────────────────────────────────────
-//
-// Empty / disabled by default → full self-play. When enabled, every
-// `snapshot_every` updates the trainer copies the live network into a
-// FIFO pool of size `max_size`. During rollouts, each env independently
-// draws an opponent: with probability `p_use_pool` it pulls a pool member
-// to play the non-learner seat; otherwise it stays in current-vs-current
-// self-play. Snapshots are only sampled after `warmup_updates` so the
-// pool isn't filled with cold-start garbage.
-//
+// Reservoir-sampled past-policy snapshots for self-play stabilisation.
 struct OpponentPoolConfig {
     bool     enabled                = false;
     int      max_size               = 20;
     int      snapshot_every         = 200;
     int      warmup_updates         = 200;
     float    p_use_pool             = 0.5f;
-    // Cap on distinct pool snapshots used in a single rollout. Lower =
-    // cheaper inference (fewer batched forwards) at the cost of less
-    // opponent diversity within a rollout — diversity recovers across
-    // rollouts as we resample at each rollout start.
+    // Cap on distinct snapshots used per rollout — bounds inference cost.
     int      max_unique_per_rollout = 1;
     uint64_t seed                   = 0;   // 0 → random_device
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// PPO hyper-parameters
-// ─────────────────────────────────────────────────────────────────────────────
-
 struct PPOConfig {
-    // ── core PPO ────────────────────────────────────────────────────────
     float gamma            = 1.0f;
     float gae_lambda       = 1.0f;
     float clip_coef        = 0.1f;
@@ -136,90 +73,56 @@ struct PPOConfig {
     bool  clip_vloss       = true;
     bool  norm_advantages  = true;
 
-    // ── optimiser ───────────────────────────────────────────────────────
     float learning_rate    = 2.5e-4f;
     bool  anneal_lr        = true;
-    // Floor on the annealed LR as a fraction of `learning_rate`. Default
-    // linear-to-zero schedule does negligible learning in the last ~quarter
-    // of training; floor at 0.1× to keep updates meaningful all the way
-    // through. Set to 0 to recover linear-to-zero.
+    // Floor for the LR schedule, as a fraction of learning_rate. 0 = linear-to-zero.
     float min_lr_frac      = 0.1f;
 
-    // Entropy-coefficient cosine schedule. When enabled, `ent_coef` is the
-    // start value and the effective coefficient decays to `ent_coef_min`
-    // over the full run via:
-    //     ent(t) = ent_min + 0.5·(ent_start − ent_min)·(1 + cos(π·t/T))
-    // Rationale (poker IIGs): optimal entropy is high early (action-space
-    // exploration) and low late (sharpen near-deterministic regions:
-    // premium-hand value-betting, trash folds). A constant ent_coef can't
-    // optimise both.
+    // Cosine entropy decay from ent_coef → ent_coef_min.
+    // High entropy early helps exploration; low entropy late sharpens
+    // near-deterministic regions. Constant ent_coef can't do both.
     bool  anneal_ent_coef  = false;
     float ent_coef_min     = 0.01f;
 
-    // ── rollout ─────────────────────────────────────────────────────────
     int   num_envs         = 8;
     int   num_steps        = 128;
     int   update_epochs    = 4;
     int   num_minibatches  = 4;
 
-    // ── training ────────────────────────────────────────────────────────
     int   total_timesteps  = 10'000'000;
 
-    // ── network ─────────────────────────────────────────────────────────
     int   hidden_dim       = 512;
     int   num_layers       = 3;
     BetHistoryConfig    hist;
     RoundSummaryConfig  round_summary;
 
-    // ── opponent pool ───────────────────────────────────────────────────
     OpponentPoolConfig  opp_pool;
 
-    // ── derived ─────────────────────────────────────────────────────────
     constexpr int batch_size()     const noexcept { return num_envs * num_steps; }
     constexpr int minibatch_size() const noexcept { return batch_size() / num_minibatches; }
     constexpr int num_updates()    const noexcept { return total_timesteps / batch_size(); }
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Env-side PokerConfig
-// ─────────────────────────────────────────────────────────────────────────────
-//
-// Wraps a Game::DefaultGameConfig (the poker variant) plus PPO-side knobs.
-// All poker-rule tuning lives in `game`; only per-run seeding and adapter
-// flags belong on PokerConfig itself.
-//
-// `kPokerConfig` (below) is the live compile-time instance threaded through
-// PokerEnvironment / PokerEnvironmentFactory / cmd_train. The trainer-side
-// feature gates (`hist`, `round_summary`) are pulled directly from
-// `kPPOConfig` so the env's observation layout and the network's input
-// layout cannot drift.
-//
+// Wraps Game::DefaultGameConfig + PPO-side knobs. `hist`/`round_summary`
+// are pinned to PPOConfig at the kPokerConfig site so env obs layout
+// stays in sync with network input layout.
 struct PokerConfig {
-    Game::DefaultGameConfig  game{};           // deck, stacks, blinds, betting structure
-    BetHistoryConfig    hist{};                // attention-encoder layout (T, F, ...)
-    RoundSummaryConfig  round_summary{};       // per-round summary feature block
+    Game::DefaultGameConfig  game{};
+    BetHistoryConfig    hist{};
+    RoundSummaryConfig  round_summary{};
 
-    // Seed used as a base — each created env gets seed ^ instance hash.
-    // Default is non-deterministic; the constexpr instance below pins it
-    // to a fixed value for reproducible training runs.
+    // Base seed; each env gets seed ^ instance hash.
     uint64_t seed = std::random_device()();
 
     [[nodiscard]] constexpr int num_raise_slots() const noexcept { return game.num_raise_slots(); }
     [[nodiscard]] constexpr int action_count()    const noexcept { return game.action_count(); }
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Best-response (approximate exploitability) evaluator config
-// ─────────────────────────────────────────────────────────────────────────────
-//
-// See best_response.h for the algorithm; this struct is co-located here so
-// `kBRConfig` (below) can be `inline constexpr` without pulling the
-// evaluator's heavy implementation into config.h.
-//
+// Approximate best-response evaluator. See best_response.h.
 struct BestResponseConfig {
     bool  enabled            = false;
-    int   eval_every         = 1000;   // run every N main-trainer updates
-    int   updates_per_eval   = 200;    // PPO updates of exploiter per eval
+    int   eval_every         = 1000;
+    int   updates_per_eval   = 200;
 
     int   num_envs           = 32;
     int   num_steps          = 128;
@@ -238,43 +141,32 @@ struct BestResponseConfig {
 
     bool  warm_start         = true;
 
-    // Fresh exploiter seeds per evaluate() call. >1 trains independent
-    // exploiters from random init against the same frozen target and
-    // reports max-bb/hand as the canonical lower bound (mean/min/std are
-    // diagnostics). Each seed's bb/hand is a valid lower bound on its own;
-    // max over seeds is the tightest bound the budget can produce. Cost
-    // scales linearly. With >1, warm_start is ignored.
+    // >1 trains independent exploiters from random init and reports
+    // max(bb/hand) — tightest lower bound the budget can produce.
+    // With >1, warm_start is ignored.
     int   num_exploiter_seeds = 3;
 
-    // Hands played in the post-training eval-only match between the
-    // trained exploiter and frozen target. The match's bb/hand is the
-    // reported BR estimate — using rewards collected during the exploiter's
-    // training rollouts would bias the bound downward (early-training
-    // exploiter plays badly while learning). Set to 0 to skip and fall
-    // back to training-time reward averaging (debug only).
+    // Hands in the post-training eval match. Using training-time rewards
+    // would bias the bound (early exploiter plays badly while learning).
+    // 0 = skip and fall back to training rewards (debug only).
     int   eval_hands         = 5000;
 
-    float bb_per_unit_reward = 10.0f;  // matches PokerEnvironment::reward_norm
+    float bb_per_unit_reward = 10.0f;
     uint64_t seed            = std::random_device()();
 };
 
 namespace config {
 
-// ─── Bet abstraction ────────────────────────────────────────────────────
-// Discrete-action layout exposed to PPO. Must match the chosen game
-// variant's GameConfig (validated at PokerEnvironment construction).
+// Discrete action layout. Must match the chosen game variant
+// (validated at PokerEnvironment construction).
 static constexpr BetConfig kBetConfig{
-    .num_raise_sizes    = 12,    // 11 pot fractions + AI; matches main.cpp
+    .num_raise_sizes    = 12,
     .min_raise          = 0.5,
     .geometric_ratio    = 1.5,
     .max_bets_per_round = 4,
 };
 
-// ─── PPO trainer ────────────────────────────────────────────────────────
-// Tweak values, rebuild, and the trainer picks them up. Code uses
-// `if constexpr (kPPOConfig.flag)` to strip dead branches.
 static constexpr PPOConfig kPPOConfig{
-    // Core PPO
     .gamma            = 1.0f,
     .gae_lambda       = 0.975f,
     .clip_coef        = 0.1f,
@@ -284,29 +176,24 @@ static constexpr PPOConfig kPPOConfig{
     .clip_vloss       = true,
     .norm_advantages  = true,
 
-    // Optimiser
     .learning_rate    = 3.0e-4f,
     .anneal_lr        = true,
     .min_lr_frac      = 0.2f,
 
-    // Entropy schedule (cosine to ent_coef_min)
     .anneal_ent_coef  = false,
     .ent_coef_min     = 0.01f,
 
-    // Rollout
     .num_envs         = 96,
     .num_steps        = 128,
     .update_epochs    = 4,
     .num_minibatches  = 4,
 
-    // Training
     .total_timesteps  = 300'000'000,
 
-    // Network
     .hidden_dim       = 512,
     .num_layers       = 3,
     .hist             = BetHistoryConfig{
-        .enabled         = false,    // build-time gate is features::ATTENTION_ENCODER
+        .enabled         = false,    // build gate: features::ATTENTION_ENCODER
         .max_history_len = 32,
         .attn_dim        = 64,
         .attn_heads      = 4,
@@ -314,10 +201,9 @@ static constexpr PPOConfig kPPOConfig{
         .num_blocks      = 1,
     },
     .round_summary    = RoundSummaryConfig{
-        .enabled = false,            // build-time gate is features::ROUND_SUMMARY
+        .enabled = false,            // build gate: features::ROUND_SUMMARY
     },
 
-    // Opponent pool (reservoir-sampled past selves)
     .opp_pool         = OpponentPoolConfig{
         .enabled                 = false,
         .max_size                = 20,
@@ -329,10 +215,6 @@ static constexpr PPOConfig kPPOConfig{
     },
 };
 
-// ─── Best-response evaluator ────────────────────────────────────────────
-// Used by main.cpp to instrument approximate exploitability during
-// training. All knobs are compile-time. Set `enabled = false` to remove
-// BR overhead from the binary.
 static constexpr BestResponseConfig kBRConfig{
     .enabled            = false,
     .eval_every         = 1000,
@@ -359,14 +241,7 @@ static constexpr BestResponseConfig kBRConfig{
 
 }  // namespace config
 
-// ─── Live env-side PokerConfig ──────────────────────────────────────────
-// Threaded through PokerEnvironment / PokerEnvironmentFactory / cmd_train.
-// `hist` and `round_summary` are pinned to `kPPOConfig` so the env's
-// observation layout and the network's input layout can never drift.
-//
-// Lives in `poker_ppo` directly (not `poker_ppo::config`) since it's the
-// canonical thing main / cmd_* pass into the environment factory — keeping
-// the config sub-namespace for the trainer-side hyperparameter bag.
+// Pinned to kPPOConfig so env obs layout can't drift from network input.
 static constexpr PokerConfig kPokerConfig{
     .game          = Game::kGameConfig,
     .hist          = config::kPPOConfig.hist,
@@ -374,10 +249,8 @@ static constexpr PokerConfig kPokerConfig{
     .seed          = 0x12345ULL,
 };
 
-// Compile-time invariants. These mirror the runtime check in the
-// PokerEnvironment constructor — having them as static_asserts means
-// any drift between BetConfig and the game's action layout fails to
-// build instead of throwing at runtime.
+// Mirrors the runtime check in PokerEnvironment's ctor; drift here fails
+// the build instead of throwing at runtime.
 static_assert(kPokerConfig.action_count() == config::kBetConfig.action_count(),
               "kBetConfig.action_count() must match kPokerConfig.action_count() "
               "(2 + num_raise_slots)");

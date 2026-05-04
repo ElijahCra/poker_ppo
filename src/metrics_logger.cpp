@@ -20,13 +20,12 @@ MetricsLogger::MetricsLogger(const std::string& run_dir) : run_dir_(run_dir) {
                 "rollout_ms,update_ms\n";
     metrics_.flush();
 
-    // Long format: one row per (snapshot, anchor) pair.  pivot in plot_live.
+    // Long format: pivoted in plot_live.
     league_ << "update,global_step,anchor,num_hands,bb_per_hand,win_rate\n";
     league_.flush();
 
-    // One row per BR evaluation. bb_per_hand is the max-over-seeds (the
-    // tightest measured lower bound); the *_mean/min/std columns are
-    // diagnostics over the per-seed distribution.
+    // bb_per_hand is the max-over-seeds (tightest lower bound); the rest
+    // are diagnostics over the seed distribution.
     br_ << "update,global_step,br_updates_run,num_seeds,num_hands,"
            "bb_per_hand,bb_per_hand_mean,bb_per_hand_min,bb_per_hand_std,"
            "win_rate,wall_ms\n";

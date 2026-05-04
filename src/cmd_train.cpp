@@ -21,14 +21,10 @@ int cmd_train(IPokerEnvironmentFactory& factory,
     PPOTrainer trainer(factory, device);
     trainer.set_rollout_strategy(strategy);
 
-    // Local references to the compile-time configs so the call-sites read
-    // naturally and we don't repeat the `config::` qualification.
     const PPOConfig& ppo_cfg = config::kPPOConfig;
     const BetConfig& bet_cfg = config::kBetConfig;
 
-    // ── League (anchor-relative bb/hand tracking) ──────────────────────
-    // Query obs_dim and action_count from a throw-away env instance so the
-    // league's helper networks match the trainer's network architecture.
+    // Throw-away env to query obs/action dims for league/BR networks.
     int obs_dim;
     int action_count;
     {
@@ -40,8 +36,7 @@ int cmd_train(IPokerEnvironmentFactory& factory,
     League::Config league_cfg;
     league_cfg.num_hands_per_match = 10000;
     league_cfg.num_parallel_envs   = 32;
-    // reward_norm in poker_env is 10 * big_blind; one scaled-reward unit thus
-    // corresponds to 10 BB.  Keep this in sync if you change the env's scale.
+    // Matches reward_norm = 10 * big_blind in poker_env.
     league_cfg.bb_per_unit_reward  = 10.0f;
 
     League league(factory, bet_cfg,
@@ -59,14 +54,10 @@ int cmd_train(IPokerEnvironmentFactory& factory,
     for (const auto& a : league.anchors()) std::cout << "  " << a->name();
     std::cout << "\n";
 
-    // How often to evaluate against the anchors (synchronous so it doesn't
-    // contend with rollout/update wall-clock).
-    constexpr int snapshot_every = 200;   // updates
+    // League/BR run synchronously — wall-clock cost shows up as gaps
+    // between [update K] lines, not added to rollout/update timings.
+    constexpr int snapshot_every = 200;
 
-    // ── Approximate best-response evaluator ─────────────────────────────
-    // Train a fresh PPO exploiter against a frozen snapshot of the trained
-    // network for a lower bound on its exploitability. Toggleable via
-    // BestResponseConfig::enabled. See include/best_response.h for details.
     const BestResponseConfig& br_cfg = config::kBRConfig;
 
     std::unique_ptr<BestResponseEvaluator> br_eval;
@@ -86,7 +77,6 @@ int cmd_train(IPokerEnvironmentFactory& factory,
         std::cout << "Best-response evaluator: OFF\n";
     }
 
-    // Action labels for the histogram printout.
     auto action_label = [&](int a) -> std::string {
         if (a == 0) return "F";
         if (a == 1) return "C";
@@ -96,15 +86,13 @@ int cmd_train(IPokerEnvironmentFactory& factory,
         return "AI";
     };
 
-    // ── Metrics logging ─────────────────────────────────────────────────
-    // CSVs land under runs/<timestamp>/ and are tailed by tools/plot_live.py.
+    // CSVs at runs/<timestamp>/, tailed by tools/plot_live.py.
     MetricsLogger metrics(make_run_dir());
     std::cout << "Metrics dir: " << metrics.run_dir() << "\n"
               << "  (live plots: `python tools/plot_live.py "
               << metrics.run_dir() << "`)\n";
 
     trainer.set_log_callback([&](const PPOTrainer::UpdateStats& s) {
-        // Per-update CSV row (cheap; cb fires once per update).
         metrics.log_update(s);
 
         if (s.update % 10 == 0) {
@@ -120,10 +108,6 @@ int cmd_train(IPokerEnvironmentFactory& factory,
                       << "\n";
         }
 
-        // Synchronous evaluation every `snapshot_every` updates. Synchronous
-        // (rather than async) so the league's wall-clock cost is *not* added
-        // to the next rollout/update timing — it shows up only as the gap
-        // between consecutive [update K] log lines.
         if (s.update > 0 && s.update % snapshot_every == 0) {
             using clock = std::chrono::steady_clock;
             using ms    = std::chrono::duration<double, std::milli>;
@@ -138,9 +122,8 @@ int cmd_train(IPokerEnvironmentFactory& factory,
                       << "  duration=" << eval_ms << "ms]\n";
             league.print_results(results);
 
-            // Action mix vs `uniform` (sanity baseline) and `pair_all_in`
-            // (folds ~94% preflop — a healthy exploiter shows high
-            // raise/all-in % and low fold % against it).
+            // pair_all_in folds ~94% preflop, so a healthy policy shows
+            // high raise/all-in and low fold against it.
             auto print_action_mix = [&](const char* anchor_name) {
                 int idx = -1;
                 for (size_t i = 0; i < results.size(); ++i) {
@@ -175,9 +158,6 @@ int cmd_train(IPokerEnvironmentFactory& factory,
             std::cout << "\n";
         }
 
-        // Approximate best-response evaluation. Synchronous so its wall
-        // time shows up only as a gap between consecutive [update K] lines,
-        // rather than being counted toward the next rollout/update timing.
         if (br_eval && s.update > 0 && s.update % br_cfg.eval_every == 0) {
             auto br_result = br_eval->evaluate(
                 trainer.network(), s.update, s.global_step);
@@ -203,7 +183,6 @@ int cmd_train(IPokerEnvironmentFactory& factory,
 
     trainer.train();
 
-    // Final evaluation on the trained network.
     std::cout << "\nFinal league evaluation...\n";
     auto final_results = league.evaluate(trainer.network());
     metrics.log_league(/*update=*/-1, /*step=*/-1, final_results);
