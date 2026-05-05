@@ -66,6 +66,14 @@ target_link_libraries(hand_strength_test PRIVATE
     GTest::gtest_main
 )
 
+# MMD tests. Exercises ActorCritic::masked_log_probs and the KL math
+# the trainer uses; needs poker_ppo_lib for the network module + libtorch.
+add_executable(mmd_test mmd_test.cpp)
+target_link_libraries(mmd_test PRIVATE
+    poker_ppo_lib
+    GTest::gtest_main
+)
+
 # Register with CTest so `ctest` discovers the cases automatically.
 include(GoogleTest)
 gtest_discover_tests(showdown_test)
@@ -73,3 +81,4 @@ gtest_discover_tests(attention_test)
 gtest_discover_tests(betting_config_test)
 gtest_discover_tests(poker_config_test)
 gtest_discover_tests(hand_strength_test)
+gtest_discover_tests(mmd_test)

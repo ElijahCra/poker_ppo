@@ -98,6 +98,21 @@ struct PPOConfig {
 
     OpponentPoolConfig  opp_pool;
 
+    // ── MMD regularisation (Sokota et al., ICLR 2023) ────────────────────
+    // When `kl_coef > 0`, adds `kl_coef * KL(π_θ || ρ)` to the PPO loss,
+    // where ρ is a slowly-updated "magnet" snapshot of π_θ. This converts
+    // vanilla self-play PPO into Magnetic Mirror Descent — a regularised
+    // PG method with last-iterate Nash convergence guarantees in the
+    // tabular case (and empirically in the deep variant). Cheap to add:
+    // one extra forward pass per minibatch through the magnet network +
+    // a clone of the policy every `magnet_update_every` updates.
+    //
+    // 0.05 is the value Sokota 2023 found best-on-average; the sweep
+    // range was [2^-3..2^3] × that. Set kl_coef = 0 to disable (recovers
+    // vanilla self-play PPO bit-for-bit).
+    float kl_coef             = 0.05f;
+    int   magnet_update_every = 100;  // updates between magnet refreshes
+
     constexpr int batch_size()     const noexcept { return num_envs * num_steps; }
     constexpr int minibatch_size() const noexcept { return batch_size() / num_minibatches; }
     constexpr int num_updates()    const noexcept { return total_timesteps / batch_size(); }
@@ -190,7 +205,7 @@ static constexpr PPOConfig kPPOConfig{
 
     .total_timesteps  = 300'000'000,
 
-    .hidden_dim       = 512,
+    .hidden_dim       = 256,
     .num_layers       = 3,
     .hist             = BetHistoryConfig{
         .enabled         = false,    // build gate: features::ATTENTION_ENCODER
@@ -216,7 +231,7 @@ static constexpr PPOConfig kPPOConfig{
 };
 
 static constexpr BestResponseConfig kBRConfig{
-    .enabled            = false,
+    .enabled            = true,
     .eval_every         = 1000,
     .updates_per_eval   = 2000,
     .num_envs           = 32,
@@ -234,7 +249,7 @@ static constexpr BestResponseConfig kBRConfig{
     .clip_vloss         = false,
     .warm_start         = false,
     .num_exploiter_seeds = 3,
-    .eval_hands         = 5000,
+    .eval_hands         = 10000,
     .bb_per_unit_reward = 10.0f,
     .seed               = 0xCAFEBABEull,
 };

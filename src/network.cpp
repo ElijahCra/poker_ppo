@@ -255,7 +255,16 @@ ActorCriticImpl::evaluate(torch::Tensor obs, torch::Tensor legal_mask,
     const auto log_prob = log_dist.gather(-1, action.unsqueeze(-1)).squeeze(-1);
     const auto entropy  = -(dist * log_dist).sum(-1);
 
-    return {log_prob, value, entropy};
+    return {log_prob, log_dist, value, entropy};
+}
+
+torch::Tensor
+ActorCriticImpl::masked_log_probs(torch::Tensor obs, torch::Tensor legal_mask) {
+    // Actor-only forward — the critic's value head isn't needed for the
+    // KL term, so saving the second tower call is essentially free.
+    auto logits       = actor_->forward(obs);
+    const auto masked = apply_mask(logits, legal_mask);
+    return torch::log_softmax(masked, -1);
 }
 
 ActorCritic clone_actor_critic(const ActorCritic&  src,

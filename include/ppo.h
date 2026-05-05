@@ -104,6 +104,11 @@ private:
     std::unique_ptr<RolloutCollector>    collector_;
     std::unique_ptr<OpponentManager>     opp_mgr_;
 
+    // MMD magnet — frozen snapshot of `network_`, refreshed every
+    // `cfg_.magnet_update_every` updates. Null when `cfg_.kl_coef == 0`
+    // (vanilla self-play PPO; the regulariser is bypassed entirely).
+    ActorCritic                          magnet_{nullptr};
+
     int update_idx_ = 0;
 
     LogCallback log_cb_;

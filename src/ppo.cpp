@@ -62,6 +62,17 @@ PPOTrainer::PPOTrainer(IPokerEnvironmentFactory& env_factory,
         cfg_.hidden_dim, cfg_.num_layers,
         cfg_.hist, cfg_.round_summary, device_);
     opp_mgr_->reset_assignments(cfg_.num_envs);
+
+    // MMD magnet — initialise from the random-init network so the very
+    // first update's KL term is well-defined. Refreshed every
+    // cfg_.magnet_update_every updates inside train(). Only allocated
+    // when the regulariser is enabled.
+    if constexpr (cfg_.kl_coef > 0.0f) {
+        magnet_ = clone_actor_critic(
+            network_, obs_dim, action_count,
+            cfg_.hidden_dim, cfg_.num_layers,
+            cfg_.hist, cfg_.round_summary, device_);
+    }
 }
 
 PPOTrainer::~PPOTrainer() = default;
@@ -116,6 +127,20 @@ void PPOTrainer::train() {
         }
 
         opp_mgr_->maybe_snapshot(update_idx_, network_);
+
+        // Refresh the MMD magnet on cadence. Slow refresh = strong
+        // anchoring (drives π_θ toward older self); fast refresh =
+        // weak anchoring (closer to vanilla PPO). Sokota 2023's grid
+        // landed at K ≈ 100, the default in config.h.
+        if constexpr (cfg_.kl_coef > 0.0f) {
+            const int K = std::max(1, cfg_.magnet_update_every);
+            if (update_idx_ > 0 && update_idx_ % K == 0) {
+                magnet_ = clone_actor_critic(
+                    network_, collector_->obs_dim(), collector_->action_count(),
+                    cfg_.hidden_dim, cfg_.num_layers,
+                    cfg_.hist, cfg_.round_summary, device_);
+            }
+        }
     }
 }
 
@@ -314,9 +339,35 @@ PPOTrainer::UpdateStats PPOTrainer::update() {
 
             auto entropy_loss = er.entropy.mean();
 
+            // MMD regularisation: KL(π_θ || ρ) per state, mean over the
+            // minibatch. ρ is the magnet — a slowly-refreshed snapshot of
+            // π_θ. Pulls π_θ toward an older self each step, which gives
+            // the regularised-PG family its last-iterate Nash convergence
+            // guarantee in the tabular case (Sokota et al. 2023). Stripped
+            // from the binary when `cfg_.kl_coef == 0` (vanilla PPO).
+            torch::Tensor mmd_kl_loss;
+            if constexpr (cfg_.kl_coef > 0.0f) {
+                torch::Tensor magnet_log_probs;
+                {
+                    torch::NoGradGuard ng;
+                    magnet_log_probs = magnet_->masked_log_probs(mb_obs, mb_masks);
+                }
+                // KL(π || ρ) = Σ_a π(a) (log π(a) − log ρ(a)).
+                // Use exp(log π) for the weight rather than a separate
+                // softmax — keeps gradients flowing through the same
+                // tensor that produced log_probs_all.
+                const auto pi   = er.log_probs_all.exp();
+                const auto kl   = (pi * (er.log_probs_all - magnet_log_probs))
+                                  .sum(/*dim=*/-1);
+                mmd_kl_loss     = kl.mean();
+            }
+
             auto loss = pg_loss
                       - ent_coef_now * entropy_loss
                       + cfg_.vf_coef * v_loss;
+            if constexpr (cfg_.kl_coef > 0.0f) {
+                loss = loss + cfg_.kl_coef * mmd_kl_loss;
+            }
 
             optimizer_->zero_grad();
             loss.backward();

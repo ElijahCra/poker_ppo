@@ -80,13 +80,24 @@ public:
     };
     ActionResult get_action(torch::Tensor obs, torch::Tensor legal_mask);
 
+    /// `log_probs_all` is the full masked log-softmax;
+    /// `log_prob.gather(action)` recovers `log_prob`. Free to expose
+    /// since `evaluate()` already runs `log_softmax` internally; needed
+    /// by the MMD regulariser, which computes KL across all actions.
     struct EvalResult {
-        torch::Tensor log_prob;
-        torch::Tensor value;
-        torch::Tensor entropy;
+        torch::Tensor log_prob;       // [B]    log π(a|s) for stored a
+        torch::Tensor log_probs_all;  // [B, A] full masked log-softmax
+        torch::Tensor value;          // [B]
+        torch::Tensor entropy;        // [B]
     };
     EvalResult evaluate(torch::Tensor obs, torch::Tensor legal_mask,
                         const torch::Tensor &action);
+
+    /// Masked log-softmax over the full action set, NoGrad-friendly.
+    /// Used by the MMD regulariser to evaluate the frozen magnet on the
+    /// same obs the live policy is updating against. Returns [B, A].
+    torch::Tensor masked_log_probs(torch::Tensor obs,
+                                   torch::Tensor legal_mask);
 
 private:
     torch::Tensor apply_mask(torch::Tensor logits, torch::Tensor mask);
