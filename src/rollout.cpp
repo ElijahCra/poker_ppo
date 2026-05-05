@@ -260,7 +260,10 @@ void RolloutCollector::collect(Strategy         strategy,
                                float            gae_lambda)
 {
     network->eval();
-    torch::NoGradGuard no_grad;
+    // InferenceMode is stricter than NoGradGuard (no view tracking, no
+    // version counter) — slightly faster and safe here because rollout
+    // tensors are detached/copied to CPU before storage in the buffer.
+    c10::InferenceMode inference_guard;
 
     if (strategy == Strategy::Threadpool) ensure_step_pool();
 

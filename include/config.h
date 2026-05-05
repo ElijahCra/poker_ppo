@@ -209,10 +209,10 @@ static constexpr PPOConfig kPPOConfig{
     .num_layers       = 3,
     .hist             = BetHistoryConfig{
         .enabled         = false,    // build gate: features::ATTENTION_ENCODER
-        .max_history_len = 32,
+        .max_history_len = 16,       // HUNL caps actions at ~16/hand; T² attn cost
         .attn_dim        = 64,
         .attn_heads      = 4,
-        .ffn_mult        = 4,
+        .ffn_mult        = 2,        // FF hidden = 128, half the trunk width
         .num_blocks      = 1,
     },
     .round_summary    = RoundSummaryConfig{

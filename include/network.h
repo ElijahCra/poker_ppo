@@ -18,27 +18,23 @@ inline constexpr float kAttentionMaskLogit = -1e9f;
 
 inline constexpr float kAdvantageEps = 1e-8f;
 
-// One half of an actor-critic pair: optional bet-history attention encoder
-// + MLP trunk + linear head. Used twice by ActorCritic so the value-loss
-// gradient doesn't flow into the actor's representation (CleanRL convention).
-class TowerImpl : public torch::nn::Module {
+// Bet-history transformer encoder. Owned by ActorCritic and shared
+// across actor and critic — running it once per forward halves the
+// attention compute compared to giving each tower its own encoder.
+// Only instantiated when hist.enabled.
+class HistoryEncoderImpl : public torch::nn::Module {
 public:
-    TowerImpl(int obs_dim, int output_dim,
-              int hidden_dim, int num_layers,
-              float head_init_std,
-              BetHistoryConfig    hist,
-              RoundSummaryConfig  round_summary);
+    explicit HistoryEncoderImpl(BetHistoryConfig hist);
 
-    torch::Tensor forward(torch::Tensor obs);
+    // history_block: [B, T*(1+F)] — first T floats are the validity mask,
+    // followed by T*F token features. Returns the CLS embedding [B, D].
+    torch::Tensor forward(const torch::Tensor& history_block);
+
+    [[nodiscard]] int output_dim() const noexcept { return hist_.attn_dim; }
 
 private:
-    torch::Tensor encode_history(const torch::Tensor& history_block);
+    BetHistoryConfig hist_;
 
-    BetHistoryConfig    hist_;
-    RoundSummaryConfig  round_summary_;
-    ObservationLayout   layout_;
-
-    // Only registered when hist.enabled.
     torch::nn::Linear token_embed_{nullptr};
     torch::Tensor cls_token_;
     torch::Tensor pos_embed_;
@@ -48,14 +44,31 @@ private:
     std::vector<torch::nn::LayerNorm> ffn_ln_;
     std::vector<torch::nn::Linear>    ffn1_;
     std::vector<torch::nn::Linear>    ffn2_;
+};
+TORCH_MODULE(HistoryEncoder);
 
+// MLP trunk + linear head. Used twice by ActorCritic so the value-loss
+// gradient doesn't flow into the actor's representation (CleanRL convention).
+// Pre-flattened input: ActorCritic does the obs slicing and (optional)
+// history encoding, then hands the tower a single trunk-input tensor.
+class TowerImpl : public torch::nn::Module {
+public:
+    TowerImpl(int in_dim, int output_dim,
+              int hidden_dim, int num_layers,
+              float head_init_std);
+
+    torch::Tensor forward(torch::Tensor x);
+
+private:
     torch::nn::Sequential trunk_{nullptr};
     torch::nn::Linear     head_{nullptr};
 };
 TORCH_MODULE(Tower);
 
-// Two independent Towers (no shared params). Same instance plays both
-// seats — sharing across players, not across actor/critic.
+// Two independent Towers (no shared MLP params). Optional shared
+// HistoryEncoder is run once per forward; its output is fed to the
+// actor with grad and to the critic detached, so value loss can't
+// reshape the encoder's representation.
 //
 // Heads: actor std=0.01, critic std=1.0; trunk orthogonal(√2)+Tanh.
 // Actor masks illegal actions before softmax via kIllegalActionLogit.
@@ -102,6 +115,20 @@ public:
 private:
     torch::Tensor apply_mask(torch::Tensor logits, torch::Tensor mask);
 
+    // Encoder runs only when hist_.enabled. Returns an undefined tensor
+    // otherwise — callers check .defined() to skip the cat.
+    torch::Tensor encode_history(const torch::Tensor& obs);
+
+    // Concatenate the tower input from obs slices + (optional) encoded
+    // history. `encoded` may be detached (critic side) or live (actor side).
+    torch::Tensor build_trunk_input(const torch::Tensor& obs,
+                                    const torch::Tensor& encoded);
+
+    BetHistoryConfig    hist_;
+    RoundSummaryConfig  round_summary_;
+    ObservationLayout   layout_;
+
+    HistoryEncoder encoder_{nullptr};   // unset when hist_.enabled is false
     Tower actor_{nullptr};
     Tower critic_{nullptr};
 };

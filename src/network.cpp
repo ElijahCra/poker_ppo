@@ -6,109 +6,66 @@
 
 namespace poker_ppo {
 
-TowerImpl::TowerImpl(int obs_dim, int output_dim,
-                     int hidden_dim, int num_layers,
-                     float head_init_std,
-                     BetHistoryConfig    hist,
-                     RoundSummaryConfig  round_summary)
-    : hist_(hist),
-      round_summary_(round_summary),
-      layout_(ObservationLayout::build(hist, round_summary))
+// ─── HistoryEncoder ──────────────────────────────────────────────────────
+
+HistoryEncoderImpl::HistoryEncoderImpl(BetHistoryConfig hist)
+    : hist_(hist)
 {
-    if (layout_.total_dim != obs_dim) {
+    const int D  = hist_.attn_dim;
+    const int H  = hist_.attn_heads;
+    const int T  = hist_.max_history_len;
+    const int F  = BetHistoryConfig::feat_per_action;
+    const int FF = hist_.ffn_mult * D;
+
+    if (D <= 0 || H <= 0 || D % H != 0) {
         throw std::invalid_argument(
-            "Tower: obs_dim does not match ObservationLayout::build(hist, round_summary)");
-    }
-    const int tower_static_dim = layout_.static_off + ObservationLayout::FEAT_STATIC;
-    int trunk_in_dim = tower_static_dim + layout_.round_summary_dim;
-
-    // Whole block dead-code-eliminated when the build flag is off.
-    if constexpr (features::ATTENTION_ENCODER) {
-        if (hist_.enabled) {
-            const int D  = hist_.attn_dim;
-            const int H  = hist_.attn_heads;
-            const int T  = hist_.max_history_len;
-            const int F  = BetHistoryConfig::feat_per_action;
-            const int FF = hist_.ffn_mult * D;
-
-            if (D <= 0 || H <= 0 || D % H != 0) {
-                throw std::invalid_argument(
-                    "BetHistoryConfig: attn_dim must be a positive multiple of attn_heads");
-            }
-
-            token_embed_ = register_module("token_embed", torch::nn::Linear(F, D));
-
-            cls_token_ = register_parameter("cls_token", torch::zeros({1, 1, D}));
-            pos_embed_ = register_parameter("pos_embed", torch::zeros({1, T + 1, D}));
-            torch::nn::init::normal_(cls_token_, /*mean=*/0.0, /*std=*/0.02);
-            torch::nn::init::normal_(pos_embed_, /*mean=*/0.0, /*std=*/0.02);
-
-            attn_ln_.reserve(hist_.num_blocks);
-            qkv_proj_.reserve(hist_.num_blocks);
-            out_proj_.reserve(hist_.num_blocks);
-            ffn_ln_.reserve(hist_.num_blocks);
-            ffn1_.reserve(hist_.num_blocks);
-            ffn2_.reserve(hist_.num_blocks);
-            for (int b = 0; b < hist_.num_blocks; ++b) {
-                const std::string s = std::to_string(b);
-                attn_ln_.push_back(register_module(
-                    "attn_ln_" + s, torch::nn::LayerNorm(torch::nn::LayerNormOptions({D}))));
-                qkv_proj_.push_back(register_module(
-                    "qkv_proj_" + s, torch::nn::Linear(D, 3 * D)));
-                out_proj_.push_back(register_module(
-                    "out_proj_" + s, torch::nn::Linear(D, D)));
-                ffn_ln_.push_back(register_module(
-                    "ffn_ln_" + s, torch::nn::LayerNorm(torch::nn::LayerNormOptions({D}))));
-                ffn1_.push_back(register_module(
-                    "ffn1_" + s, torch::nn::Linear(D, FF)));
-                ffn2_.push_back(register_module(
-                    "ffn2_" + s, torch::nn::Linear(FF, D)));
-            }
-
-            // CLS embedding (D) feeds the trunk alongside round_summary if both on.
-            trunk_in_dim += D;
-        }
+            "BetHistoryConfig: attn_dim must be a positive multiple of attn_heads");
     }
 
-    torch::nn::Sequential trunk;
-    int in_dim = trunk_in_dim;
-    for (int i = 0; i < num_layers; ++i) {
-        trunk->push_back(torch::nn::Linear(in_dim, hidden_dim));
-        trunk->push_back(torch::nn::Tanh());
-        in_dim = hidden_dim;
-    }
-    trunk_ = register_module("trunk", trunk);
-    head_  = register_module("head",  torch::nn::Linear(hidden_dim, output_dim));
+    token_embed_ = register_module("token_embed", torch::nn::Linear(F, D));
 
-    // Orthogonal for trunk/head, xavier for attention.
-    for (auto& m : trunk_->modules(/*include_self=*/false)) {
-        if (auto* lin = m->as<torch::nn::Linear>()) {
-            torch::nn::init::orthogonal_(lin->weight, std::sqrt(2.0));
-            torch::nn::init::constant_(lin->bias, 0.0);
-        }
-    }
-    torch::nn::init::orthogonal_(head_->weight, head_init_std);
-    torch::nn::init::constant_(head_->bias, 0.0);
+    cls_token_ = register_parameter("cls_token", torch::zeros({1, 1, D}));
+    pos_embed_ = register_parameter("pos_embed", torch::zeros({1, T + 1, D}));
+    torch::nn::init::normal_(cls_token_, /*mean=*/0.0, /*std=*/0.02);
+    torch::nn::init::normal_(pos_embed_, /*mean=*/0.0, /*std=*/0.02);
 
-    if constexpr (features::ATTENTION_ENCODER) {
-        if (hist_.enabled) {
-            auto xavier_lin = [](torch::nn::Linear& lin) {
-                torch::nn::init::xavier_uniform_(lin->weight);
-                torch::nn::init::constant_(lin->bias, 0.0);
-            };
-            xavier_lin(token_embed_);
-            for (int b = 0; b < hist_.num_blocks; ++b) {
-                xavier_lin(qkv_proj_[b]);
-                xavier_lin(out_proj_[b]);
-                xavier_lin(ffn1_[b]);
-                xavier_lin(ffn2_[b]);
-            }
-        }
+    attn_ln_.reserve(hist_.num_blocks);
+    qkv_proj_.reserve(hist_.num_blocks);
+    out_proj_.reserve(hist_.num_blocks);
+    ffn_ln_.reserve(hist_.num_blocks);
+    ffn1_.reserve(hist_.num_blocks);
+    ffn2_.reserve(hist_.num_blocks);
+    for (int b = 0; b < hist_.num_blocks; ++b) {
+        const std::string s = std::to_string(b);
+        attn_ln_.push_back(register_module(
+            "attn_ln_" + s, torch::nn::LayerNorm(torch::nn::LayerNormOptions({D}))));
+        qkv_proj_.push_back(register_module(
+            "qkv_proj_" + s, torch::nn::Linear(D, 3 * D)));
+        out_proj_.push_back(register_module(
+            "out_proj_" + s, torch::nn::Linear(D, D)));
+        ffn_ln_.push_back(register_module(
+            "ffn_ln_" + s, torch::nn::LayerNorm(torch::nn::LayerNormOptions({D}))));
+        ffn1_.push_back(register_module(
+            "ffn1_" + s, torch::nn::Linear(D, FF)));
+        ffn2_.push_back(register_module(
+            "ffn2_" + s, torch::nn::Linear(FF, D)));
+    }
+
+    auto xavier_lin = [](torch::nn::Linear& lin) {
+        torch::nn::init::xavier_uniform_(lin->weight);
+        torch::nn::init::constant_(lin->bias, 0.0);
+    };
+    xavier_lin(token_embed_);
+    for (int b = 0; b < hist_.num_blocks; ++b) {
+        xavier_lin(qkv_proj_[b]);
+        xavier_lin(out_proj_[b]);
+        xavier_lin(ffn1_[b]);
+        xavier_lin(ffn2_[b]);
     }
 }
 
 torch::Tensor
-TowerImpl::encode_history(const torch::Tensor& history_block) {
+HistoryEncoderImpl::forward(const torch::Tensor& history_block) {
     // history_block: [B, T*(1+F)]
     const int T = hist_.max_history_len;
     const int F = BetHistoryConfig::feat_per_action;
@@ -129,6 +86,7 @@ TowerImpl::encode_history(const torch::Tensor& history_block) {
 
     x = x + pos_embed_;
 
+    // Additive mask: [B, 1, 1, T+1] broadcasts to [B, H, T+1, T+1] inside SDPA.
     auto add_mask = (1.0 - attn_mask).unsqueeze(1).unsqueeze(1) * kAttentionMaskLogit;
 
     const int64_t L = T + 1;
@@ -137,18 +95,20 @@ TowerImpl::encode_history(const torch::Tensor& history_block) {
         auto qkv = qkv_proj_[b]->forward(h);          // [B, L, 3D]
         auto qkv_split = qkv.chunk(3, /*dim=*/-1);
         auto reshape_heads = [&](torch::Tensor t) {
-            return t.reshape({B, L, H, d_head}).transpose(1, 2).contiguous();
+            return t.reshape({B, L, H, d_head}).transpose(1, 2);
         };
         auto q = reshape_heads(qkv_split[0]);
         auto k = reshape_heads(qkv_split[1]);
         auto v = reshape_heads(qkv_split[2]);
 
-        auto scores = torch::matmul(q, k.transpose(-2, -1))
-                    / std::sqrt(static_cast<double>(d_head));
-        scores = scores + add_mask;
-        auto attn = torch::softmax(scores, /*dim=*/-1);
+        // Fused kernel: Flash on CUDA, oneDNN on CPU. Replaces a manual
+        // matmul → scale → mask-add → softmax → matmul chain.
+        auto out = torch::scaled_dot_product_attention(
+            q, k, v,
+            /*attn_mask=*/add_mask,
+            /*dropout_p=*/0.0,
+            /*is_causal=*/false);
 
-        auto out = torch::matmul(attn, v);
         out = out.transpose(1, 2).contiguous().reshape({B, L, D});
         out = out_proj_[b]->forward(out);
         x = x + out;
@@ -163,7 +123,88 @@ TowerImpl::encode_history(const torch::Tensor& history_block) {
     return x.select(/*dim=*/1, /*index=*/0);   // CLS, [B, D]
 }
 
-torch::Tensor TowerImpl::forward(torch::Tensor obs) {
+// ─── Tower (MLP trunk + head) ────────────────────────────────────────────
+
+TowerImpl::TowerImpl(int in_dim, int output_dim,
+                     int hidden_dim, int num_layers,
+                     float head_init_std)
+{
+    torch::nn::Sequential trunk;
+    int d = in_dim;
+    for (int i = 0; i < num_layers; ++i) {
+        trunk->push_back(torch::nn::Linear(d, hidden_dim));
+        trunk->push_back(torch::nn::Tanh());
+        d = hidden_dim;
+    }
+    trunk_ = register_module("trunk", trunk);
+    head_  = register_module("head",  torch::nn::Linear(hidden_dim, output_dim));
+
+    for (auto& m : trunk_->modules(/*include_self=*/false)) {
+        if (auto* lin = m->as<torch::nn::Linear>()) {
+            torch::nn::init::orthogonal_(lin->weight, std::sqrt(2.0));
+            torch::nn::init::constant_(lin->bias, 0.0);
+        }
+    }
+    torch::nn::init::orthogonal_(head_->weight, head_init_std);
+    torch::nn::init::constant_(head_->bias, 0.0);
+}
+
+torch::Tensor TowerImpl::forward(torch::Tensor x) {
+    return head_->forward(trunk_->forward(x));
+}
+
+// ─── ActorCritic (shared encoder + two towers) ───────────────────────────
+
+ActorCriticImpl::ActorCriticImpl(int obs_dim, int action_count,
+                                 int hidden_dim, int num_layers,
+                                 BetHistoryConfig    hist,
+                                 RoundSummaryConfig  round_summary)
+    : hist_(hist),
+      round_summary_(round_summary),
+      layout_(ObservationLayout::build(hist, round_summary))
+{
+    if (layout_.total_dim != obs_dim) {
+        throw std::invalid_argument(
+            "ActorCritic: obs_dim does not match ObservationLayout::build(hist, round_summary)");
+    }
+
+    int trunk_in_dim =
+        layout_.static_off + ObservationLayout::FEAT_STATIC + layout_.round_summary_dim;
+
+    if constexpr (features::ATTENTION_ENCODER) {
+        if (hist_.enabled) {
+            encoder_ = register_module("history_encoder",
+                                       HistoryEncoder(hist_));
+            trunk_in_dim += encoder_->output_dim();
+        }
+    }
+
+    actor_  = register_module("actor",
+                              Tower(trunk_in_dim, action_count,
+                                    hidden_dim, num_layers,
+                                    /*head_init_std=*/0.01f));
+    critic_ = register_module("critic",
+                              Tower(trunk_in_dim, /*output_dim=*/1,
+                                    hidden_dim, num_layers,
+                                    /*head_init_std=*/1.0f));
+}
+
+torch::Tensor
+ActorCriticImpl::encode_history(const torch::Tensor& obs) {
+    if constexpr (features::ATTENTION_ENCODER) {
+        if (hist_.enabled && !encoder_.is_empty()) {
+            auto history_blk = obs.narrow(1, layout_.history_off,
+                                          layout_.history_dim);
+            return encoder_->forward(history_blk);
+        }
+    }
+    return {};
+}
+
+torch::Tensor
+ActorCriticImpl::build_trunk_input(const torch::Tensor& obs,
+                                   const torch::Tensor& encoded)
+{
     const int tower_static_dim =
         layout_.static_off + ObservationLayout::FEAT_STATIC;
 
@@ -180,47 +221,36 @@ torch::Tensor TowerImpl::forward(torch::Tensor obs) {
         }
     }
 
-    if constexpr (features::ATTENTION_ENCODER) {
-        if (hist_.enabled) {
-            auto history_blk = obs.narrow(1, layout_.history_off,
-                                          layout_.history_dim);
-            parts.push_back(encode_history(history_blk));
-        }
+    if (encoded.defined()) {
+        parts.push_back(encoded);
     }
 
-    torch::Tensor trunk_in = (parts.size() == 1)
-        ? parts[0]
-        : torch::cat(parts, /*dim=*/-1);
-    auto features = trunk_->forward(trunk_in);
-    return head_->forward(features);
-}
-
-ActorCriticImpl::ActorCriticImpl(int obs_dim, int action_count,
-                                 int hidden_dim, int num_layers,
-                                 BetHistoryConfig    hist,
-                                 RoundSummaryConfig  round_summary)
-{
-    actor_  = register_module("actor",
-                              Tower(obs_dim, action_count,
-                                    hidden_dim, num_layers,
-                                    /*head_init_std=*/0.01f,
-                                    hist, round_summary));
-    critic_ = register_module("critic",
-                              Tower(obs_dim, /*output_dim=*/1,
-                                    hidden_dim, num_layers,
-                                    /*head_init_std=*/1.0f,
-                                    hist, round_summary));
+    return (parts.size() == 1) ? parts[0] : torch::cat(parts, /*dim=*/-1);
 }
 
 std::pair<torch::Tensor, torch::Tensor>
 ActorCriticImpl::forward(torch::Tensor obs) {
-    auto logits = actor_->forward(obs);
-    auto value  = critic_->forward(obs).squeeze(-1);
+    auto encoded = encode_history(obs);
+
+    // Detach for the critic so value-loss gradient can't reshape the
+    // encoder representation — preserves the CleanRL "no shared trunk"
+    // semantics for the encoder. When no encoder, both inputs are
+    // identical and we share the cat result.
+    auto actor_in = build_trunk_input(obs, encoded);
+    auto critic_in = encoded.defined()
+        ? build_trunk_input(obs, encoded.detach())
+        : actor_in;
+
+    auto logits = actor_->forward(actor_in);
+    auto value  = critic_->forward(critic_in).squeeze(-1);
     return {logits, value};
 }
 
 torch::Tensor ActorCriticImpl::get_value(torch::Tensor obs) {
-    return critic_->forward(obs).squeeze(-1);
+    auto encoded = encode_history(obs);
+    auto critic_in = build_trunk_input(
+        obs, encoded.defined() ? encoded.detach() : encoded);
+    return critic_->forward(critic_in).squeeze(-1);
 }
 
 torch::Tensor
@@ -260,11 +290,12 @@ ActorCriticImpl::evaluate(torch::Tensor obs, torch::Tensor legal_mask,
 
 torch::Tensor
 ActorCriticImpl::masked_log_probs(torch::Tensor obs, torch::Tensor legal_mask) {
-    // Actor-only forward — the critic's value head isn't needed for the
-    // KL term, so saving the second tower call is essentially free.
-    auto logits       = actor_->forward(obs);
-    const auto masked = apply_mask(logits, legal_mask);
-    return torch::log_softmax(masked, -1);
+    // Actor-only forward — saves the critic tower call. Encoder still
+    // runs once (it's not duplicated across towers anymore).
+    auto encoded  = encode_history(obs);
+    auto actor_in = build_trunk_input(obs, encoded);
+    auto logits   = actor_->forward(actor_in);
+    return torch::log_softmax(apply_mask(logits, legal_mask), -1);
 }
 
 ActorCritic clone_actor_critic(const ActorCritic&  src,
