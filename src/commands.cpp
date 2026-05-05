@@ -97,7 +97,8 @@ int cmd_train(IPokerEnvironmentFactory& factory,
         metrics.log_update(s);
 
         if (s.update % 10 == 0) {
-            std::cout << "update=" << s.update
+            std::cout << std::fixed << std::setprecision(4)
+                      << "update=" << s.update
                       << "  step="   << s.global_step
                       << "  pg="     << s.policy_loss
                       << "  vf="     << s.value_loss
@@ -105,8 +106,9 @@ int cmd_train(IPokerEnvironmentFactory& factory,
                       << "  kl="     << s.approx_kl
                       << "  clip="   << s.clip_fraction
                       << "  ev="     << s.explained_variance
-                      << "  lr="     << s.learning_rate
-                      << "\n";
+                      << "  lr="     << std::setprecision(6) << s.learning_rate
+                      << "\n"
+                      << std::defaultfloat << std::setprecision(6);
         }
 
         if (s.update > 0 && s.update % snapshot_every == 0) {

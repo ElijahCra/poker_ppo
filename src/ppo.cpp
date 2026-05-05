@@ -116,14 +116,15 @@ void PPOTrainer::train() {
         if (log_cb_) log_cb_(stats);
 
         if (update_idx_ % 10 == 0) {
-            std::cout << "[update " << update_idx_ << "]"
+            std::cout << std::fixed << std::setprecision(1)
+                      << "[update " << update_idx_ << "]"
                       << "  rollout=" << stats.rollout_ms << "ms"
                       << "  update=" << stats.update_ms << "ms";
             if (opp_mgr_->enabled()) {
                 std::cout << "  pool=" << opp_mgr_->size()
                           << "/" << opp_mgr_->capacity();
             }
-            std::cout << "\n";
+            std::cout << "\n" << std::defaultfloat << std::setprecision(6);
         }
 
         opp_mgr_->maybe_snapshot(update_idx_, network_);

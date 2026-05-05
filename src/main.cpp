@@ -99,11 +99,8 @@ int main(int argc, char** argv) {
         std::cout << "\n";
     }
 
-    // CPU has historically beaten CUDA for small configs (3×256 MLP @
-    // batch≈32) — kernel-launch overhead dominates. Revisit at
-    // hidden_dim ≥ 512 or num_envs ≥ 128.
-    //torch::Device device = torch::cuda::is_available() ? torch::kCUDA : torch::mps::is_available() ? torch::kMPS : torch::kCPU;
-    torch::Device device = torch::kCPU;
+    torch::Device device = torch::cuda::is_available() ? torch::kCUDA : torch::mps::is_available() ? torch::kMPS : torch::kCPU;
+    //torch::Device device = torch::kCPU;
     std::cout << "Using device: " << device << "\n";
 
     PokerEnvironmentFactory factory(poker_cfg);

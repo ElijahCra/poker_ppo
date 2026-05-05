@@ -233,7 +233,7 @@ static constexpr PPOConfig kPPOConfig{
 static constexpr BestResponseConfig kBRConfig{
     .enabled            = true,
     .eval_every         = 1000,
-    .updates_per_eval   = 2000,
+    .updates_per_eval   = 500,
     .num_envs           = 32,
     .num_steps          = 128,
     .update_epochs      = 4,
@@ -248,8 +248,8 @@ static constexpr BestResponseConfig kBRConfig{
     .norm_advantages    = true,
     .clip_vloss         = false,
     .warm_start         = false,
-    .num_exploiter_seeds = 3,
-    .eval_hands         = 10000,
+    .num_exploiter_seeds = 2,
+    .eval_hands         = 5000,
     .bb_per_unit_reward = 10.0f,
     .seed               = 0xCAFEBABEull,
 };
