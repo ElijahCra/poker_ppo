@@ -183,9 +183,9 @@ static constexpr BetConfig kBetConfig{
 
 static constexpr PPOConfig kPPOConfig{
     .gamma            = 1.0f,
-    .gae_lambda       = 0.975f,
+    .gae_lambda       = 0.95f,
     .clip_coef        = 0.1f,
-    .ent_coef         = 0.05f,
+    .ent_coef         = 0.4f,
     .vf_coef          = 0.5f,
     .max_grad_norm    = 0.5f,
     .clip_vloss       = true,
@@ -195,20 +195,20 @@ static constexpr PPOConfig kPPOConfig{
     .anneal_lr        = true,
     .min_lr_frac      = 0.2f,
 
-    .anneal_ent_coef  = false,
-    .ent_coef_min     = 0.01f,
+    .anneal_ent_coef  = true,
+    .ent_coef_min     = 0.05f,
 
     .num_envs         = 96,
     .num_steps        = 128,
     .update_epochs    = 4,
     .num_minibatches  = 4,
 
-    .total_timesteps  = 300'000'000,
+    .total_timesteps  = 600'000'000,
 
-    .hidden_dim       = 256,
+    .hidden_dim       = 512,
     .num_layers       = 3,
     .hist             = BetHistoryConfig{
-        .enabled         = false,    // build gate: features::ATTENTION_ENCODER
+        .enabled         = true,    // build gate: features::ATTENTION_ENCODER
         .max_history_len = 16,       // HUNL caps actions at ~16/hand; T² attn cost
         .attn_dim        = 64,
         .attn_heads      = 4,
@@ -216,11 +216,11 @@ static constexpr PPOConfig kPPOConfig{
         .num_blocks      = 1,
     },
     .round_summary    = RoundSummaryConfig{
-        .enabled = false,            // build gate: features::ROUND_SUMMARY
+        .enabled = true,            // build gate: features::ROUND_SUMMARY
     },
 
     .opp_pool         = OpponentPoolConfig{
-        .enabled                 = false,
+        .enabled                 = true,
         .max_size                = 20,
         .snapshot_every          = 200,
         .warmup_updates          = 400,
@@ -232,14 +232,14 @@ static constexpr PPOConfig kPPOConfig{
 
 static constexpr BestResponseConfig kBRConfig{
     .enabled            = true,
-    .eval_every         = 1000,
-    .updates_per_eval   = 500,
+    .eval_every         = 2000,    // less frequent → cheaper overall, deeper per eval
+    .updates_per_eval   = 3000,    // more chase time per eval
     .num_envs           = 32,
     .num_steps          = 128,
     .update_epochs      = 4,
     .num_minibatches    = 4,
-    .learning_rate      = 3.0e-4f,
-    .ent_coef           = 0.01f,
+    .learning_rate      = 1.5e-4f, // warm_start needs gentle LR; high LR shocks the exploiter
+    .ent_coef           = 0.03f,   // more exploration to escape negative-BR plateau
     .vf_coef            = 0.5f,
     .clip_coef          = 0.2f,
     .max_grad_norm      = 0.5f,
@@ -247,9 +247,9 @@ static constexpr BestResponseConfig kBRConfig{
     .gae_lambda         = 1.0f,
     .norm_advantages    = true,
     .clip_vloss         = false,
-    .warm_start         = false,
-    .num_exploiter_seeds = 2,
-    .eval_hands         = 5000,
+    .warm_start         = true,
+    .num_exploiter_seeds = 1,
+    .eval_hands         = 10000,
     .bb_per_unit_reward = 10.0f,
     .seed               = 0xCAFEBABEull,
 };
