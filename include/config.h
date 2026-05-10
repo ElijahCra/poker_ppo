@@ -183,7 +183,7 @@ static constexpr BetConfig kBetConfig{
 
 static constexpr PPOConfig kPPOConfig{
     .gamma            = 1.0f,
-    .gae_lambda       = 0.95f,
+    .gae_lambda       = 0.90f,
     .clip_coef        = 0.1f,
     .ent_coef         = 0.4f,
     .vf_coef          = 0.5f,
@@ -196,7 +196,7 @@ static constexpr PPOConfig kPPOConfig{
     .min_lr_frac      = 0.2f,
 
     .anneal_ent_coef  = true,
-    .ent_coef_min     = 0.05f,
+    .ent_coef_min     = 0.01f,
 
     .num_envs         = 96,
     .num_steps        = 128,
@@ -206,14 +206,14 @@ static constexpr PPOConfig kPPOConfig{
     .total_timesteps  = 600'000'000,
 
     .hidden_dim       = 512,
-    .num_layers       = 3,
+    .num_layers       = 4,
     .hist             = BetHistoryConfig{
         .enabled         = true,    // build gate: features::ATTENTION_ENCODER
         .max_history_len = 16,       // HUNL caps actions at ~16/hand; T² attn cost
-        .attn_dim        = 64,
+        .attn_dim        = 96,
         .attn_heads      = 4,
-        .ffn_mult        = 2,        // FF hidden = 128, half the trunk width
-        .num_blocks      = 1,
+        .ffn_mult        = 3,        // FF hidden = 128, half the trunk width
+        .num_blocks      = 2,
     },
     .round_summary    = RoundSummaryConfig{
         .enabled = true,            // build gate: features::ROUND_SUMMARY
@@ -232,7 +232,7 @@ static constexpr PPOConfig kPPOConfig{
 
 static constexpr BestResponseConfig kBRConfig{
     .enabled            = true,
-    .eval_every         = 2000,    // less frequent → cheaper overall, deeper per eval
+    .eval_every         = 3000,    // less frequent → cheaper overall, deeper per eval
     .updates_per_eval   = 3000,    // more chase time per eval
     .num_envs           = 32,
     .num_steps          = 128,
