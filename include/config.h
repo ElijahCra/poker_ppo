@@ -34,7 +34,7 @@ struct BetHistoryConfig {
     }
 };
 
-// Per-round summary block. 4 features × 4 rounds = 16 floats.
+// Per-round summary block. 4 features × 4 rounds
 //   0  my_chips_in / initial_stack
 //   1  opp_chips_in / initial_stack
 //   2  raises_count / max_raises_per_round
@@ -58,7 +58,7 @@ struct OpponentPoolConfig {
     int      snapshot_every         = 200;
     int      warmup_updates         = 200;
     float    p_use_pool             = 0.5f;
-    // Cap on distinct snapshots used per rollout — bounds inference cost.
+    // Cap on distinct snapshots used per rollout > 1 causes inference time to grow linearly.
     int      max_unique_per_rollout = 1;
     uint64_t seed                   = 0;   // 0 → random_device
 };
@@ -75,12 +75,10 @@ struct PPOConfig {
 
     float learning_rate    = 2.5e-4f;
     bool  anneal_lr        = true;
-    // Floor for the LR schedule, as a fraction of learning_rate. 0 = linear-to-zero.
+    // Floor for the LR schedule, as a fraction of learning_rate
     float min_lr_frac      = 0.1f;
 
-    // Cosine entropy decay from ent_coef → ent_coef_min.
-    // High entropy early helps exploration; low entropy late sharpens
-    // near-deterministic regions. Constant ent_coef can't do both.
+    // Cosine entropy decay from ent_coef -> ent_coef_min.
     bool  anneal_ent_coef  = false;
     float ent_coef_min     = 0.01f;
 
@@ -98,18 +96,9 @@ struct PPOConfig {
 
     OpponentPoolConfig  opp_pool;
 
-    // ── MMD regularisation (Sokota et al., ICLR 2023) ────────────────────
-    // When `kl_coef > 0`, adds `kl_coef * KL(π_θ || ρ)` to the PPO loss,
-    // where ρ is a slowly-updated "magnet" snapshot of π_θ. This converts
-    // vanilla self-play PPO into Magnetic Mirror Descent — a regularised
-    // PG method with last-iterate Nash convergence guarantees in the
-    // tabular case (and empirically in the deep variant). Cheap to add:
-    // one extra forward pass per minibatch through the magnet network +
-    // a clone of the policy every `magnet_update_every` updates.
-    //
-    // 0.05 is the value Sokota 2023 found best-on-average; the sweep
-    // range was [2^-3..2^3] × that. Set kl_coef = 0 to disable (recovers
-    // vanilla self-play PPO bit-for-bit).
+    // MMD regularisation
+    // When kl_coef > 0, adds kl_coef * KL(π_θ || ρ) to the PPO loss, where ρ is a slowly-updated "magnet" snapshot of π_θ.
+    // sweep range was [2^-3..2^3] × that. Set kl_coef = 0 to disable
     float kl_coef             = 0.05f;
     int   magnet_update_every = 100;  // updates between magnet refreshes
 
@@ -118,9 +107,6 @@ struct PPOConfig {
     constexpr int num_updates()    const noexcept { return total_timesteps / batch_size(); }
 };
 
-// Wraps Game::DefaultGameConfig + PPO-side knobs. `hist`/`round_summary`
-// are pinned to PPOConfig at the kPokerConfig site so env obs layout
-// stays in sync with network input layout.
 struct PokerConfig {
     Game::DefaultGameConfig  game{};
     BetHistoryConfig    hist{};
@@ -133,7 +119,7 @@ struct PokerConfig {
     [[nodiscard]] constexpr int action_count()    const noexcept { return game.action_count(); }
 };
 
-// Approximate best-response evaluator. See best_response.h.
+// Approximate best-response evaluator
 struct BestResponseConfig {
     bool  enabled            = false;
     int   eval_every         = 1000;
@@ -156,14 +142,10 @@ struct BestResponseConfig {
 
     bool  warm_start         = true;
 
-    // >1 trains independent exploiters from random init and reports
-    // max(bb/hand) — tightest lower bound the budget can produce.
-    // With >1, warm_start is ignored.
+    // >1 trains independent exploiters from random init and reports max(bb/hand). With >1, warm_start is ignored.
     int   num_exploiter_seeds = 3;
 
-    // Hands in the post-training eval match. Using training-time rewards
-    // would bias the bound (early exploiter plays badly while learning).
-    // 0 = skip and fall back to training rewards (debug only).
+    // Hands in the post-training eval match.
     int   eval_hands         = 5000;
 
     float bb_per_unit_reward = 10.0f;
@@ -208,15 +190,15 @@ static constexpr PPOConfig kPPOConfig{
     .hidden_dim       = 512,
     .num_layers       = 4,
     .hist             = BetHistoryConfig{
-        .enabled         = true,    // build gate: features::ATTENTION_ENCODER
-        .max_history_len = 16,       // HUNL caps actions at ~16/hand; T² attn cost
+        .enabled         = true,
+        .max_history_len = 16
         .attn_dim        = 96,
         .attn_heads      = 4,
-        .ffn_mult        = 3,        // FF hidden = 128, half the trunk width
+        .ffn_mult        = 3,
         .num_blocks      = 2,
     },
     .round_summary    = RoundSummaryConfig{
-        .enabled = true,            // build gate: features::ROUND_SUMMARY
+        .enabled = true,
     },
 
     .opp_pool         = OpponentPoolConfig{
@@ -232,14 +214,14 @@ static constexpr PPOConfig kPPOConfig{
 
 static constexpr BestResponseConfig kBRConfig{
     .enabled            = true,
-    .eval_every         = 3000,    // less frequent → cheaper overall, deeper per eval
-    .updates_per_eval   = 3000,    // more chase time per eval
+    .eval_every         = 3000,
+    .updates_per_eval   = 3000,
     .num_envs           = 32,
     .num_steps          = 128,
     .update_epochs      = 4,
     .num_minibatches    = 4,
-    .learning_rate      = 1.5e-4f, // warm_start needs gentle LR; high LR shocks the exploiter
-    .ent_coef           = 0.03f,   // more exploration to escape negative-BR plateau
+    .learning_rate      = 1.5e-4f,
+    .ent_coef           = 0.03f,
     .vf_coef            = 0.5f,
     .clip_coef          = 0.2f,
     .max_grad_norm      = 0.5f,
@@ -256,7 +238,6 @@ static constexpr BestResponseConfig kBRConfig{
 
 }  // namespace config
 
-// Pinned to kPPOConfig so env obs layout can't drift from network input.
 static constexpr PokerConfig kPokerConfig{
     .game          = Game::kGameConfig,
     .hist          = config::kPPOConfig.hist,
@@ -264,8 +245,7 @@ static constexpr PokerConfig kPokerConfig{
     .seed          = 0x12345ULL,
 };
 
-// Mirrors the runtime check in PokerEnvironment's ctor; drift here fails
-// the build instead of throwing at runtime.
+
 static_assert(kPokerConfig.action_count() == config::kBetConfig.action_count(),
               "kBetConfig.action_count() must match kPokerConfig.action_count() "
               "(2 + num_raise_slots)");
