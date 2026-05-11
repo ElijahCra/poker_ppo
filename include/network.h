@@ -1,78 +1,152 @@
 #pragma once
 
-#include "types.h"
+#include "config.h"
+#include "observation_builder.h"
 #include <torch/torch.h>
+#include <vector>
 
 namespace poker_ppo {
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Actor  — independent policy network with legal-action masking
-// ─────────────────────────────────────────────────────────────────────────────
-//
-// Architecture:
-//   observation → [MLP trunk] → features → linear head → logits [action_count]
-//
-// The actor applies a legal-action mask before softmax:
-//   masked_logits = logits + (1 - mask) * (-1e8)
-//
-// A single Actor is used for both players (parameter sharing across seats),
-// consistent with the self-play PG approach shown effective in the paper.
+// Additive logit for illegal actions. -1e8 instead of -inf so log-probs
+// stay finite if a caller gathers an illegal slot.
+inline constexpr float kIllegalActionLogit = -1e8f;
 
-class ActorImpl : public torch::nn::Module {
+// More aggressive than kIllegalActionLogit because attention's softmax
+// runs over keys that are already attended; -1e8 leaks ~1e-9 weight on
+// padded positions (caught by attention tests).
+inline constexpr float kAttentionMaskLogit = -1e9f;
+
+inline constexpr float kAdvantageEps = 1e-8f;
+
+// Bet-history transformer encoder. Owned by ActorCritic and shared
+// across actor and critic — running it once per forward halves the
+// attention compute compared to giving each tower its own encoder.
+// Only instantiated when hist.enabled.
+class HistoryEncoderImpl : public torch::nn::Module {
 public:
-    ActorImpl(int obs_dim, int action_count, int hidden_dim, int num_layers);
+    explicit HistoryEncoderImpl(BetHistoryConfig hist);
 
-    /// Raw logits (unmasked).  Shape: [B, action_count].
-    torch::Tensor forward(torch::Tensor obs);
+    // history_block: [B, T*(1+F)] — first T floats are the validity mask,
+    // followed by T*F token features. Returns the CLS embedding [B, D].
+    torch::Tensor forward(const torch::Tensor& history_block);
 
-    /// Sample an action with masked categorical.
+    [[nodiscard]] int output_dim() const noexcept { return hist_.attn_dim; }
+
+private:
+    BetHistoryConfig hist_;
+
+    torch::nn::Linear token_embed_{nullptr};
+    torch::Tensor cls_token_;
+    torch::Tensor pos_embed_;
+    std::vector<torch::nn::LayerNorm> attn_ln_;
+    std::vector<torch::nn::Linear>    qkv_proj_;
+    std::vector<torch::nn::Linear>    out_proj_;
+    std::vector<torch::nn::LayerNorm> ffn_ln_;
+    std::vector<torch::nn::Linear>    ffn1_;
+    std::vector<torch::nn::Linear>    ffn2_;
+};
+TORCH_MODULE(HistoryEncoder);
+
+// MLP trunk + linear head. Used twice by ActorCritic so the value-loss
+// gradient doesn't flow into the actor's representation (CleanRL convention).
+// Pre-flattened input: ActorCritic does the obs slicing and (optional)
+// history encoding, then hands the tower a single trunk-input tensor.
+class TowerImpl : public torch::nn::Module {
+public:
+    TowerImpl(int in_dim, int output_dim,
+              int hidden_dim, int num_layers,
+              float head_init_std);
+
+    torch::Tensor forward(torch::Tensor x);
+
+private:
+    torch::nn::Sequential trunk_{nullptr};
+    torch::nn::Linear     head_{nullptr};
+};
+TORCH_MODULE(Tower);
+
+// Two independent Towers (no shared MLP params). Optional shared
+// HistoryEncoder is run once per forward; its output is fed to the
+// actor with grad and to the critic detached, so value loss can't
+// reshape the encoder's representation.
+//
+// Heads: actor std=0.01, critic std=1.0; trunk orthogonal(√2)+Tanh.
+// Actor masks illegal actions before softmax via kIllegalActionLogit.
+class ActorCriticImpl : public torch::nn::Module {
+public:
+    ActorCriticImpl(int obs_dim, int action_count,
+                    int hidden_dim, int num_layers,
+                    BetHistoryConfig    hist,
+                    RoundSummaryConfig  round_summary = {});
+
+    // {logits, value}. Logits unmasked — use get_action()/evaluate() for masking.
+    std::pair<torch::Tensor, torch::Tensor> forward(torch::Tensor obs);
+
+    // Critic-only. Skips the actor tower (e.g. for GAE bootstrap).
+    torch::Tensor get_value(torch::Tensor obs);
+
     struct ActionResult {
-        torch::Tensor action;    // [B]   int64
+        torch::Tensor action;    // [B] int64
         torch::Tensor log_prob;  // [B]
+        torch::Tensor value;     // [B]
         torch::Tensor entropy;   // [B]
     };
     ActionResult get_action(torch::Tensor obs, torch::Tensor legal_mask);
 
-    /// Evaluate previously-taken actions (for PPO loss computation).
+    /// `log_probs_all` is the full masked log-softmax;
+    /// `log_prob.gather(action)` recovers `log_prob`. Free to expose
+    /// since `evaluate()` already runs `log_softmax` internally; needed
+    /// by the MMD regulariser, which computes KL across all actions.
     struct EvalResult {
-        torch::Tensor log_prob;  // [B]
-        torch::Tensor entropy;   // [B]
+        torch::Tensor log_prob;       // [B]    log π(a|s) for stored a
+        torch::Tensor log_probs_all;  // [B, A] full masked log-softmax
+        torch::Tensor value;          // [B]
+        torch::Tensor entropy;        // [B]
     };
     EvalResult evaluate(torch::Tensor obs, torch::Tensor legal_mask,
-                        torch::Tensor action);
+                        const torch::Tensor &action);
+
+    /// Masked log-softmax over the full action set, NoGrad-friendly.
+    /// Used by the MMD regulariser to evaluate the frozen magnet on the
+    /// same obs the live policy is updating against. Returns [B, A].
+    torch::Tensor masked_log_probs(torch::Tensor obs,
+                                   torch::Tensor legal_mask);
 
 private:
     torch::Tensor apply_mask(torch::Tensor logits, torch::Tensor mask);
 
-    torch::nn::Sequential trunk_{nullptr};
-    torch::nn::Linear      head_{nullptr};
+    // Encoder runs only when hist_.enabled. Returns an undefined tensor
+    // otherwise — callers check .defined() to skip the cat.
+    torch::Tensor encode_history(const torch::Tensor& obs);
+
+    // Concatenate the tower input from obs slices + (optional) encoded
+    // history. `encoded` may be detached (critic side) or live (actor side).
+    torch::Tensor build_trunk_input(const torch::Tensor& obs,
+                                    const torch::Tensor& encoded);
+
+    BetHistoryConfig    hist_;
+    RoundSummaryConfig  round_summary_;
+    ObservationLayout   layout_;
+
+    HistoryEncoder encoder_{nullptr};   // unset when hist_.enabled is false
+    Tower actor_{nullptr};
+    Tower critic_{nullptr};
 };
 
-TORCH_MODULE(Actor);
+TORCH_MODULE(ActorCritic);
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Critic  — independent value network
-// ─────────────────────────────────────────────────────────────────────────────
-//
-// Architecture:
-//   observation → [MLP trunk] → features → linear head → value [1]
-//
-// Completely separate parameters from the Actor.  This eliminates gradient
-// interference between the policy and value objectives — the value loss
-// cannot corrupt the policy's learned features, and vice versa.
-
-class CriticImpl : public torch::nn::Module {
-public:
-    CriticImpl(int obs_dim, int hidden_dim, int num_layers);
-
-    /// Scalar value estimate.  Shape: [B].
-    torch::Tensor forward(torch::Tensor obs);
-
-private:
-    torch::nn::Sequential trunk_{nullptr};
-    torch::nn::Linear      head_{nullptr};
-};
-
-TORCH_MODULE(Critic);
+// Typed deep copy. libtorch's Module::clone() returns a base Module and
+// needs param re-registration, which the pool and the BR evaluator both
+// don't want. Allocates a fresh ActorCritic, copies params + buffers
+// under NoGradGuard, moves to device, sets eval() (clones are always frozen).
+[[nodiscard]] ActorCritic clone_actor_critic(
+    const ActorCritic&  src,
+    int                 obs_dim,
+    int                 action_count,
+    int                 hidden_dim,
+    int                 num_layers,
+    BetHistoryConfig    hist,
+    RoundSummaryConfig  round_summary,
+    torch::Device       device);
 
 } // namespace poker_ppo

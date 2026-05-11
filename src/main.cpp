@@ -1,155 +1,127 @@
-//  main.cpp  — example showing how to wire up the PPO trainer
-//
-//  Replace StubPokerEnvironment with your real Texas Hold'em implementation.
+//   ./poker_ppo                                  train (default)
+//   ./poker_ppo --benchmark [iters]              rollout A/B bench
+//   ./poker_ppo --play <model_path>              interactive REPL
+//   ./poker_ppo --strategy {serial|threadpool}   rollout strategy
 
-#include "ppo.h"
+#include "commands.h"
+#include "poker_env.h"
+
 #include <iostream>
-#include <random>
+#include <string>
+#include <string_view>
 
 using namespace poker_ppo;
 
-// ═════════════════════════════════════════════════════════════════════════════
-// STUB environment — replace this with your real implementation
-// ═════════════════════════════════════════════════════════════════════════════
+namespace {
 
-class StubPokerEnvironment : public IPokerEnvironment {
-public:
-    explicit StubPokerEnvironment(const BetConfig& cfg)
-        : cfg_(cfg), rng_(std::random_device{}())
-    {}
-
-    int obs_dim() const override {
-        // Example: 52 card bits + pot + stack + street + …
-        // Choose whatever encoding you like.
-        return 128;
+void print_game(const ::Game::DefaultGameConfig& g) {
+    std::cout << "─── Game variant: " << g.name << " ──────────────────\n"
+              << "  deck cards      : " << int(g.deck_size())
+              << "  (excluded " << g.excluded_cards.size() << "/52)\n"
+              << "  initial stack   : " << g.initial_stack << " mbb\n"
+              << "  blinds          : " << g.small_blind << " / " << g.big_blind << " mbb\n"
+              << "  min bet / raise : " << g.min_bet << " / " << g.min_raise << " mbb\n"
+              << "  max raises/rnd  : " << int(g.max_raises_per_round) << "\n"
+              << "  pot fractions   : {";
+    for (size_t i = 0; i < g.pot_fractions.size(); ++i) {
+        std::cout << g.pot_fractions[i]
+                  << (i + 1 < g.pot_fractions.size() ? ", " : "");
     }
+    std::cout << "}  all-in slot: " << (g.include_all_in_slot ? "yes" : "no") << "\n";
 
-    const BetConfig& bet_config() const override { return cfg_; }
-
-    StepResult reset() override {
-        step_count_    = 0;
-        done_          = false;
-        player_        = 0;
-        bets_this_round_ = 0;
-        return make_result(0.0f, false);
+    std::cout << "Action space (" << g.action_count() << " actions):\n"
+              << "  [0] Fold\n  [1] Check/Call\n";
+    for (size_t i = 0; i < g.pot_fractions.size(); ++i) {
+        std::cout << "  [" << (2 + i) << "] Raise " << g.pot_fractions[i] << "× pot\n";
     }
-
-    StepResult step(int action) override {
-        (void)action;
-        step_count_++;
-
-        // Toggle player
-        player_ = 1 - player_;
-
-        if (Action::is_raise(action))
-            bets_this_round_++;
-
-        // Dummy termination after some steps
-        if (step_count_ >= 8) {
-            done_ = true;
-            std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
-            return make_result(dist(rng_), true);
-        }
-        return make_result(0.0f, false);
+    if (g.include_all_in_slot) {
+        std::cout << "  [" << (2 + g.pot_fractions.size()) << "] All-in\n";
     }
+}
 
-    int          current_player()    const override { return player_; }
-    torch::Tensor observation()      const override {
-        return torch::randn({obs_dim()});
-    }
-    torch::Tensor legal_action_mask() const override {
-        auto mask = torch::ones({cfg_.action_count()});
-        // Mask out raises if bet cap reached
-        if (bets_this_round_ >= cfg_.max_bets_per_round) {
-            for (int i = 0; i < cfg_.num_raise_sizes; ++i)
-                mask[Action::Raise(i)] = 0.0f;
-        }
-        return mask;
-    }
-    bool is_terminal() const override { return done_; }
-
-private:
-    StepResult make_result(float reward, bool done) {
-        return { observation(), reward, done, legal_action_mask() };
-    }
-
-    BetConfig cfg_;
-    std::mt19937 rng_;
-    int  step_count_ = 0;
-    int  player_     = 0;
-    bool done_       = false;
-    int  bets_this_round_ = 0;
+struct CliOptions {
+    bool        benchmark_mode  = false;
+    bool        play_mode       = false;
+    std::string play_model_path;
+    int         benchmark_iters = 20;
+    std::string strategy        = "threadpool";
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-
-class StubFactory : public IPokerEnvironmentFactory {
-public:
-    std::unique_ptr<IPokerEnvironment> create(const BetConfig& cfg) override {
-        return std::make_unique<StubPokerEnvironment>(cfg);
-    }
-};
-
-// ═════════════════════════════════════════════════════════════════════════════
-// main
-// ═════════════════════════════════════════════════════════════════════════════
-
-int main() {
-    // ── configure bet sizes ──────────────────────────────────────────────
-    BetConfig bet_cfg;
-    bet_cfg.num_raise_sizes    = 5;       // 5 raise options
-    bet_cfg.min_raise          = 0.5;     // 0.5× pot
-    bet_cfg.geometric_ratio    = 2.0;     // 0.5, 1, 2, 4, 8 × pot
-    bet_cfg.max_bets_per_round = 3;       // up to 3 raises per player per round
-
-    std::cout << "Action space (" << bet_cfg.action_count() << " actions):\n"
-              << "  [0] Fold\n"
-              << "  [1] Check/Call\n";
-    for (int i = 0; i < bet_cfg.num_raise_sizes; ++i) {
-        std::cout << "  [" << Action::Raise(i) << "] Raise "
-                  << bet_cfg.raise_amount(i) << "x\n";
-    }
-
-    // ── configure PPO ────────────────────────────────────────────────────
-    PPOConfig ppo_cfg;
-    ppo_cfg.total_timesteps = 1'000'000;
-    ppo_cfg.num_envs        = 16;
-    ppo_cfg.num_steps       = 128;
-    ppo_cfg.update_epochs   = 4;
-    ppo_cfg.num_minibatches = 4;
-    ppo_cfg.ent_coef        = 0.05f;   // higher entropy for IIGs
-    ppo_cfg.learning_rate   = 2.5e-4f;
-    ppo_cfg.hidden_dim      = 512;
-    ppo_cfg.num_layers      = 3;
-
-    // ── train ────────────────────────────────────────────────────────────
-    StubFactory factory;
-    PPOTrainer trainer(factory, bet_cfg, ppo_cfg);
-
-    trainer.set_log_callback([](const PPOTrainer::UpdateStats& s) {
-        if (s.update % 50 == 0) {
-            std::cout << "update=" << s.update
-                      << "  step=" << s.global_step
-                      << "  pg_loss=" << s.policy_loss
-                      << "  vf_loss=" << s.value_loss
-                      << "  entropy=" << s.entropy
-                      << "  kl=" << s.approx_kl
-                      << "  clip=" << s.clip_fraction
-                      << "  ev=" << s.explained_variance
-                      << "  lr=" << s.learning_rate
-                      << "\n";
+bool parse_cli(int argc, char** argv, CliOptions& out) {
+    for (int i = 1; i < argc; ++i) {
+        std::string_view a = argv[i];
+        if (a == "--benchmark") {
+            out.benchmark_mode = true;
+            if (i + 1 < argc) {
+                try { out.benchmark_iters = std::stoi(argv[i + 1]); ++i; }
+                catch (...) { /* leave default */ }
+            }
+        } else if (a == "--play") {
+            out.play_mode = true;
+            if (i + 1 < argc) { out.play_model_path = argv[i + 1]; ++i; }
+        } else if (a == "--strategy") {
+            if (i + 1 < argc) { out.strategy = argv[i + 1]; ++i; }
+        } else {
+            std::cerr << "unknown argument '" << a << "'\n";
+            return false;
         }
-    });
+    }
+    return true;
+}
 
-    std::cout << "\nStarting training for "
-              << ppo_cfg.total_timesteps << " steps...\n\n";
+}  // namespace
 
-    trainer.train();
+int main(int argc, char** argv) {
+    std::cout.setf(std::ios::unitbuf);  // unbuffered for PTY/log capture
 
-    // ── save ─────────────────────────────────────────────────────────────
-    trainer.save("poker_ppo_model");
-    std::cout << "\nModel saved to poker_ppo_model_actor.pt"
-              << " and poker_ppo_model_critic.pt\n";
+    CliOptions opt;
+    if (!parse_cli(argc, argv, opt)) return 1;
 
-    return 0;
+    PokerConfig poker_cfg = kPokerConfig;
+    poker_cfg.game.validate();
+
+    print_game(poker_cfg.game);
+    {
+        const PPOConfig& p = config::kPPOConfig;
+        std::cout << "Bet-history attention encoder: "
+                  << (p.hist.enabled ? "ON" : "OFF") << "\n"
+                  << "Round-summary block          : "
+                  << (p.round_summary.enabled ? "ON" : "OFF") << "\n"
+                  << "Opponent pool                : "
+                  << (p.opp_pool.enabled ? "ON" : "OFF");
+        if (p.opp_pool.enabled) {
+            std::cout << "  (size=" << p.opp_pool.max_size
+                      << ", snapshot_every=" << p.opp_pool.snapshot_every
+                      << ", warmup=" << p.opp_pool.warmup_updates
+                      << ", p_use_pool=" << p.opp_pool.p_use_pool
+                      << ", max_unique=" << p.opp_pool.max_unique_per_rollout << ")";
+        }
+        std::cout << "\n";
+    }
+
+    torch::Device device = torch::cuda::is_available() ? torch::kCUDA : torch::mps::is_available() ? torch::kMPS : torch::kCPU;
+    //torch::Device device = torch::kCPU;
+    std::cout << "Using device: " << device << "\n";
+
+    PokerEnvironmentFactory factory(poker_cfg);
+
+    if (opt.play_mode) {
+        return cmd_play(factory, config::kBetConfig, device, opt.play_model_path);
+    }
+    if (opt.benchmark_mode) {
+        return cmd_benchmark(factory, device, opt.benchmark_iters);
+    }
+
+    PPOTrainer::Strategy strategy;
+    if (opt.strategy == "serial") {
+        strategy = PPOTrainer::Strategy::Serial;
+    } else if (opt.strategy == "threadpool") {
+        strategy = PPOTrainer::Strategy::Threadpool;
+    } else {
+        std::cerr << "unknown --strategy '" << opt.strategy
+                  << "' (expected serial|threadpool)\n";
+        return 1;
+    }
+    std::cout << "Rollout strategy: " << opt.strategy << "\n";
+    return cmd_train(factory, poker_cfg, device, strategy);
 }

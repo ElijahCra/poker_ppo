@@ -1,37 +1,29 @@
 #pragma once
+//
+// PPO trainer. Owns network + optimiser, drives RolloutCollector +
+// OpponentManager. Self-play: same ActorCritic plays both seats; rewards
+// are recorded from the acting player's perspective (sign-flipped on seat 1).
+//
 
-#include "types.h"
+#include "config.h"
 #include "environment.h"
 #include "network.h"
-#include "rollout_buffer.h"
+#include "rollout.h"
 
 #include <torch/torch.h>
+
 #include <functional>
 #include <memory>
+#include <string>
+#include <utility>
+#include <vector>
 
 namespace poker_ppo {
 
-// ─────────────────────────────────────────────────────────────────────────────
-// PPOTrainer
-// ─────────────────────────────────────────────────────────────────────────────
-//
-// Usage:
-//   1. Implement IPokerEnvironment & IPokerEnvironmentFactory.
-//   2. Create a PPOTrainer with your factory, BetConfig, and PPOConfig.
-//   3. Call train().  Optionally register a callback for logging.
-//
-// The trainer runs self-play: a single Actor and a single Critic play both
-// seats.  The Actor and Critic have fully independent parameters (no shared
-// trunk), eliminating gradient interference between the policy and value
-// objectives.
-//
-// Rewards stored in the buffer are always from the perspective of the acting
-// player (flipped sign when seat == 1).  GAE correctly handles the sign
-// inversion at player-switch boundaries (zero-sum).
+class OpponentManager;
 
 class PPOTrainer {
 public:
-    /// Per-update statistics passed to the logging callback.
     struct UpdateStats {
         int    update;
         int    global_step;
@@ -42,53 +34,85 @@ public:
         float  clip_fraction;
         float  explained_variance;
         float  learning_rate;
+        double rollout_ms;
+        double update_ms;
     };
 
     using LogCallback = std::function<void(const UpdateStats&)>;
 
-    PPOTrainer(IPokerEnvironmentFactory& env_factory,
-               const BetConfig& bet_cfg,
-               const PPOConfig& ppo_cfg,
-               torch::Device device = torch::kCPU);
+    // Hyperparameters come from config::kPPOConfig + config::kBetConfig.
+    explicit PPOTrainer(IPokerEnvironmentFactory& env_factory,
+                        torch::Device device = torch::kCPU);
 
-    /// Run the full training loop.
+    ~PPOTrainer();
+
+    using Strategy = RolloutCollector::Strategy;
+
     void train();
 
-    /// Register a callback invoked after each PPO update.
+    void set_rollout_strategy(Strategy s) noexcept { strategy_ = s; }
+
+    // Thin shims around collector_->collect(strategy, ...). Used by
+    // benchmarks/tests that don't want to know about OpponentManager.
+    void collect_rollout_serial();
+    void collect_rollout_threadpool();
+
+    struct BenchmarkResult {
+        struct Stats { double min_ms, median_ms, mean_ms, p95_ms, max_ms; };
+        int num_envs;
+        int num_steps;
+        int iters;
+        int samples;
+        // (name, stats), preserves insertion order. benchmark_rollouts()
+        // emits serial then threadpool.
+        std::vector<std::pair<std::string, Stats>> by_strategy;
+
+        const Stats* find(const std::string& name) const {
+            for (const auto& [n, s] : by_strategy) if (n == name) return &s;
+            return nullptr;
+        }
+    };
+
+    // A/B-time the two built-in strategies. Iterations interleave per round
+    // so each strategy faces a similar env distribution. No update().
+    BenchmarkResult benchmark_rollouts(int iters = 20, int warmup = 3,
+                                       bool verbose = true);
+
+    using RolloutFn = std::function<void(PPOTrainer&)>;
+    BenchmarkResult benchmark_strategies(
+        const std::vector<std::pair<std::string, RolloutFn>>& strategies,
+        int iters = 20, int warmup = 3, bool verbose = true);
+
     void set_log_callback(LogCallback cb) { log_cb_ = std::move(cb); }
 
-    /// Access the trained networks (e.g. for evaluation / saving).
-    Actor&  actor()  { return actor_; }
-    Critic& critic() { return critic_; }
+    ActorCritic& network() { return network_; }
 
-    /// Save / load model weights.
-    void save(const std::string& path_prefix);
-    void load(const std::string& path_prefix);
+    int opponent_pool_size() const;
+
+    void save(const std::string& path);
+    void load(const std::string& path);
 
 private:
-    void collect_rollout();
-    void update();
+    [[nodiscard]] UpdateStats update();
 
-    PPOConfig    cfg_;
-    BetConfig    bet_cfg_;
+    static inline constexpr const PPOConfig& cfg_      = config::kPPOConfig;
+    static inline constexpr const BetConfig& bet_cfg_  = config::kBetConfig;
     torch::Device device_;
 
-    Actor   actor_;
-    Critic  critic_;
-    std::unique_ptr<torch::optim::Adam> optimizer_;
-    std::unique_ptr<VectorizedEnv>      vec_env_;
-    std::unique_ptr<RolloutBuffer>      buffer_;
+    ActorCritic                          network_;
+    std::unique_ptr<torch::optim::Adam>  optimizer_;
+    std::unique_ptr<RolloutCollector>    collector_;
+    std::unique_ptr<OpponentManager>     opp_mgr_;
 
-    // State carried between rollouts
-    torch::Tensor next_obs_;             // [num_envs, obs_dim]
-    torch::Tensor next_done_;            // [num_envs]
-    torch::Tensor next_legal_mask_;      // [num_envs, action_count]
-    torch::Tensor next_current_player_;  // [num_envs]  int32
+    // MMD magnet — frozen snapshot of `network_`, refreshed every
+    // `cfg_.magnet_update_every` updates. Null when `cfg_.kl_coef == 0`
+    // (vanilla self-play PPO; the regulariser is bypassed entirely).
+    ActorCritic                          magnet_{nullptr};
 
-    int global_step_ = 0;
-    int update_idx_  = 0;
+    int update_idx_ = 0;
 
     LogCallback log_cb_;
+    Strategy    strategy_ = Strategy::Threadpool;
 };
 
 } // namespace poker_ppo

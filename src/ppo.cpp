@@ -1,19 +1,29 @@
 #include "ppo.h"
-#include <iostream>
+
+#include "opponent_manager.h"
+
 #include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <iomanip>
+#include <iostream>
 #include <numeric>
+#include <thread>
 
 namespace poker_ppo {
-
-// ═════════════════════════════════════════════════════════════════════════════
-// VectorizedEnv
-// ═════════════════════════════════════════════════════════════════════════════
 
 VectorizedEnv::VectorizedEnv(IPokerEnvironmentFactory& factory,
                              const BetConfig& cfg, int num_envs) {
     envs_.reserve(num_envs);
     for (int i = 0; i < num_envs; ++i)
         envs_.push_back(factory.create(cfg));
+
+    int N = num_envs, D = obs_dim(), A = action_count();
+    obs_buf_     = torch::zeros({N, D});
+    rewards_buf_ = torch::zeros({N});
+    dones_buf_   = torch::zeros({N});
+    masks_buf_   = torch::zeros({N, A});
+    players_buf_ = torch::zeros({N}, torch::kInt32);
 }
 
 torch::Tensor VectorizedEnv::reset_all() {
@@ -27,198 +37,261 @@ torch::Tensor VectorizedEnv::reset_all() {
     return obs;
 }
 
-VectorizedEnv::BatchStepResult
-VectorizedEnv::step(const std::vector<int>& actions) {
-    int N = num_envs();
-    int D = obs_dim();
-    int A = action_count();
-
-    auto obs     = torch::zeros({N, D});
-    auto rewards = torch::zeros({N});
-    auto dones   = torch::zeros({N});
-    auto masks   = torch::zeros({N, A});
-    auto players = torch::zeros({N}, torch::kInt32);
-
-    for (int i = 0; i < N; ++i) {
-        // Track which player is acting *before* the step
-        int acting_player = envs_[i]->current_player();
-
-        auto result = envs_[i]->step(actions[i]);
-
-        // Reward from player 1's perspective; flip for player 2 so the single
-        // network always sees "my reward" regardless of seat.
-        float r = result.reward;
-        if (acting_player == 1) r = -r;
-
-        // Auto-reset on done
-        if (result.done) {
-            rewards[i] = r;
-            dones[i]   = 1.0f;
-            auto reset_result  = envs_[i]->reset();
-            obs[i]    = reset_result.observation;
-            masks[i]  = reset_result.legal_action_mask;
-            players[i] = envs_[i]->current_player();
-        } else {
-            obs[i]     = result.observation;
-            rewards[i] = r;
-            dones[i]   = 0.0f;
-            masks[i]   = result.legal_action_mask;
-            players[i] = envs_[i]->current_player();
-        }
-    }
-
-    return {obs, rewards, dones, masks, players};
-}
-
-// ═════════════════════════════════════════════════════════════════════════════
-// PPOTrainer
-// ═════════════════════════════════════════════════════════════════════════════
-
 PPOTrainer::PPOTrainer(IPokerEnvironmentFactory& env_factory,
-                       const BetConfig& bet_cfg,
-                       const PPOConfig& ppo_cfg,
                        torch::Device device)
-    : cfg_(ppo_cfg), bet_cfg_(bet_cfg), device_(device),
-      actor_(nullptr), critic_(nullptr)
+    : device_(device),
+      network_(nullptr)
 {
-    // Create vectorized environment
-    vec_env_ = std::make_unique<VectorizedEnv>(
-        env_factory, bet_cfg, cfg_.num_envs);
+    collector_ = std::make_unique<RolloutCollector>(
+        env_factory, bet_cfg_, cfg_.num_envs, cfg_.num_steps, device_);
 
-    int obs_dim      = vec_env_->obs_dim();
-    int action_count = vec_env_->action_count();
+    const int obs_dim      = collector_->obs_dim();
+    const int action_count = collector_->action_count();
 
-    // Create separate actor and critic networks
-    actor_  = Actor(obs_dim, action_count, cfg_.hidden_dim, cfg_.num_layers);
-    critic_ = Critic(obs_dim, cfg_.hidden_dim, cfg_.num_layers);
-    actor_->to(device_);
-    critic_->to(device_);
-
-    // Single optimiser over both networks' parameters.
-    // (Using separate optimisers with different learning rates is also
-    // reasonable — just create two Adam instances instead.)
-    std::vector<torch::Tensor> all_params;
-    for (auto& p : actor_->parameters())  all_params.push_back(p);
-    for (auto& p : critic_->parameters()) all_params.push_back(p);
+    network_ = ActorCritic(obs_dim, action_count,
+                           cfg_.hidden_dim, cfg_.num_layers,
+                           cfg_.hist, cfg_.round_summary);
+    network_->to(device_);
 
     optimizer_ = std::make_unique<torch::optim::Adam>(
-        all_params, torch::optim::AdamOptions(cfg_.learning_rate));
+        network_->parameters(),
+        torch::optim::AdamOptions(cfg_.learning_rate));
 
-    // Rollout buffer
-    buffer_ = std::make_unique<RolloutBuffer>(
-        cfg_.num_steps, cfg_.num_envs, obs_dim, action_count);
+    opp_mgr_ = std::make_unique<OpponentManager>(
+        cfg_.opp_pool, obs_dim, action_count,
+        cfg_.hidden_dim, cfg_.num_layers,
+        cfg_.hist, cfg_.round_summary, device_);
+    opp_mgr_->reset_assignments(cfg_.num_envs);
+
+    // MMD magnet — initialise from the random-init network so the very
+    // first update's KL term is well-defined. Refreshed every
+    // cfg_.magnet_update_every updates inside train(). Only allocated
+    // when the regulariser is enabled.
+    if constexpr (cfg_.kl_coef > 0.0f) {
+        magnet_ = clone_actor_critic(
+            network_, obs_dim, action_count,
+            cfg_.hidden_dim, cfg_.num_layers,
+            cfg_.hist, cfg_.round_summary, device_);
+    }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+PPOTrainer::~PPOTrainer() = default;
+
+int PPOTrainer::opponent_pool_size() const {
+    return opp_mgr_ ? opp_mgr_->size() : 0;
+}
+
 void PPOTrainer::train() {
-    // Initial reset
-    next_obs_  = vec_env_->reset_all().to(device_);
-    next_done_ = torch::zeros({cfg_.num_envs}, device_);
+    collector_->init_carry();
+    opp_mgr_->reset_assignments(cfg_.num_envs);
 
-    // Build initial legal masks and player tracking
-    int A = vec_env_->action_count();
-    next_legal_mask_     = torch::zeros({cfg_.num_envs, A}, device_);
-    next_current_player_ = torch::zeros({cfg_.num_envs},
-                                        torch::TensorOptions()
-                                            .dtype(torch::kInt32)
-                                            .device(device_));
-
-    for (int i = 0; i < cfg_.num_envs; ++i) {
-        next_legal_mask_[i]     = vec_env_->env(i).legal_action_mask().to(device_);
-        next_current_player_[i] = vec_env_->env(i).current_player();
-    }
-
-    int total_updates = cfg_.num_updates();
+    const int total_updates = cfg_.num_updates();
 
     for (update_idx_ = 0; update_idx_ < total_updates; ++update_idx_) {
-        // Anneal learning rate
-        if (cfg_.anneal_lr) {
-            float frac = 1.0f - static_cast<float>(update_idx_) / total_updates;
-            float lr   = cfg_.learning_rate * frac;
+        // Linear LR anneal with min_lr_frac floor — without the floor the
+        // last quarter of training does ~no learning.
+        if constexpr (cfg_.anneal_lr) {
+            const float frac = 1.0f - static_cast<float>(update_idx_) / total_updates;
+            constexpr float floor_frac = cfg_.min_lr_frac > 0.0f ? cfg_.min_lr_frac : 0.0f;
+            const float lr = cfg_.learning_rate * std::max(frac, floor_frac);
             for (auto& pg : optimizer_->param_groups())
                 static_cast<torch::optim::AdamOptions&>(pg.options()).lr(lr);
         }
 
-        collect_rollout();
-        update();
+        using clock = std::chrono::steady_clock;
+        using ms    = std::chrono::duration<double, std::milli>;
+
+        auto t0 = clock::now();
+        at::set_num_threads(1);
+        collector_->collect(strategy_, network_, *opp_mgr_,
+                            update_idx_, cfg_.gamma, cfg_.gae_lambda);
+        auto t1 = clock::now();
+        at::set_num_threads(std::thread::hardware_concurrency());
+        auto stats = update();
+        auto t2 = clock::now();
+
+        stats.rollout_ms = ms(t1 - t0).count();
+        stats.update_ms  = ms(t2 - t1).count();
+
+        if (log_cb_) log_cb_(stats);
+
+        if (update_idx_ % 10 == 0) {
+            std::cout << std::fixed << std::setprecision(1)
+                      << "[update " << update_idx_ << "]"
+                      << "  rollout=" << stats.rollout_ms << "ms"
+                      << "  update=" << stats.update_ms << "ms";
+            if (opp_mgr_->enabled()) {
+                std::cout << "  pool=" << opp_mgr_->size()
+                          << "/" << opp_mgr_->capacity();
+            }
+            std::cout << "\n" << std::defaultfloat << std::setprecision(6);
+        }
+
+        opp_mgr_->maybe_snapshot(update_idx_, network_);
+
+        // Refresh the MMD magnet on cadence. Slow refresh = strong
+        // anchoring (drives π_θ toward older self); fast refresh =
+        // weak anchoring (closer to vanilla PPO). Sokota 2023's grid
+        // landed at K ≈ 100, the default in config.h.
+        if constexpr (cfg_.kl_coef > 0.0f) {
+            const int K = std::max(1, cfg_.magnet_update_every);
+            if (update_idx_ > 0 && update_idx_ % K == 0) {
+                magnet_ = clone_actor_critic(
+                    network_, collector_->obs_dim(), collector_->action_count(),
+                    cfg_.hidden_dim, cfg_.num_layers,
+                    cfg_.hist, cfg_.round_summary, device_);
+            }
+        }
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-void PPOTrainer::collect_rollout() {
-    actor_->eval();
-    critic_->eval();
-    torch::NoGradGuard no_grad;
-
-    for (int step = 0; step < cfg_.num_steps; ++step) {
-        // Actor: sample actions
-        auto ar = actor_->get_action(next_obs_, next_legal_mask_);
-
-        // Critic: estimate values
-        auto value = critic_->forward(next_obs_);
-
-        // Convert actions to CPU ints
-        auto actions_cpu = ar.action.to(torch::kCPU);
-        std::vector<int> actions(cfg_.num_envs);
-        for (int i = 0; i < cfg_.num_envs; ++i)
-            actions[i] = actions_cpu[i].item<int64_t>();
-
-        // Step environments
-        auto [obs, rewards, dones, masks, players] = vec_env_->step(actions);
-
-        // Store in buffer (including which player was acting)
-        buffer_->insert(step,
-                        next_obs_.cpu(),
-                        ar.action.cpu(),
-                        ar.log_prob.cpu(),
-                        rewards,
-                        next_done_.cpu(),
-                        value.cpu(),
-                        next_legal_mask_.cpu(),
-                        next_current_player_.cpu());
-
-        // Advance state
-        next_obs_            = obs.to(device_);
-        next_done_           = dones.to(device_);
-        next_legal_mask_     = masks.to(device_);
-        next_current_player_ = players.to(device_);
-
-        global_step_ += cfg_.num_envs;
-    }
-
-    // Bootstrap value from critic
-    auto next_value = critic_->forward(next_obs_);
-
-    buffer_->compute_returns(next_value.cpu(),
-                             next_done_.cpu(),
-                             next_current_player_.cpu(),
-                             cfg_.gamma, cfg_.gae_lambda);
+void PPOTrainer::collect_rollout_serial() {
+    collector_->collect(Strategy::Serial, network_, *opp_mgr_,
+                        update_idx_, cfg_.gamma, cfg_.gae_lambda);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-void PPOTrainer::update() {
-    actor_->train();
-    critic_->train();
+void PPOTrainer::collect_rollout_threadpool() {
+    collector_->collect(Strategy::Threadpool, network_, *opp_mgr_,
+                        update_idx_, cfg_.gamma, cfg_.gae_lambda);
+}
 
-    auto batch = buffer_->flatten();
-    int B = batch.obs.size(0);
+PPOTrainer::BenchmarkResult
+PPOTrainer::benchmark_strategies(
+    const std::vector<std::pair<std::string, RolloutFn>>& strategies,
+    int iters, int warmup, bool verbose) {
+    using clock = std::chrono::steady_clock;
+    using ms    = std::chrono::duration<double, std::milli>;
 
-    // Move to device
-    auto b_obs     = batch.obs.to(device_);
-    auto b_actions = batch.actions.to(device_);
-    auto b_logp    = batch.log_probs.to(device_);
-    auto b_adv     = batch.advantages.to(device_);
-    auto b_ret     = batch.returns.to(device_);
-    auto b_val     = batch.values.to(device_);
-    auto b_masks   = batch.legal_masks.to(device_);
+    collector_->init_carry();
+    opp_mgr_->reset_assignments(cfg_.num_envs);
 
-    float total_policy_loss = 0, total_value_loss = 0, total_entropy = 0;
-    float total_approx_kl = 0, total_clip_frac = 0;
-    int   num_updates = 0;
+    const int saved_update_idx = update_idx_;
+    update_idx_ = 1;  // not %10 — silences the train() log
+
+    auto run_one = [&](const RolloutFn& fn) {
+        auto t0 = clock::now();
+        fn(*this);
+        return ms(clock::now() - t0).count();
+    };
+
+    // Interleaved warmup so each path stabilises caches/threads.
+    for (int i = 0; i < warmup; ++i) {
+        for (const auto& s : strategies) s.second(*this);
+    }
+
+    std::vector<std::vector<double>> samples(strategies.size());
+    for (auto& v : samples) v.reserve(iters);
+
+    // Interleave per-iter so paths see a similar env state distribution.
+    for (int i = 0; i < iters; ++i) {
+        for (size_t s = 0; s < strategies.size(); ++s) {
+            samples[s].push_back(run_one(strategies[s].second));
+        }
+    }
+
+    update_idx_ = saved_update_idx;
+
+    auto pack = [](std::vector<double> v) -> BenchmarkResult::Stats {
+        std::sort(v.begin(), v.end());
+        const double sum    = std::accumulate(v.begin(), v.end(), 0.0);
+        const double mean   = sum / static_cast<double>(v.size());
+        const double median = v[v.size() / 2];
+        const double p95    = v[std::min(v.size() - 1,
+                                         static_cast<size_t>(v.size() * 0.95))];
+        return {v.front(), median, mean, p95, v.back()};
+    };
+
+    BenchmarkResult r;
+    r.num_envs  = cfg_.num_envs;
+    r.num_steps = cfg_.num_steps;
+    r.iters     = iters;
+    r.samples   = cfg_.num_envs * cfg_.num_steps;
+    r.by_strategy.reserve(strategies.size());
+    for (size_t s = 0; s < strategies.size(); ++s) {
+        r.by_strategy.emplace_back(strategies[s].first, pack(samples[s]));
+    }
+
+    if (verbose) {
+        // Slowest median = baseline → all printed multipliers are ≥ 1×.
+        const auto* slowest = &r.by_strategy.front().second;
+        for (const auto& kv : r.by_strategy)
+            if (kv.second.median_ms > slowest->median_ms) slowest = &kv.second;
+
+        std::cout << "\n══════════ rollout benchmark ══════════\n"
+                  << "  iters=" << iters << "  warmup=" << warmup
+                  << "  num_envs=" << r.num_envs
+                  << "  num_steps=" << r.num_steps
+                  << "  samples/rollout=" << r.samples << "\n"
+                  << "  ─────────────────────────────────────\n"
+                  << std::fixed << std::setprecision(2);
+        for (const auto& kv : r.by_strategy) {
+            const auto& name = kv.first;
+            const auto& s    = kv.second;
+            std::cout << "  " << std::setw(12) << std::left << name << std::right
+                      << "  min=" << s.min_ms    << "ms"
+                      << "  med=" << s.median_ms << "ms"
+                      << "  mean=" << s.mean_ms  << "ms"
+                      << "  p95="  << s.p95_ms   << "ms"
+                      << "  max="  << s.max_ms   << "ms"
+                      << "  spd="  << (slowest->median_ms / s.median_ms) << "x"
+                      << "  us/samp=" << (s.median_ms * 1e3 / r.samples) << "\n";
+        }
+        std::cout.unsetf(std::ios::fixed);
+        std::cout << "═══════════════════════════════════════\n\n";
+    }
+    return r;
+}
+
+PPOTrainer::BenchmarkResult
+PPOTrainer::benchmark_rollouts(int iters, int warmup, bool verbose) {
+    return benchmark_strategies({
+        {"serial",     [](PPOTrainer& t) { t.collect_rollout_serial();     }},
+        {"threadpool", [](PPOTrainer& t) { t.collect_rollout_threadpool(); }},
+    }, iters, warmup, verbose);
+}
+
+PPOTrainer::UpdateStats PPOTrainer::update() {
+    network_->train();
+
+    auto& buffer = collector_->buffer();
+    auto batch   = buffer.flatten();
+    int  B       = batch.obs.size(0);
+
+    auto& b_obs     = batch.obs;
+    auto& b_actions = batch.actions;
+    auto& b_logp    = batch.log_probs;
+    auto  b_adv     = batch.advantages;  // copy: normalisation mutates it
+    auto& b_ret     = batch.returns;
+    auto& b_val     = batch.values;
+    auto& b_masks   = batch.legal_masks;
+
+    auto stat_opts = torch::TensorOptions().dtype(torch::kFloat32).device(device_);
+    auto total_policy_loss = torch::zeros({}, stat_opts);
+    auto total_value_loss  = torch::zeros({}, stat_opts);
+    auto total_entropy     = torch::zeros({}, stat_opts);
+    auto total_approx_kl   = torch::zeros({}, stat_opts);
+    auto total_clip_frac   = torch::zeros({}, stat_opts);
+    int  num_updates = 0;
+
+    // Cosine entropy decay. Held constant across this update's
+    // minibatches (only changes between updates) so the loss is well
+    // defined within an update.
+    const float ent_coef_now = [&]() {
+        if constexpr (!cfg_.anneal_ent_coef) {
+            return cfg_.ent_coef;
+        } else {
+            const int total = std::max(1, cfg_.num_updates());
+            const float progress = std::min(
+                1.0f, static_cast<float>(update_idx_) / static_cast<float>(total));
+            const float cosine_factor = 0.5f * (1.0f + std::cos(M_PI * progress));
+            constexpr float ent_min =
+                cfg_.ent_coef_min < cfg_.ent_coef ? cfg_.ent_coef_min : cfg_.ent_coef;
+            return ent_min + cosine_factor * (cfg_.ent_coef - ent_min);
+        }
+    }();
 
     for (int epoch = 0; epoch < cfg_.update_epochs; ++epoch) {
-        // Shuffle
-        auto indices = torch::randperm(B, torch::kInt64).to(device_);
+        auto indices = torch::randperm(B, torch::TensorOptions().dtype(torch::kInt64).device(device_));
 
         for (int start = 0; start < B; start += cfg_.minibatch_size()) {
             int end = std::min(start + cfg_.minibatch_size(), B);
@@ -232,19 +305,16 @@ void PPOTrainer::update() {
             auto mb_val     = b_val.index_select(0, mb_idx);
             auto mb_masks   = b_masks.index_select(0, mb_idx);
 
-            // Normalise advantages
-            if (cfg_.norm_advantages && mb_adv.size(0) > 1) {
-                mb_adv = (mb_adv - mb_adv.mean()) /
-                         (mb_adv.std() + 1e-8f);
+            if constexpr (cfg_.norm_advantages) {
+                if (mb_adv.size(0) > 1) {
+                    mb_adv = (mb_adv - mb_adv.mean()) /
+                             (mb_adv.std() + kAdvantageEps);
+                }
             }
 
-            // Actor forward: get new log_probs and entropy for stored actions
-            auto er = actor_->evaluate(mb_obs, mb_masks, mb_actions);
+            auto er = network_->evaluate(mb_obs, mb_masks, mb_actions);
 
-            // Critic forward: get new value estimates
-            auto new_values = critic_->forward(mb_obs);
-
-            // ── policy loss (clipped surrogate) ─────────────────────
+            // Clipped surrogate.
             auto logratio = er.log_prob - mb_logp;
             auto ratio    = logratio.exp();
 
@@ -253,97 +323,112 @@ void PPOTrainer::update() {
                 ratio, 1.0f - cfg_.clip_coef, 1.0f + cfg_.clip_coef);
             auto pg_loss  = torch::max(pg_loss1, pg_loss2).mean();
 
-            // ── value loss ──────────────────────────────────────────
+            // 16 minibatches per update — branch in the binary is worth
+            // killing via if constexpr.
             torch::Tensor v_loss;
-            if (cfg_.clip_vloss) {
+            if constexpr (cfg_.clip_vloss) {
                 auto v_clipped = mb_val + torch::clamp(
-                    new_values - mb_val,
+                    er.value - mb_val,
                     -cfg_.clip_coef, cfg_.clip_coef);
-                auto v_loss_unclipped = (new_values - mb_ret).pow(2);
+                auto v_loss_unclipped = (er.value - mb_ret).pow(2);
                 auto v_loss_clipped   = (v_clipped - mb_ret).pow(2);
                 v_loss = 0.5f * torch::max(v_loss_unclipped,
                                            v_loss_clipped).mean();
             } else {
-                v_loss = 0.5f * (new_values - mb_ret).pow(2).mean();
+                v_loss = 0.5f * (er.value - mb_ret).pow(2).mean();
             }
 
-            // ── entropy bonus ───────────────────────────────────────
             auto entropy_loss = er.entropy.mean();
 
-            // ── total loss ──────────────────────────────────────────
+            // MMD regularisation: KL(π_θ || ρ) per state, mean over the
+            // minibatch. ρ is the magnet — a slowly-refreshed snapshot of
+            // π_θ. Pulls π_θ toward an older self each step, which gives
+            // the regularised-PG family its last-iterate Nash convergence
+            // guarantee in the tabular case (Sokota et al. 2023). Stripped
+            // from the binary when `cfg_.kl_coef == 0` (vanilla PPO).
+            torch::Tensor mmd_kl_loss;
+            if constexpr (cfg_.kl_coef > 0.0f) {
+                torch::Tensor magnet_log_probs;
+                {
+                    torch::NoGradGuard ng;
+                    magnet_log_probs = magnet_->masked_log_probs(mb_obs, mb_masks);
+                }
+                // KL(π || ρ) = Σ_a π(a) (log π(a) − log ρ(a)).
+                // Use exp(log π) for the weight rather than a separate
+                // softmax — keeps gradients flowing through the same
+                // tensor that produced log_probs_all.
+                const auto pi   = er.log_probs_all.exp();
+                const auto kl   = (pi * (er.log_probs_all - magnet_log_probs))
+                                  .sum(/*dim=*/-1);
+                mmd_kl_loss     = kl.mean();
+            }
+
             auto loss = pg_loss
-                      - cfg_.ent_coef * entropy_loss
-                      + cfg_.vf_coef  * v_loss;
+                      - ent_coef_now * entropy_loss
+                      + cfg_.vf_coef * v_loss;
+            if constexpr (cfg_.kl_coef > 0.0f) {
+                loss = loss + cfg_.kl_coef * mmd_kl_loss;
+            }
 
             optimizer_->zero_grad();
             loss.backward();
-            // Clip gradients for both networks jointly
-            std::vector<torch::Tensor> all_params;
-            for (auto& p : actor_->parameters())  all_params.push_back(p);
-            for (auto& p : critic_->parameters()) all_params.push_back(p);
-            torch::nn::utils::clip_grad_norm_(all_params, cfg_.max_grad_norm);
+            torch::nn::utils::clip_grad_norm_(network_->parameters(), cfg_.max_grad_norm);
             optimizer_->step();
 
-            // ── stats ───────────────────────────────────────────────
-            total_policy_loss += pg_loss.item<float>();
-            total_value_loss  += v_loss.item<float>();
-            total_entropy     += entropy_loss.item<float>();
-
+            // Accumulate on device; one .item() sync after the loop.
             {
                 torch::NoGradGuard ng;
-                auto approx_kl = ((ratio - 1.0f) - logratio).mean();
-                total_approx_kl += approx_kl.item<float>();
-                auto clipped = ((ratio - 1.0f).abs() > cfg_.clip_coef)
-                               .to(torch::kFloat32).mean();
-                total_clip_frac += clipped.item<float>();
+                total_policy_loss += pg_loss.detach();
+                total_value_loss  += v_loss.detach();
+                total_entropy     += entropy_loss.detach();
+                total_approx_kl   += ((ratio.detach() - 1.0f) - logratio.detach()).mean();
+                total_clip_frac   += ((ratio.detach() - 1.0f).abs() > cfg_.clip_coef)
+                                     .to(torch::kFloat32).mean();
             }
             ++num_updates;
         }
     }
 
-    // ── explained variance ──────────────────────────────────────────────
     float explained_var;
     {
         torch::NoGradGuard ng;
         auto var_y = b_ret.var();
         auto var_e = (b_ret - b_val).var();
-        explained_var = (var_y.item<float>() < 1e-8f)
+        explained_var = (var_y.item<float>() < kAdvantageEps)
             ? -1.0f
-            : 1.0f - var_e.item<float>() / (var_y.item<float>() + 1e-8f);
+            : 1.0f - var_e.item<float>() / (var_y.item<float>() + kAdvantageEps);
     }
 
-    // ── logging callback ────────────────────────────────────────────────
-    if (log_cb_) {
-        float n = static_cast<float>(num_updates);
-        float lr = cfg_.learning_rate;
-        if (cfg_.anneal_lr) {
-            float frac = 1.0f - static_cast<float>(update_idx_) /
-                         cfg_.num_updates();
-            lr = cfg_.learning_rate * frac;
-        }
-        log_cb_(UpdateStats{
-            update_idx_,
-            global_step_,
-            total_policy_loss / n,
-            total_value_loss  / n,
-            total_entropy     / n,
-            total_approx_kl   / n,
-            total_clip_frac   / n,
-            explained_var,
-            lr
-        });
+    float n  = static_cast<float>(std::max(1, num_updates));
+    float lr = cfg_.learning_rate;
+    if constexpr (cfg_.anneal_lr) {
+        // Mirror train()'s floor logic so the reported lr matches what
+        // the optimiser actually uses.
+        const float frac       = 1.0f - static_cast<float>(update_idx_) / cfg_.num_updates();
+        constexpr float floor_frac = cfg_.min_lr_frac > 0.0f ? cfg_.min_lr_frac : 0.0f;
+        lr = cfg_.learning_rate * std::max(frac, floor_frac);
     }
+    return UpdateStats{
+        update_idx_,
+        collector_->global_step(),
+        total_policy_loss.item<float>() / n,
+        total_value_loss.item<float>()  / n,
+        total_entropy.item<float>()     / n,
+        total_approx_kl.item<float>()   / n,
+        total_clip_frac.item<float>()   / n,
+        explained_var,
+        lr,
+        0.0,  // rollout_ms — set by train()
+        0.0,  // update_ms  — set by train()
+    };
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-void PPOTrainer::save(const std::string& path_prefix) {
-    torch::save(actor_,  path_prefix + "_actor.pt");
-    torch::save(critic_, path_prefix + "_critic.pt");
+void PPOTrainer::save(const std::string& path) {
+    torch::save(network_, path);
 }
 
-void PPOTrainer::load(const std::string& path_prefix) {
-    torch::load(actor_,  path_prefix + "_actor.pt");
-    torch::load(critic_, path_prefix + "_critic.pt");
+void PPOTrainer::load(const std::string& path) {
+    torch::load(network_, path);
 }
 
 } // namespace poker_ppo
