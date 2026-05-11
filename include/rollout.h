@@ -14,6 +14,7 @@
 
 #include <torch/torch.h>
 
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
@@ -139,7 +140,8 @@ private:
 class RolloutBuffer {
 public:
     RolloutBuffer(int num_steps, int num_envs, int obs_dim, int action_count,
-                  torch::Device device = torch::kCPU);
+                  torch::Device device = torch::kCPU,
+                  bool          enable_cfv = false);
 
     // Reset counts; reuse storage tensors.
     void clear();
@@ -155,6 +157,23 @@ public:
               float value,
               torch::Tensor mask);    // [action_count] CPU or device_
 
+    // Write the CFV target+mask vector for a previously-pushed transition.
+    // Called retroactively at terminal time once the showdown info is
+    // known. No-op when CFV storage isn't allocated. `step_idx` is the slot
+    // index — typically the caller passes a value in [traj_start_count,
+    // count(player, env_idx)).
+    void write_cfv_at(int player, int env_idx, int step_idx,
+                      const std::array<float, kCFVHeadDim>& target,
+                      const std::array<float, kCFVHeadDim>& mask);
+
+    // Returns how many transitions have been pushed for (player, env).
+    // Used by PlayerRolloutState to delimit per-trajectory slot ranges.
+    [[nodiscard]] int count(int player, int env_idx) const noexcept {
+        return counts_[player][env_idx];
+    }
+
+    [[nodiscard]] bool cfv_enabled() const noexcept { return cfv_enabled_; }
+
     // GAE per (player, env_idx) trajectory.
     //
     // Per (p, e) tail, bootstrap_terminal[p][e] selects:
@@ -169,7 +188,8 @@ public:
                          const torch::Tensor& bootstrap_terminal);
 
     // All valid transitions concatenated across both players and all envs.
-    // Returned tensors live on device_.
+    // Returned tensors live on device_. cfv_targets/cfv_mask are undefined
+    // (.defined() == false) when CFV storage isn't allocated.
     struct FlatBatch {
         torch::Tensor obs;          // [B, obs_dim]
         torch::Tensor actions;      // [B]
@@ -178,6 +198,8 @@ public:
         torch::Tensor returns;      // [B]
         torch::Tensor values;       // [B]
         torch::Tensor legal_masks;  // [B, action_count]
+        torch::Tensor cfv_targets;  // [B, kCFVHeadDim] or undefined
+        torch::Tensor cfv_mask;     // [B, kCFVHeadDim] or undefined
     };
     FlatBatch flatten() const;
 
@@ -199,6 +221,10 @@ private:
     torch::Tensor legal_masks_[2];  // [T, N, A]
     torch::Tensor advantages_[2];   // [T, N]
     torch::Tensor returns_[2];      // [T, N]
+
+    bool          cfv_enabled_ = false;
+    torch::Tensor cfv_targets_[2];  // [T, N, kCFVHeadDim] when enabled
+    torch::Tensor cfv_mask_[2];     // [T, N, kCFVHeadDim] when enabled
 
     std::vector<int32_t> counts_[2];  // [N]
 };
@@ -227,10 +253,23 @@ struct PlayerRolloutState {
         float          done     = 0.0f;
     };
 
+    // Per-trajectory CFV vector. Caller fills these at terminal time and
+    // passes to flush_on_terminal_with_cfv. Empty (mask all zero) for
+    // truncations.
+    struct TerminalCFV {
+        std::array<float, kCFVHeadDim> target{};
+        std::array<float, kCFVHeadDim> mask{};
+    };
+
     Pending pending[2];
     float   accumulated[2]      = {0.0f, 0.0f};
     float   next_done_flag[2]   = {0.0f, 0.0f};
     bool    tail_was_terminal[2] = {false, false};
+
+    // Buffer slot index where the current trajectory's first transition
+    // for player p was written. After flush_on_terminal we set this to
+    // buf.count(p, env) so the next trajectory's range starts cleanly.
+    int     traj_start_slot[2]   = {0, 0};
 
     void record_step(int player, int env_idx, RolloutBuffer& buf,
                      torch::Tensor obs, torch::Tensor mask,
@@ -261,7 +300,10 @@ struct PlayerRolloutState {
         accumulated[1] -= env_reward;
     }
 
-    void flush_on_terminal(int env_idx, RolloutBuffer& buf) {
+    // CFV-aware terminal flush. cfv_per_player is indexed [0]=seat0, [1]=seat1;
+    // pass nullptr to skip CFV writes (e.g. when the buffer has no CFV storage).
+    void flush_on_terminal(int env_idx, RolloutBuffer& buf,
+                           const TerminalCFV* cfv_per_player = nullptr) {
         for (int p = 0; p < 2; ++p) {
             Pending& pp = pending[p];
             if (pp.has) {
@@ -271,6 +313,17 @@ struct PlayerRolloutState {
                 pp.has = false;
                 tail_was_terminal[p] = true;
             }
+            // Back-fill CFV to every slot pushed for this player in the
+            // just-completed trajectory: [traj_start_slot[p], count).
+            if (cfv_per_player && buf.cfv_enabled()) {
+                const int end_slot = buf.count(p, env_idx);
+                for (int s = traj_start_slot[p]; s < end_slot; ++s) {
+                    buf.write_cfv_at(p, env_idx, s,
+                                     cfv_per_player[p].target,
+                                     cfv_per_player[p].mask);
+                }
+            }
+            traj_start_slot[p] = buf.count(p, env_idx);
         }
         // Reset accumulators unconditionally:
         // - SB-fold walk: one seat never acted this hand.
@@ -285,7 +338,8 @@ struct PlayerRolloutState {
 
     // Drain still-pending transitions at rollout end. These are
     // truncations, not terminals — the trainer reads tail_was_terminal[p]
-    // to pick the right bootstrap V.
+    // to pick the right bootstrap V. CFV is left zero-masked for these
+    // tails (no terminal showdown info to attribute).
     void flush_on_rollout_end(int env_idx, RolloutBuffer& buf) {
         for (int p = 0; p < 2; ++p) {
             Pending& pp = pending[p];
@@ -312,7 +366,8 @@ public:
                      const BetConfig&          bet_cfg,
                      int                       num_envs,
                      int                       num_steps,
-                     torch::Device             device);
+                     torch::Device             device,
+                     bool                      enable_cfv = false);
 
     ~RolloutCollector();
 

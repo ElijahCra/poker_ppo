@@ -43,14 +43,15 @@ PPOTrainer::PPOTrainer(IPokerEnvironmentFactory& env_factory,
       network_(nullptr)
 {
     collector_ = std::make_unique<RolloutCollector>(
-        env_factory, bet_cfg_, cfg_.num_envs, cfg_.num_steps, device_);
+        env_factory, bet_cfg_, cfg_.num_envs, cfg_.num_steps, device_,
+        /*enable_cfv=*/cfg_.cfv_aux.enabled);
 
     const int obs_dim      = collector_->obs_dim();
     const int action_count = collector_->action_count();
 
     network_ = ActorCritic(obs_dim, action_count,
                            cfg_.hidden_dim, cfg_.num_layers,
-                           cfg_.hist, cfg_.round_summary);
+                           cfg_.hist, cfg_.round_summary, cfg_.cfv_aux);
     network_->to(device_);
 
     optimizer_ = std::make_unique<torch::optim::Adam>(
@@ -71,7 +72,7 @@ PPOTrainer::PPOTrainer(IPokerEnvironmentFactory& env_factory,
         magnet_ = clone_actor_critic(
             network_, obs_dim, action_count,
             cfg_.hidden_dim, cfg_.num_layers,
-            cfg_.hist, cfg_.round_summary, device_);
+            cfg_.hist, cfg_.round_summary, device_, cfg_.cfv_aux);
     }
 }
 
@@ -139,7 +140,7 @@ void PPOTrainer::train() {
                 magnet_ = clone_actor_critic(
                     network_, collector_->obs_dim(), collector_->action_count(),
                     cfg_.hidden_dim, cfg_.num_layers,
-                    cfg_.hist, cfg_.round_summary, device_);
+                    cfg_.hist, cfg_.round_summary, device_, cfg_.cfv_aux);
             }
         }
     }
@@ -257,13 +258,15 @@ PPOTrainer::UpdateStats PPOTrainer::update() {
     auto batch   = buffer.flatten();
     int  B       = batch.obs.size(0);
 
-    auto& b_obs     = batch.obs;
-    auto& b_actions = batch.actions;
-    auto& b_logp    = batch.log_probs;
-    auto  b_adv     = batch.advantages;  // copy: normalisation mutates it
-    auto& b_ret     = batch.returns;
-    auto& b_val     = batch.values;
-    auto& b_masks   = batch.legal_masks;
+    auto& b_obs        = batch.obs;
+    auto& b_actions    = batch.actions;
+    auto& b_logp       = batch.log_probs;
+    auto  b_adv        = batch.advantages;  // copy: normalisation mutates it
+    auto& b_ret        = batch.returns;
+    auto& b_val        = batch.values;
+    auto& b_masks      = batch.legal_masks;
+    auto& b_cfv_target = batch.cfv_targets;  // undefined when cfv aux is off
+    auto& b_cfv_mask   = batch.cfv_mask;
 
     auto stat_opts = torch::TensorOptions().dtype(torch::kFloat32).device(device_);
     auto total_policy_loss = torch::zeros({}, stat_opts);
@@ -271,6 +274,7 @@ PPOTrainer::UpdateStats PPOTrainer::update() {
     auto total_entropy     = torch::zeros({}, stat_opts);
     auto total_approx_kl   = torch::zeros({}, stat_opts);
     auto total_clip_frac   = torch::zeros({}, stat_opts);
+    auto total_cfv_loss    = torch::zeros({}, stat_opts);
     int  num_updates = 0;
 
     // Cosine entropy decay. Held constant across this update's
@@ -363,11 +367,34 @@ PPOTrainer::UpdateStats PPOTrainer::update() {
                 mmd_kl_loss     = kl.mean();
             }
 
+            // Auxiliary CFV loss: masked MSE between predicted CFV vector
+            // and showdown-derived terminal targets. Only contributes when
+            // cfv_aux is enabled at config time AND the buffer carried
+            // CFV data through (b_cfv_target.defined()). When the entire
+            // minibatch is in zero-mask tails, divisor falls back to 1 to
+            // avoid NaN.
+            torch::Tensor cfv_loss;
+            if constexpr (cfg_.cfv_aux.enabled) {
+                if (er.cfv.defined() && b_cfv_target.defined()) {
+                    auto mb_cfv_target = b_cfv_target.index_select(0, mb_idx);
+                    auto mb_cfv_mask   = b_cfv_mask  .index_select(0, mb_idx);
+
+                    auto sq_err = (er.cfv - mb_cfv_target).pow(2) * mb_cfv_mask;
+                    auto denom  = mb_cfv_mask.sum().clamp_min(1.0f);
+                    cfv_loss    = sq_err.sum() / denom;
+                }
+            }
+
             auto loss = pg_loss
                       - ent_coef_now * entropy_loss
                       + cfg_.vf_coef * v_loss;
             if constexpr (cfg_.kl_coef > 0.0f) {
                 loss = loss + cfg_.kl_coef * mmd_kl_loss;
+            }
+            if constexpr (cfg_.cfv_aux.enabled) {
+                if (cfv_loss.defined()) {
+                    loss = loss + cfg_.cfv_aux.coef * cfv_loss;
+                }
             }
 
             optimizer_->zero_grad();
@@ -384,6 +411,11 @@ PPOTrainer::UpdateStats PPOTrainer::update() {
                 total_approx_kl   += ((ratio.detach() - 1.0f) - logratio.detach()).mean();
                 total_clip_frac   += ((ratio.detach() - 1.0f).abs() > cfg_.clip_coef)
                                      .to(torch::kFloat32).mean();
+                if constexpr (cfg_.cfv_aux.enabled) {
+                    if (cfv_loss.defined()) {
+                        total_cfv_loss += cfv_loss.detach();
+                    }
+                }
             }
             ++num_updates;
         }
@@ -418,6 +450,7 @@ PPOTrainer::UpdateStats PPOTrainer::update() {
         total_clip_frac.item<float>()   / n,
         explained_var,
         lr,
+        total_cfv_loss.item<float>()    / n,
         0.0,  // rollout_ms — set by train()
         0.0,  // update_ms  — set by train()
     };

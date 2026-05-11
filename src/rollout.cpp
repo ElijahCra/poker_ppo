@@ -1,6 +1,8 @@
 #include "rollout.h"
 
+#include "cfv_targets.h"
 #include "opponent_manager.h"
+#include "poker_env.h"
 
 #include <algorithm>
 #include <thread>
@@ -10,10 +12,12 @@ namespace poker_ppo {
 
 RolloutBuffer::RolloutBuffer(int num_steps, int num_envs,
                              int obs_dim, int action_count,
-                             torch::Device device)
+                             torch::Device device,
+                             bool          enable_cfv)
     : num_steps_(num_steps), num_envs_(num_envs),
       obs_dim_(obs_dim), action_count_(action_count),
-      device_(device)
+      device_(device),
+      cfv_enabled_(enable_cfv)
 {
     // Storage on CPU: pushes come from per-env worker threads and per-
     // transition device writes would serialise on CUDA's launch queue.
@@ -32,12 +36,40 @@ RolloutBuffer::RolloutBuffer(int num_steps, int num_envs,
         advantages_[p]  = torch::zeros({num_steps, num_envs},              cpu_f);
         returns_[p]     = torch::zeros({num_steps, num_envs},              cpu_f);
         counts_[p].assign(num_envs, 0);
+
+        if (cfv_enabled_) {
+            // [T, N, 1326] floats — biggest tensor in the buffer when
+            // enabled. ~130 MB at default sizes.
+            cfv_targets_[p] = torch::zeros(
+                {num_steps, num_envs, kCFVHeadDim}, cpu_f);
+            cfv_mask_[p]    = torch::zeros(
+                {num_steps, num_envs, kCFVHeadDim}, cpu_f);
+        }
     }
 }
 
 void RolloutBuffer::clear() {
     for (int p = 0; p < 2; ++p) {
         std::fill(counts_[p].begin(), counts_[p].end(), 0);
+        if (cfv_enabled_) {
+            // Zero the active region — slots from prior rollout would
+            // otherwise leak into newly-allocated trajectories that don't
+            // overwrite their CFV (truncations stay zero-masked).
+            cfv_targets_[p].zero_();
+            cfv_mask_[p].zero_();
+        }
+    }
+}
+
+void RolloutBuffer::write_cfv_at(int player, int env_idx, int step_idx,
+                                 const std::array<float, kCFVHeadDim>& target,
+                                 const std::array<float, kCFVHeadDim>& mask) {
+    if (!cfv_enabled_) return;
+    auto t_acc = cfv_targets_[player].accessor<float, 3>();
+    auto m_acc = cfv_mask_[player]   .accessor<float, 3>();
+    for (int k = 0; k < kCFVHeadDim; ++k) {
+        t_acc[step_idx][env_idx][k] = target[k];
+        m_acc[step_idx][env_idx][k] = mask[k];
     }
 }
 
@@ -124,6 +156,7 @@ void RolloutBuffer::compute_returns(
 RolloutBuffer::FlatBatch RolloutBuffer::flatten() const {
     std::vector<torch::Tensor> obs_list, actions_list, logp_list;
     std::vector<torch::Tensor> advs_list, rets_list, vals_list, masks_list;
+    std::vector<torch::Tensor> cfv_t_list, cfv_m_list;
 
     for (int p = 0; p < 2; ++p) {
         for (int e = 0; e < num_envs_; ++e) {
@@ -136,6 +169,10 @@ RolloutBuffer::FlatBatch RolloutBuffer::flatten() const {
             rets_list   .push_back(returns_[p]    .slice(0, 0, T).select(1, e));
             vals_list   .push_back(values_[p]     .slice(0, 0, T).select(1, e));
             masks_list  .push_back(legal_masks_[p].slice(0, 0, T).select(1, e));
+            if (cfv_enabled_) {
+                cfv_t_list.push_back(cfv_targets_[p].slice(0, 0, T).select(1, e));
+                cfv_m_list.push_back(cfv_mask_[p]   .slice(0, 0, T).select(1, e));
+            }
         }
     }
 
@@ -154,6 +191,8 @@ RolloutBuffer::FlatBatch RolloutBuffer::flatten() const {
             torch::zeros({0},                f),
             torch::zeros({0},                f),
             torch::zeros({0, action_count_}, f),
+            cfv_enabled_ ? torch::zeros({0, kCFVHeadDim}, f) : torch::Tensor{},
+            cfv_enabled_ ? torch::zeros({0, kCFVHeadDim}, f) : torch::Tensor{},
         };
     }
     return {
@@ -164,6 +203,8 @@ RolloutBuffer::FlatBatch RolloutBuffer::flatten() const {
         to_dev(torch::cat(rets_list,    0)),
         to_dev(torch::cat(vals_list,    0)),
         to_dev(torch::cat(masks_list,   0)),
+        cfv_enabled_ ? to_dev(torch::cat(cfv_t_list, 0)) : torch::Tensor{},
+        cfv_enabled_ ? to_dev(torch::cat(cfv_m_list, 0)) : torch::Tensor{},
     };
 }
 
@@ -213,14 +254,15 @@ RolloutCollector::RolloutCollector(IPokerEnvironmentFactory& factory,
                                    const BetConfig&          bet_cfg,
                                    int                       num_envs,
                                    int                       num_steps,
-                                   torch::Device             device)
+                                   torch::Device             device,
+                                   bool                      enable_cfv)
     : device_(device), num_envs_(num_envs), num_steps_(num_steps)
 {
     vec_env_ = std::make_unique<VectorizedEnv>(factory, bet_cfg, num_envs);
     const int obs_dim      = vec_env_->obs_dim();
     const int action_count = vec_env_->action_count();
     buffer_ = std::make_unique<RolloutBuffer>(
-        num_steps, num_envs, obs_dim, action_count, device_);
+        num_steps, num_envs, obs_dim, action_count, device_, enable_cfv);
 }
 
 RolloutCollector::~RolloutCollector() = default;
@@ -335,7 +377,24 @@ void RolloutCollector::collect(Strategy         strategy,
             player_state[i].step_reward(res.reward);
 
             if (res.done) {
-                player_state[i].flush_on_terminal(i, *buffer_);
+                // Compute CFV vectors for both seats BEFORE the env is
+                // reset — terminal info (cards, pot) is gone after reset.
+                PlayerRolloutState::TerminalCFV cfv_arr[2];
+                const PlayerRolloutState::TerminalCFV* cfv_ptr = nullptr;
+                if (buffer_->cfv_enabled()) {
+                    auto* poker_env =
+                        dynamic_cast<PokerEnvironment*>(envs[i].get());
+                    if (poker_env != nullptr) {
+                        for (int p = 0; p < 2; ++p) {
+                            auto r = compute_cfv_at_terminal(*poker_env, p);
+                            cfv_arr[p].target = r.target;
+                            cfv_arr[p].mask   = r.mask;
+                        }
+                        cfv_ptr = cfv_arr;
+                    }
+                }
+
+                player_state[i].flush_on_terminal(i, *buffer_, cfv_ptr);
                 auto rr = envs[i]->reset();
                 next_obs[i]  = rr.observation;
                 next_mask[i] = rr.legal_action_mask;

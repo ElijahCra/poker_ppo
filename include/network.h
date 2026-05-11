@@ -72,14 +72,21 @@ TORCH_MODULE(Tower);
 //
 // Heads: actor std=0.01, critic std=1.0; trunk orthogonal(√2)+Tanh.
 // Actor masks illegal actions before softmax via kIllegalActionLogit.
+//
+// Optional auxiliary CFV head (when cfv_aux.enabled): a third Tower
+// outputting [B, kCFVHeadDim] counterfactual values per hole-card combo.
+// Shares the live encoder output (gradients flow back into encoder),
+// providing range-aware supervision to the trunk + encoder.
 class ActorCriticImpl : public torch::nn::Module {
 public:
     ActorCriticImpl(int obs_dim, int action_count,
                     int hidden_dim, int num_layers,
                     BetHistoryConfig    hist,
-                    RoundSummaryConfig  round_summary = {});
+                    RoundSummaryConfig  round_summary = {},
+                    CFVAuxConfig        cfv_aux = {});
 
     // {logits, value}. Logits unmasked — use get_action()/evaluate() for masking.
+    // CFV head NOT computed on this path — rollout doesn't need it.
     std::pair<torch::Tensor, torch::Tensor> forward(torch::Tensor obs);
 
     // Critic-only. Skips the actor tower (e.g. for GAE bootstrap).
@@ -97,11 +104,13 @@ public:
     /// `log_prob.gather(action)` recovers `log_prob`. Free to expose
     /// since `evaluate()` already runs `log_softmax` internally; needed
     /// by the MMD regulariser, which computes KL across all actions.
+    /// `cfv` is undefined (.defined() == false) when the aux head is off.
     struct EvalResult {
         torch::Tensor log_prob;       // [B]    log π(a|s) for stored a
         torch::Tensor log_probs_all;  // [B, A] full masked log-softmax
         torch::Tensor value;          // [B]
         torch::Tensor entropy;        // [B]
+        torch::Tensor cfv;            // [B, kCFVHeadDim] or undefined
     };
     EvalResult evaluate(torch::Tensor obs, torch::Tensor legal_mask,
                         const torch::Tensor &action);
@@ -111,6 +120,8 @@ public:
     /// same obs the live policy is updating against. Returns [B, A].
     torch::Tensor masked_log_probs(torch::Tensor obs,
                                    torch::Tensor legal_mask);
+
+    [[nodiscard]] bool has_cfv() const noexcept { return !cfv_.is_empty(); }
 
 private:
     torch::Tensor apply_mask(torch::Tensor logits, torch::Tensor mask);
@@ -126,11 +137,13 @@ private:
 
     BetHistoryConfig    hist_;
     RoundSummaryConfig  round_summary_;
+    CFVAuxConfig        cfv_aux_;
     ObservationLayout   layout_;
 
     HistoryEncoder encoder_{nullptr};   // unset when hist_.enabled is false
     Tower actor_{nullptr};
     Tower critic_{nullptr};
+    Tower cfv_{nullptr};                // unset when cfv_aux_.enabled is false
 };
 
 TORCH_MODULE(ActorCritic);
@@ -147,6 +160,7 @@ TORCH_MODULE(ActorCritic);
     int                 num_layers,
     BetHistoryConfig    hist,
     RoundSummaryConfig  round_summary,
-    torch::Device       device);
+    torch::Device       device,
+    CFVAuxConfig        cfv_aux = {});
 
 } // namespace poker_ppo

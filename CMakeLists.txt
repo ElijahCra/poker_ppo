@@ -45,6 +45,7 @@ add_library(poker_ppo_lib
     src/opponent_manager.cpp
     src/best_response.cpp
     src/commands.cpp
+    src/cfv_targets.cpp
 )
 target_include_directories(poker_ppo_lib PUBLIC
     include

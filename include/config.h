@@ -51,6 +51,21 @@ struct RoundSummaryConfig {
     }
 };
 
+// Auxiliary counterfactual-value head: predicts payoff for every possible
+// hole-card combo of the acting player at the current public state. Trains
+// against showdown targets computed from observed self-play (both seats'
+// cards visible to the trainer). Goal is range-aware trunk representations
+// for downstream subgame-solving — see DeepStack/ReBeL.
+//
+// Output dim is C(52, 2) = 1326. Loss is masked: combos that share cards
+// with the opponent's actual hand or the actual board are zeroed out.
+struct CFVAuxConfig {
+    bool  enabled = false;
+    float coef    = 0.5f;   // weight in the total loss
+};
+
+inline constexpr int kCFVHeadDim = 1326;
+
 // Reservoir-sampled past-policy snapshots for self-play stabilisation.
 struct OpponentPoolConfig {
     bool     enabled                = false;
@@ -97,6 +112,7 @@ struct PPOConfig {
     RoundSummaryConfig  round_summary;
 
     OpponentPoolConfig  opp_pool;
+    CFVAuxConfig        cfv_aux;
 
     // ── MMD regularisation (Sokota et al., ICLR 2023) ────────────────────
     // When `kl_coef > 0`, adds `kl_coef * KL(π_θ || ρ)` to the PPO loss,

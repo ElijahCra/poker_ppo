@@ -34,6 +34,7 @@ public:
         float  clip_fraction;
         float  explained_variance;
         float  learning_rate;
+        float  cfv_loss;            // 0 when CFV aux is disabled
         double rollout_ms;
         double update_ms;
     };

@@ -158,9 +158,11 @@ torch::Tensor TowerImpl::forward(torch::Tensor x) {
 ActorCriticImpl::ActorCriticImpl(int obs_dim, int action_count,
                                  int hidden_dim, int num_layers,
                                  BetHistoryConfig    hist,
-                                 RoundSummaryConfig  round_summary)
+                                 RoundSummaryConfig  round_summary,
+                                 CFVAuxConfig        cfv_aux)
     : hist_(hist),
       round_summary_(round_summary),
+      cfv_aux_(cfv_aux),
       layout_(ObservationLayout::build(hist, round_summary))
 {
     if (layout_.total_dim != obs_dim) {
@@ -187,6 +189,14 @@ ActorCriticImpl::ActorCriticImpl(int obs_dim, int action_count,
                               Tower(trunk_in_dim, /*output_dim=*/1,
                                     hidden_dim, num_layers,
                                     /*head_init_std=*/1.0f));
+    if (cfv_aux_.enabled) {
+        // Wider output (1326). Smaller head init keeps initial CFV close
+        // to zero; the value-loss-style MSE drives it from there.
+        cfv_ = register_module("cfv",
+                               Tower(trunk_in_dim, kCFVHeadDim,
+                                     hidden_dim, num_layers,
+                                     /*head_init_std=*/0.1f));
+    }
 }
 
 torch::Tensor
@@ -277,15 +287,31 @@ ActorCriticImpl::get_action(torch::Tensor obs, torch::Tensor legal_mask) {
 ActorCriticImpl::EvalResult
 ActorCriticImpl::evaluate(torch::Tensor obs, torch::Tensor legal_mask,
                           const torch::Tensor &action) {
-    auto [logits, value] = forward(obs);
-    const auto masked = apply_mask(logits, legal_mask);
+    // Compute encoder once and run all enabled towers off the same input.
+    // This is the only path that produces CFV — rollout's forward() skips it.
+    auto encoded   = encode_history(obs);
+    auto actor_in  = build_trunk_input(obs, encoded);
+    auto critic_in = encoded.defined()
+        ? build_trunk_input(obs, encoded.detach())
+        : actor_in;
 
+    auto logits = actor_->forward(actor_in);
+    auto value  = critic_->forward(critic_in).squeeze(-1);
+
+    torch::Tensor cfv;
+    if (!cfv_.is_empty()) {
+        // CFV gets the live encoder output — auxiliary task is *meant* to
+        // shape the encoder representation.
+        cfv = cfv_->forward(actor_in);
+    }
+
+    const auto masked   = apply_mask(logits, legal_mask);
     const auto dist     = torch::softmax(masked, -1);
     const auto log_dist = torch::log_softmax(masked, -1);
     const auto log_prob = log_dist.gather(-1, action.unsqueeze(-1)).squeeze(-1);
     const auto entropy  = -(dist * log_dist).sum(-1);
 
-    return {log_prob, log_dist, value, entropy};
+    return {log_prob, log_dist, value, entropy, cfv};
 }
 
 torch::Tensor
@@ -305,10 +331,11 @@ ActorCritic clone_actor_critic(const ActorCritic&  src,
                                int                 num_layers,
                                BetHistoryConfig    hist,
                                RoundSummaryConfig  round_summary,
-                               torch::Device       device)
+                               torch::Device       device,
+                               CFVAuxConfig        cfv_aux)
 {
     ActorCritic dst(obs_dim, action_count, hidden_dim, num_layers,
-                    hist, round_summary);
+                    hist, round_summary, cfv_aux);
     dst->to(device);
 
     torch::NoGradGuard ng;
