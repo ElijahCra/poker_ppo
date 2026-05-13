@@ -13,10 +13,12 @@ OpponentPool::OpponentPool(int obs_dim, int action_count,
                            RoundSummaryConfig  round_summary,
                            torch::Device       device,
                            int                 max_size,
-                           uint64_t            seed)
+                           uint64_t            seed,
+                           CFVAuxConfig        cfv_aux)
     : obs_dim_(obs_dim), action_count_(action_count),
       hidden_dim_(hidden_dim), num_layers_(num_layers),
       hist_(hist), round_summary_(round_summary),
+      cfv_aux_(cfv_aux),
       device_(device), max_size_(std::max(0, max_size)),
       rng_(seed ? seed : std::random_device{}()) {}
 
@@ -31,7 +33,8 @@ OpponentPool::SnapshotId OpponentPool::add_snapshot(const ActorCritic& src) {
         const SnapshotId id = next_id_++;
         snapshots_.push_back({id, clone_actor_critic(src, obs_dim_, action_count_,
                                         hidden_dim_, num_layers_,
-                                        hist_, round_summary_, device_)});
+                                        hist_, round_summary_, device_,
+                                        cfv_aux_)});
         return id;
     }
 
@@ -48,7 +51,8 @@ OpponentPool::SnapshotId OpponentPool::add_snapshot(const ActorCritic& src) {
     const SnapshotId id = next_id_++;
     snapshots_[slot] = {id, clone_actor_critic(src, obs_dim_, action_count_,
                                         hidden_dim_, num_layers_,
-                                        hist_, round_summary_, device_)};
+                                        hist_, round_summary_, device_,
+                                        cfv_aux_)};
     return id;
 }
 
@@ -104,7 +108,8 @@ OpponentManager::OpponentManager(OpponentPoolConfig  cfg,
                                  int                 num_layers,
                                  BetHistoryConfig    hist,
                                  RoundSummaryConfig  round_summary,
-                                 torch::Device       device)
+                                 torch::Device       device,
+                                 CFVAuxConfig        cfv_aux)
     : cfg_(cfg),
       // Different stream from the pool's RNG when both are user-seeded.
       episode_rng_(cfg.seed ? cfg.seed
@@ -117,7 +122,7 @@ OpponentManager::OpponentManager(OpponentPoolConfig  cfg,
         : 0;
     pool_ = std::make_unique<OpponentPool>(
         obs_dim, action_count, hidden_dim, num_layers,
-        hist, round_summary, device, cfg_.max_size, pool_seed);
+        hist, round_summary, device, cfg_.max_size, pool_seed, cfv_aux);
 }
 
 OpponentManager::~OpponentManager() = default;

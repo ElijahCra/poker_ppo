@@ -16,7 +16,8 @@ League::League(IPokerEnvironmentFactory& factory,
                BetHistoryConfig    hist,
                RoundSummaryConfig  round_summary,
                Config cfg,
-               torch::Device device)
+               torch::Device device,
+               CFVAuxConfig cfv_aux)
     : factory_(factory),
       bet_cfg_(bet_cfg),
       cfg_(cfg),
@@ -26,6 +27,7 @@ League::League(IPokerEnvironmentFactory& factory,
       num_layers_(num_layers),
       hist_(hist),
       round_summary_(round_summary),
+      cfv_aux_(cfv_aux),
       device_(device) {}
 
 void League::add_anchor(std::unique_ptr<IPolicy> policy) {
@@ -47,8 +49,11 @@ void League::add_default_anchors() {
 }
 
 ActorCritic League::clone_network(const ActorCritic& src) {
+    // Pass cfv_aux_ so the destination has the same CFV-head shape as
+    // the trained source — otherwise the parameter-count check below
+    // trips when the head is enabled.
     ActorCritic dst(obs_dim_, action_count_, hidden_dim_, num_layers_,
-                    hist_, round_summary_);
+                    hist_, round_summary_, cfv_aux_);
     dst->to(device_);
 
     torch::NoGradGuard ng;
@@ -71,8 +76,11 @@ ActorCritic League::clone_network(const ActorCritic& src) {
 }
 
 ActorCritic League::make_random_network() {
+    // Same shape as the trained net (including any CFV head) so the
+    // random_init anchor stays comparable. The CFV head's outputs aren't
+    // used by the anchor's get_action path; it's just there for shape.
     ActorCritic net(obs_dim_, action_count_, hidden_dim_, num_layers_,
-                    hist_, round_summary_);
+                    hist_, round_summary_, cfv_aux_);
     net->to(device_);
     net->eval();
     return net;

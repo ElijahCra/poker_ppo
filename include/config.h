@@ -244,6 +244,10 @@ static constexpr PPOConfig kPPOConfig{
         .max_unique_per_rollout  = 4,
         .seed                    = 0,
     },
+    .cfv_aux          = CFVAuxConfig{
+        .enabled = true,    // auxiliary counterfactual-value head
+        .coef    = 0.5f,
+    },
 };
 
 static constexpr BestResponseConfig kBRConfig{

@@ -87,7 +87,8 @@ int main(int argc, char** argv) {
                   << (p.hist.enabled ? "ON" : "OFF") << "\n"
                   << "Round-summary block          : "
                   << (p.round_summary.enabled ? "ON" : "OFF") << "\n"
-                  << "Opponent pool                : "
+
+        << "Opponent pool                : "
                   << (p.opp_pool.enabled ? "ON" : "OFF");
         if (p.opp_pool.enabled) {
             std::cout << "  (size=" << p.opp_pool.max_size

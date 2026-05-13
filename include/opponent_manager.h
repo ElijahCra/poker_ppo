@@ -26,7 +26,8 @@ public:
                  RoundSummaryConfig  round_summary,
                  torch::Device       device,
                  int                 max_size,
-                 uint64_t            seed = 0);
+                 uint64_t            seed = 0,
+                 CFVAuxConfig        cfv_aux = {});
 
     int  size()     const { return static_cast<int>(snapshots_.size()); }
     int  capacity() const { return max_size_; }
@@ -57,6 +58,7 @@ private:
     int obs_dim_, action_count_, hidden_dim_, num_layers_;
     BetHistoryConfig    hist_;
     RoundSummaryConfig  round_summary_;
+    CFVAuxConfig        cfv_aux_;
     torch::Device       device_;
     int                 max_size_;
 
@@ -77,7 +79,8 @@ public:
                     int                 num_layers,
                     BetHistoryConfig    hist,
                     RoundSummaryConfig  round_summary,
-                    torch::Device       device);
+                    torch::Device       device,
+                    CFVAuxConfig        cfv_aux = {});
 
     ~OpponentManager();
 

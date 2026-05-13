@@ -17,7 +17,8 @@ BestResponseEvaluator::BestResponseEvaluator(
     BetHistoryConfig    hist,
     RoundSummaryConfig  round_summary,
     BestResponseConfig  cfg,
-    torch::Device       device)
+    torch::Device       device,
+    CFVAuxConfig        target_cfv_aux)
     : factory_(factory),
       bet_cfg_(bet_cfg),
       cfg_(cfg),
@@ -27,6 +28,7 @@ BestResponseEvaluator::BestResponseEvaluator(
       num_layers_(num_layers),
       hist_(hist),
       round_summary_(round_summary),
+      target_cfv_aux_(target_cfv_aux),
       device_(device),
       rng_(cfg.seed ? cfg.seed : std::random_device{}()) {
 
@@ -57,9 +59,11 @@ BestResponseEvaluator::evaluate(const ActorCritic& target,
     const auto t0 = clock::now();
 
     // Freeze target once so all seeds play the same opponent.
+    // Pass the trained target's CFV config so the clone matches its shape;
+    // the exploiter itself has no CFV head (it doesn't need one for the BR task).
     ActorCritic frozen_target = clone_actor_critic(
         target, obs_dim_, action_count_, hidden_dim_, num_layers_,
-        hist_, round_summary_, device_);
+        hist_, round_summary_, device_, target_cfv_aux_);
 
     const int  num_seeds  = std::max(1, cfg_.num_exploiter_seeds);
     const bool multi_seed = num_seeds > 1;

@@ -61,7 +61,7 @@ PPOTrainer::PPOTrainer(IPokerEnvironmentFactory& env_factory,
     opp_mgr_ = std::make_unique<OpponentManager>(
         cfg_.opp_pool, obs_dim, action_count,
         cfg_.hidden_dim, cfg_.num_layers,
-        cfg_.hist, cfg_.round_summary, device_);
+        cfg_.hist, cfg_.round_summary, device_, cfg_.cfv_aux);
     opp_mgr_->reset_assignments(cfg_.num_envs);
 
     // MMD magnet — initialise from the random-init network so the very

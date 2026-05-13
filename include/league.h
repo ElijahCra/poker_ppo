@@ -48,7 +48,8 @@ public:
            BetHistoryConfig    hist,
            RoundSummaryConfig  round_summary,
            Config              cfg,
-           torch::Device       device = torch::kCPU);
+           torch::Device       device = torch::kCPU,
+           CFVAuxConfig        cfv_aux = {});
 
     // uniform, random_init, always_call, always_raise, pair_caller.
     void add_default_anchors();
@@ -85,6 +86,7 @@ private:
     int                       num_layers_;
     BetHistoryConfig          hist_;
     RoundSummaryConfig        round_summary_;
+    CFVAuxConfig              cfv_aux_;
     torch::Device             device_;
 
     std::vector<std::unique_ptr<IPolicy>> anchors_;

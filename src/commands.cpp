@@ -48,7 +48,8 @@ int cmd_train(IPokerEnvironmentFactory& factory,
                   ppo_cfg.hist,
                   ppo_cfg.round_summary,
                   league_cfg,
-                  device);
+                  device,
+                  ppo_cfg.cfv_aux);
 
     league.add_default_anchors();
     std::cout << "League anchors:";
@@ -68,7 +69,7 @@ int cmd_train(IPokerEnvironmentFactory& factory,
             obs_dim, action_count,
             ppo_cfg.hidden_dim, ppo_cfg.num_layers,
             ppo_cfg.hist, ppo_cfg.round_summary,
-            br_cfg, device);
+            br_cfg, device, ppo_cfg.cfv_aux);
         std::cout << "Best-response evaluator: ON  (every "
                   << br_cfg.eval_every << " updates, "
                   << br_cfg.num_exploiter_seeds << " seeds × "

@@ -49,7 +49,8 @@ public:
                           BetHistoryConfig    hist,
                           RoundSummaryConfig  round_summary,
                           BestResponseConfig  cfg,
-                          torch::Device       device);
+                          torch::Device       device,
+                          CFVAuxConfig        target_cfv_aux = {});
 
     // Train an exploiter against a frozen copy of `target` for
     // cfg.updates_per_eval updates. update/global_step are stamped into
@@ -84,6 +85,7 @@ private:
     int                       num_layers_;
     BetHistoryConfig          hist_;
     RoundSummaryConfig        round_summary_;
+    CFVAuxConfig              target_cfv_aux_;   // shape-match for frozen-target clones only
     torch::Device             device_;
 
     ActorCritic                                        exploiter_{nullptr};
