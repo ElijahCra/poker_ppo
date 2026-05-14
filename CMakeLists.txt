@@ -46,6 +46,7 @@ add_library(poker_ppo_lib
     src/best_response.cpp
     src/commands.cpp
     src/cfv_targets.cpp
+    src/checkpoint.cpp
 )
 target_include_directories(poker_ppo_lib PUBLIC
     include

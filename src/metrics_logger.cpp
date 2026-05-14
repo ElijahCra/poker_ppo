@@ -8,28 +8,36 @@
 
 namespace poker_ppo {
 
-MetricsLogger::MetricsLogger(const std::string& run_dir) : run_dir_(run_dir) {
+MetricsLogger::MetricsLogger(const std::string& run_dir, bool append)
+    : run_dir_(run_dir)
+{
     std::filesystem::create_directories(run_dir_);
 
-    metrics_.open(run_dir_ + "/metrics.csv");
-    league_ .open(run_dir_ + "/league.csv");
-    br_     .open(run_dir_ + "/br.csv");
+    const auto mode = append
+        ? (std::ios::out | std::ios::app)
+        : (std::ios::out | std::ios::trunc);
 
-    metrics_ << "update,global_step,policy_loss,value_loss,entropy,"
-                "approx_kl,clip_fraction,explained_variance,learning_rate,"
-                "cfv_loss,rollout_ms,update_ms\n";
-    metrics_.flush();
+    metrics_.open(run_dir_ + "/metrics.csv", mode);
+    league_ .open(run_dir_ + "/league.csv",  mode);
+    br_     .open(run_dir_ + "/br.csv",      mode);
 
-    // Long format: pivoted in plot_live.
-    league_ << "update,global_step,anchor,num_hands,bb_per_hand,win_rate\n";
-    league_.flush();
+    if (!append) {
+        metrics_ << "update,global_step,policy_loss,value_loss,entropy,"
+                    "approx_kl,clip_fraction,explained_variance,learning_rate,"
+                    "cfv_loss,rollout_ms,update_ms\n";
+        metrics_.flush();
 
-    // bb_per_hand is the max-over-seeds (tightest lower bound); the rest
-    // are diagnostics over the seed distribution.
-    br_ << "update,global_step,br_updates_run,num_seeds,num_hands,"
-           "bb_per_hand,bb_per_hand_mean,bb_per_hand_min,bb_per_hand_std,"
-           "win_rate,wall_ms\n";
-    br_.flush();
+        // Long format: pivoted in plot_live.
+        league_ << "update,global_step,anchor,num_hands,bb_per_hand,win_rate\n";
+        league_.flush();
+
+        // bb_per_hand is the max-over-seeds (tightest lower bound); the rest
+        // are diagnostics over the seed distribution.
+        br_ << "update,global_step,br_updates_run,num_seeds,num_hands,"
+               "bb_per_hand,bb_per_hand_mean,bb_per_hand_min,bb_per_hand_std,"
+               "win_rate,wall_ms\n";
+        br_.flush();
+    }
 }
 
 MetricsLogger::~MetricsLogger() = default;

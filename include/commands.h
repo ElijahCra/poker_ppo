@@ -15,11 +15,14 @@
 namespace poker_ppo {
 
 // PPO self-play training. Sets up league + BR + metrics, runs to
-// kPPOConfig.total_timesteps, saves on exit.
+// kPPOConfig.total_timesteps, saves on exit. When resume_dir is non-empty
+// the trainer loads the latest checkpoint from <resume_dir>/ckpt/ and
+// reopens metrics CSVs in append mode under <resume_dir>/.
 int cmd_train(IPokerEnvironmentFactory& factory,
               const PokerConfig&        poker_cfg,
               torch::Device             device,
-              PPOTrainer::Strategy      strategy);
+              PPOTrainer::Strategy      strategy,
+              const std::string&        resume_dir = "");
 
 // Interactive REPL over stdin/stdout. Driven by tools/play.py.
 int cmd_play(IPokerEnvironmentFactory& factory,

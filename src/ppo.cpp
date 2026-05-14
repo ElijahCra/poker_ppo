@@ -1,12 +1,19 @@
 #include "ppo.h"
 
+#include "checkpoint.h"
 #include "opponent_manager.h"
+
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAStream.h>
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
+#include <filesystem>
 #include <iomanip>
 #include <iostream>
+#include <mutex>
 #include <numeric>
 #include <thread>
 
@@ -74,6 +81,18 @@ PPOTrainer::PPOTrainer(IPokerEnvironmentFactory& env_factory,
             cfg_.hidden_dim, cfg_.num_layers,
             cfg_.hist, cfg_.round_summary, device_, cfg_.cfv_aux);
     }
+
+    // Async path: second collector with its own envs + buffer, plus a
+    // dedicated snapshot of the live policy used by the worker thread.
+    if constexpr (cfg_.async_rollout.enabled) {
+        collector_b_ = std::make_unique<RolloutCollector>(
+            env_factory, bet_cfg_, cfg_.num_envs, cfg_.num_steps, device_,
+            /*enable_cfv=*/cfg_.cfv_aux.enabled);
+        snapshot_ = clone_actor_critic(
+            network_, obs_dim, action_count,
+            cfg_.hidden_dim, cfg_.num_layers,
+            cfg_.hist, cfg_.round_summary, device_, cfg_.cfv_aux);
+    }
 }
 
 PPOTrainer::~PPOTrainer() = default;
@@ -84,11 +103,67 @@ int PPOTrainer::opponent_pool_size() const {
 
 void PPOTrainer::train() {
     collector_->init_carry();
+    if (collector_b_) collector_b_->init_carry();
     opp_mgr_->reset_assignments(cfg_.num_envs);
+
+    // Resume from checkpoint if a run_dir was given and one exists.
+    std::unique_ptr<Checkpoint> ckpt;
+    if constexpr (cfg_.checkpoint.enabled) {
+        if (!run_dir_.empty()) {
+            ckpt = std::make_unique<Checkpoint>(
+                std::filesystem::path(run_dir_) / "ckpt");
+            auto loaded = ckpt->load_latest(network_, *optimizer_, magnet_);
+            if (loaded) {
+                // Resume from the iter AFTER the saved one — saved iter
+                // already had its post-ops run.
+                update_idx_  = loaded->update_idx + 1;
+                global_step_ = loaded->global_step;
+                // Re-sync the snapshot since the network just changed.
+                if (!snapshot_.is_empty()) {
+                    refresh_snapshot();
+                }
+            }
+        }
+    }
 
     const int total_updates = cfg_.num_updates();
 
-    for (update_idx_ = 0; update_idx_ < total_updates; ++update_idx_) {
+    if constexpr (cfg_.async_rollout.enabled) {
+        train_async_loop(total_updates);
+    } else {
+        train_sync_loop(total_updates);
+    }
+}
+
+void PPOTrainer::refresh_snapshot() {
+    snapshot_ = clone_actor_critic(
+        network_, collector_->obs_dim(), collector_->action_count(),
+        cfg_.hidden_dim, cfg_.num_layers,
+        cfg_.hist, cfg_.round_summary, device_, cfg_.cfv_aux);
+}
+
+void PPOTrainer::maybe_refresh_magnet() {
+    if constexpr (cfg_.kl_coef > 0.0f) {
+        const int K = std::max(1, cfg_.magnet_update_every);
+        if (update_idx_ > 0 && update_idx_ % K == 0) {
+            magnet_ = clone_actor_critic(
+                network_, collector_->obs_dim(), collector_->action_count(),
+                cfg_.hidden_dim, cfg_.num_layers,
+                cfg_.hist, cfg_.round_summary, device_, cfg_.cfv_aux);
+        }
+    }
+}
+
+void PPOTrainer::train_sync_loop(int total_updates) {
+    std::unique_ptr<Checkpoint> ckpt;
+    if constexpr (cfg_.checkpoint.enabled) {
+        if (!run_dir_.empty()) {
+            ckpt = std::make_unique<Checkpoint>(
+                std::filesystem::path(run_dir_) / "ckpt");
+        }
+    }
+
+    for (; update_idx_ < total_updates; ++update_idx_) {
         // Linear LR anneal with min_lr_frac floor — without the floor the
         // last quarter of training does ~no learning.
         if constexpr (cfg_.anneal_lr) {
@@ -113,6 +188,7 @@ void PPOTrainer::train() {
 
         stats.rollout_ms = ms(t1 - t0).count();
         stats.update_ms  = ms(t2 - t1).count();
+        global_step_     = collector_->global_step();
 
         if (log_cb_) log_cb_(stats);
 
@@ -129,21 +205,156 @@ void PPOTrainer::train() {
         }
 
         opp_mgr_->maybe_snapshot(update_idx_, network_);
+        maybe_refresh_magnet();
 
-        // Refresh the MMD magnet on cadence. Slow refresh = strong
-        // anchoring (drives π_θ toward older self); fast refresh =
-        // weak anchoring (closer to vanilla PPO). Sokota 2023's grid
-        // landed at K ≈ 100, the default in config.h.
-        if constexpr (cfg_.kl_coef > 0.0f) {
-            const int K = std::max(1, cfg_.magnet_update_every);
-            if (update_idx_ > 0 && update_idx_ % K == 0) {
-                magnet_ = clone_actor_critic(
-                    network_, collector_->obs_dim(), collector_->action_count(),
-                    cfg_.hidden_dim, cfg_.num_layers,
-                    cfg_.hist, cfg_.round_summary, device_, cfg_.cfv_aux);
+        if constexpr (cfg_.checkpoint.enabled) {
+            if (ckpt && update_idx_ > 0 && update_idx_ % cfg_.checkpoint.every == 0) {
+                ckpt->save(update_idx_, global_step_, network_, *optimizer_, magnet_);
+                ckpt->prune(cfg_.checkpoint.keep_last);
             }
         }
     }
+}
+
+void PPOTrainer::train_async_loop(int total_updates) {
+    using clock = std::chrono::steady_clock;
+    using ms    = std::chrono::duration<double, std::milli>;
+
+    std::unique_ptr<Checkpoint> ckpt;
+    if constexpr (cfg_.checkpoint.enabled) {
+        if (!run_dir_.empty()) {
+            ckpt = std::make_unique<Checkpoint>(
+                std::filesystem::path(run_dir_) / "ckpt");
+        }
+    }
+
+    // Warmup rollout: synchronously fill collector_'s buffer so the first
+    // iter's update has something to consume.
+    refresh_snapshot();
+    {
+        at::set_num_threads(1);
+        auto wt0 = clock::now();
+        collector_->collect(strategy_, snapshot_, *opp_mgr_,
+                            update_idx_, cfg_.gamma, cfg_.gae_lambda);
+        auto wt1 = clock::now();
+        at::set_num_threads(std::thread::hardware_concurrency());
+        std::cout << "[async warmup] rollout=" << ms(wt1 - wt0).count() << "ms\n";
+    }
+    current_is_a_ = true;  // collector_ has fresh data
+
+    // Worker thread + signaling state.
+    enum class Sig : uint8_t { Idle, Run, Done, Exit };
+    std::mutex mu;
+    std::condition_variable cv;
+    Sig sig = Sig::Idle;
+
+    // Captured by reference: snapshot_, current_is_a_, opp_mgr_, etc.
+    // Each iter: main sets current_is_a_ + update_idx_ before signaling Run.
+    std::thread worker([&] {
+        // CUDA stream pinning lets rollout forwards overlap with the
+        // update's backward on the GPU.
+        std::unique_ptr<c10::cuda::CUDAStreamGuard> stream_guard;
+        if (device_.is_cuda()) {
+            stream_guard = std::make_unique<c10::cuda::CUDAStreamGuard>(
+                c10::cuda::getStreamFromPool(/*high_priority=*/false,
+                                             device_.index()));
+        }
+
+        while (true) {
+            std::unique_lock<std::mutex> lk(mu);
+            cv.wait(lk, [&] { return sig == Sig::Run || sig == Sig::Exit; });
+            if (sig == Sig::Exit) return;
+            const bool fill_b = current_is_a_;  // current=a → worker fills b
+            const int  worker_update_idx = update_idx_;
+            lk.unlock();
+
+            auto& target_collector = fill_b ? *collector_b_ : *collector_;
+            at::set_num_threads(1);
+            target_collector.collect(strategy_, snapshot_, *opp_mgr_,
+                                     worker_update_idx,
+                                     cfg_.gamma, cfg_.gae_lambda);
+
+            lk.lock();
+            sig = Sig::Done;
+            cv.notify_one();
+        }
+    });
+
+    for (; update_idx_ < total_updates; ++update_idx_) {
+        // LR anneal (same as sync).
+        if constexpr (cfg_.anneal_lr) {
+            const float frac = 1.0f - static_cast<float>(update_idx_) / total_updates;
+            constexpr float floor_frac = cfg_.min_lr_frac > 0.0f ? cfg_.min_lr_frac : 0.0f;
+            const float lr = cfg_.learning_rate * std::max(frac, floor_frac);
+            for (auto& pg : optimizer_->param_groups())
+                static_cast<torch::optim::AdamOptions&>(pg.options()).lr(lr);
+        }
+
+        auto t0 = clock::now();
+
+        // Dispatch rollout worker. snapshot_ is already fresh (refreshed
+        // at the end of the previous iter, or at warmup).
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            sig = Sig::Run;
+        }
+        cv.notify_one();
+
+        // Concurrently: update on current buffer.
+        at::set_num_threads(std::thread::hardware_concurrency());
+        auto stats = update();
+
+        auto t1 = clock::now();
+
+        // Wait for worker to finish its rollout.
+        {
+            std::unique_lock<std::mutex> lk(mu);
+            cv.wait(lk, [&] { return sig == Sig::Done; });
+            sig = Sig::Idle;
+        }
+        auto t2 = clock::now();
+
+        // Sync point — no concurrent work. Safe to touch shared state.
+        stats.update_ms  = ms(t1 - t0).count();
+        stats.rollout_ms = ms(t2 - t0).count();   // wall time incl. wait
+        // Surface whichever collector just finished filling.
+        const auto& fresh_collector = current_is_a_ ? *collector_b_ : *collector_;
+        global_step_ = fresh_collector.global_step();
+
+        if (log_cb_) log_cb_(stats);
+
+        if (update_idx_ % 10 == 0) {
+            std::cout << std::fixed << std::setprecision(1)
+                      << "[update " << update_idx_ << " async]"
+                      << "  rollout=" << stats.rollout_ms << "ms"
+                      << "  update=" << stats.update_ms << "ms";
+            if (opp_mgr_->enabled()) {
+                std::cout << "  pool=" << opp_mgr_->size()
+                          << "/" << opp_mgr_->capacity();
+            }
+            std::cout << "\n" << std::defaultfloat << std::setprecision(6);
+        }
+
+        opp_mgr_->maybe_snapshot(update_idx_, network_);
+        maybe_refresh_magnet();
+        refresh_snapshot();             // for the NEXT iter's worker run
+        current_is_a_ = !current_is_a_; // freshly-filled collector becomes current
+
+        if constexpr (cfg_.checkpoint.enabled) {
+            if (ckpt && update_idx_ > 0 && update_idx_ % cfg_.checkpoint.every == 0) {
+                ckpt->save(update_idx_, global_step_, network_, *optimizer_, magnet_);
+                ckpt->prune(cfg_.checkpoint.keep_last);
+            }
+        }
+    }
+
+    // Drain the worker.
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        sig = Sig::Exit;
+    }
+    cv.notify_one();
+    worker.join();
 }
 
 void PPOTrainer::collect_rollout_serial() {
@@ -254,7 +465,12 @@ PPOTrainer::benchmark_rollouts(int iters, int warmup, bool verbose) {
 PPOTrainer::UpdateStats PPOTrainer::update() {
     network_->train();
 
-    auto& buffer = collector_->buffer();
+    // In async mode, collector_b_ exists and `current_is_a_` flags which
+    // collector holds the rollout data ready for consumption. In sync mode
+    // collector_b_ is null and we always read from collector_.
+    auto& buffer = (collector_b_ && !current_is_a_)
+        ? collector_b_->buffer()
+        : collector_->buffer();
     auto batch   = buffer.flatten();
     int  B       = batch.obs.size(0);
 

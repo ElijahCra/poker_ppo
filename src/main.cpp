@@ -45,6 +45,9 @@ struct CliOptions {
     std::string play_model_path;
     int         benchmark_iters = 20;
     std::string strategy        = "threadpool";
+    // If non-empty, train() resumes from the latest checkpoint under
+    // <resume_dir>/ckpt/ and continues writing to <resume_dir>/.
+    std::string resume_dir;
 };
 
 bool parse_cli(int argc, char** argv, CliOptions& out) {
@@ -61,6 +64,12 @@ bool parse_cli(int argc, char** argv, CliOptions& out) {
             if (i + 1 < argc) { out.play_model_path = argv[i + 1]; ++i; }
         } else if (a == "--strategy") {
             if (i + 1 < argc) { out.strategy = argv[i + 1]; ++i; }
+        } else if (a == "--resume") {
+            if (i + 1 < argc) { out.resume_dir = argv[i + 1]; ++i; }
+            else {
+                std::cerr << "--resume requires a run directory path\n";
+                return false;
+            }
         } else {
             std::cerr << "unknown argument '" << a << "'\n";
             return false;
@@ -124,5 +133,5 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::cout << "Rollout strategy: " << opt.strategy << "\n";
-    return cmd_train(factory, poker_cfg, device, strategy);
+    return cmd_train(factory, poker_cfg, device, strategy, opt.resume_dir);
 }

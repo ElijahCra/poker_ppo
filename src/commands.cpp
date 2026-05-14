@@ -17,7 +17,8 @@ namespace poker_ppo {
 int cmd_train(IPokerEnvironmentFactory& factory,
               const PokerConfig&        poker_cfg,
               torch::Device             device,
-              PPOTrainer::Strategy      strategy)
+              PPOTrainer::Strategy      strategy,
+              const std::string&        resume_dir)
 {
     PPOTrainer trainer(factory, device);
     trainer.set_rollout_strategy(strategy);
@@ -89,10 +90,19 @@ int cmd_train(IPokerEnvironmentFactory& factory,
     };
 
     // CSVs at runs/<timestamp>/, tailed by tools/plot_live.py.
-    MetricsLogger metrics(make_run_dir());
-    std::cout << "Metrics dir: " << metrics.run_dir() << "\n"
+    // On resume: reuse the existing dir and append to its CSVs.
+    const std::string run_dir   = resume_dir.empty() ? make_run_dir() : resume_dir;
+    const bool        appending = !resume_dir.empty();
+    MetricsLogger metrics(run_dir, appending);
+    std::cout << "Metrics dir: " << metrics.run_dir()
+              << (appending ? "  [resumed]" : "") << "\n"
               << "  (live plots: `python tools/plot_live.py "
               << metrics.run_dir() << "`)\n";
+
+    // Trainer picks up checkpoints from <run_dir>/ckpt/ regardless of
+    // whether this is a fresh or resumed run. Fresh runs simply find no
+    // checkpoint and start from update 0.
+    trainer.set_run_dir(run_dir);
 
     trainer.set_log_callback([&](const PPOTrainer::UpdateStats& s) {
         metrics.log_update(s);

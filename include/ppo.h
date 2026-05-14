@@ -93,8 +93,26 @@ public:
     void save(const std::string& path);
     void load(const std::string& path);
 
+    // Used for checkpoint dir resolution. If empty (default), no
+    // checkpoint save/resume happens regardless of the config flag.
+    void set_run_dir(std::string dir) { run_dir_ = std::move(dir); }
+
 private:
     [[nodiscard]] UpdateStats update();
+
+    // Synchronous loop body (original behavior).
+    void train_sync_loop(int total_updates);
+
+    // Double-buffered async loop: worker thread runs rollout on a snapshot
+    // while main thread does the update; sync at iteration boundary.
+    void train_async_loop(int total_updates);
+
+    // Clone live network into snapshot_. Called at iter start before
+    // dispatching the rollout to the worker.
+    void refresh_snapshot();
+
+    // Magnet/opp-pool refresh logic shared by both loops.
+    void maybe_refresh_magnet();
 
     static inline constexpr const PPOConfig& cfg_      = config::kPPOConfig;
     static inline constexpr const BetConfig& bet_cfg_  = config::kBetConfig;
@@ -103,6 +121,7 @@ private:
     ActorCritic                          network_;
     std::unique_ptr<torch::optim::Adam>  optimizer_;
     std::unique_ptr<RolloutCollector>    collector_;
+    std::unique_ptr<RolloutCollector>    collector_b_;   // async: second buffer + envs
     std::unique_ptr<OpponentManager>     opp_mgr_;
 
     // MMD magnet — frozen snapshot of `network_`, refreshed every
@@ -110,7 +129,24 @@ private:
     // (vanilla self-play PPO; the regulariser is bypassed entirely).
     ActorCritic                          magnet_{nullptr};
 
-    int update_idx_ = 0;
+    // Frozen snapshot of network_ used by the async worker for rollouts.
+    // Refreshed at the top of each iter so the rollout sees the most
+    // recent policy minus 1-step lag. Null when async is disabled.
+    ActorCritic                          snapshot_{nullptr};
+
+    // Which collector's buffer holds the data to be consumed by the next
+    // update call. The other collector is the one the worker fills.
+    // Toggled at each async iter boundary.
+    bool                                 current_is_a_ = true;
+
+    // Mirror of RolloutCollector::global_step at the end of the last
+    // iter — surfaced here so checkpoint save can persist it without
+    // having to pick the right collector.
+    int update_idx_  = 0;
+    int global_step_ = 0;
+
+    // For checkpoint save/resume. Empty disables both.
+    std::string run_dir_;
 
     LogCallback log_cb_;
     Strategy    strategy_ = Strategy::Threadpool;

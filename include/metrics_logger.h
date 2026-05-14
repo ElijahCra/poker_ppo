@@ -17,8 +17,11 @@ namespace poker_ppo {
 
 class MetricsLogger {
 public:
-    // Creates run_dir (and parents) if missing, opens CSVs, writes headers.
-    explicit MetricsLogger(const std::string& run_dir);
+    // Creates run_dir (and parents) if missing, opens CSVs.
+    // When append=false (default), truncates and writes headers.
+    // When append=true, opens in append mode and skips headers — for
+    // resuming a run without clobbering prior rows.
+    explicit MetricsLogger(const std::string& run_dir, bool append = false);
     ~MetricsLogger();
 
     // One row per PPO update.

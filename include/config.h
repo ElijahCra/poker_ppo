@@ -66,6 +66,21 @@ struct CFVAuxConfig {
 
 inline constexpr int kCFVHeadDim = 1326;
 
+// Periodic save of full trainer state (network + optimizer + magnet +
+// counters) so a run can resume after an interruption.
+struct CheckpointConfig {
+    bool enabled   = true;
+    int  every     = 5000;   // updates between saves
+    int  keep_last = 3;      // delete older numbered files past this
+};
+
+// Async rollout: a second RolloutCollector runs concurrently with the
+// update step on a snapshot of the live policy (1-step-stale data). PPO's
+// clip handles the lag. Falls back to the synchronous path when off.
+struct AsyncConfig {
+    bool enabled = true;
+};
+
 // Reservoir-sampled past-policy snapshots for self-play stabilisation.
 struct OpponentPoolConfig {
     bool     enabled                = false;
@@ -113,6 +128,8 @@ struct PPOConfig {
 
     OpponentPoolConfig  opp_pool;
     CFVAuxConfig        cfv_aux;
+    CheckpointConfig    checkpoint;
+    AsyncConfig         async_rollout;
 
     // ── MMD regularisation (Sokota et al., ICLR 2023) ────────────────────
     // When `kl_coef > 0`, adds `kl_coef * KL(π_θ || ρ)` to the PPO loss,
@@ -214,10 +231,10 @@ static constexpr PPOConfig kPPOConfig{
     .anneal_ent_coef  = true,
     .ent_coef_min     = 0.01f,
 
-    .num_envs         = 96,
-    .num_steps        = 128,
+    .num_envs         = 256,    // bigger rollout batches → better GPU util in inference
+    .num_steps        = 256,    // longer trajectories amortize rollout setup cost
     .update_epochs    = 4,
-    .num_minibatches  = 4,
+    .num_minibatches  = 2,      // bigger minibatches → fewer kernel launches, better matmul
 
     .total_timesteps  = 600'000'000,
 
@@ -247,6 +264,14 @@ static constexpr PPOConfig kPPOConfig{
     .cfv_aux          = CFVAuxConfig{
         .enabled = true,    // auxiliary counterfactual-value head
         .coef    = 0.5f,
+    },
+    .checkpoint       = CheckpointConfig{
+        .enabled   = true,
+        .every     = 400,
+        .keep_last = 2,
+    },
+    .async_rollout    = AsyncConfig{
+        .enabled = false,    // double-buffered rollout + update
     },
 };
 
