@@ -1,8 +1,9 @@
 #pragma once
-//
-// Approximate best-response (ABR) evaluator: a vanilla PPO exploiter
-// trained against a frozen target. The exploiter's terminal reward is a
-// valid lower bound on target exploitability
+
+// Approximate best-response (ABR)
+// Trains a vanilla PPO exploiter against a frozen version of the trained model
+// The exploiter's terminal reward is a valid lower bound on target exploitability
+// when num_seeds > 1 trains multiple exploiters for variance reduction / better lower bound
 
 #include "config.h"
 #include "environment.h"
@@ -24,12 +25,11 @@ public:
         int    global_step;
         int    br_updates_run;
 
-        // Stats from the seed that achieved max bb/hand — the tightest
-        // measured lower bound on exploitability.
+        // Stats from the seed that achieved max bb/hand
         int    num_hands;
-        float  avg_reward_a;
-        float  bb_per_hand_a;
-        float  win_rate_a;
+        float  avg_reward_best;
+        float  bb_per_hand_best;
+        float  win_rate_best;
 
         // Aggregates across all seeds.
         int    num_seeds;
@@ -51,9 +51,7 @@ public:
                           BestResponseConfig  cfg,
                           torch::Device       device);
 
-    // Train an exploiter against a frozen copy of `target` for
-    // cfg.updates_per_eval updates. update/global_step are stamped into
-    // the result for logging.
+    // Trains one or multiple exploiters for cfg.updates_per_eval updates
     Result evaluate(const ActorCritic& target, int update, int global_step);
 
     const BestResponseConfig& config() const { return cfg_; }
@@ -61,8 +59,6 @@ public:
 private:
     void init_exploiter();
 
-    // Deterministic no-learning match between exploiter and frozen
-    // target — the canonical BR measurement. Resets envs_ first.
     struct EvalStats {
         int    num_hands    = 0;
         int    wins         = 0;
@@ -71,8 +67,7 @@ private:
     };
     EvalStats eval_match(ActorCritic& target);
 
-    // Train one exploiter from current state for cfg_.updates_per_eval
-    // updates, then run eval_match. evaluate() invokes once per seed.
+    // Train one exploiter from current state for cfg_.updates_per_eval updates
     EvalStats run_one_seed(ActorCritic& frozen_target);
 
     IPokerEnvironmentFactory& factory_;

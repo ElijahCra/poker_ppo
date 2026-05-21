@@ -1,8 +1,6 @@
 #pragma once
-//
-// CLI command entry points. main.cpp parses argv and dispatches to one
-// of these. Each cmd_* owns its lifecycle and returns a Unix exit code.
-//
+
+// CLI command entry points
 
 #include "config.h"
 #include "environment.h"
@@ -27,7 +25,7 @@ int cmd_play(IPokerEnvironmentFactory& factory,
              torch::Device             device,
              const std::string&        model_path);
 
-// Rollout-strategy A/B timing. No optimiser update.
+// Rollout-strategy A/B timing
 int cmd_benchmark(IPokerEnvironmentFactory& factory,
                   torch::Device             device,
                   int                       iters);

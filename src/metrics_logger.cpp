@@ -62,11 +62,11 @@ void MetricsLogger::log_best_response(const BestResponseEvaluator::Result& r) {
     br_ << r.update << ',' << r.global_step << ','
         << r.br_updates_run << ',' << r.num_seeds << ','
         << r.num_hands << ','
-        << r.bb_per_hand_a    << ','
+        << r.bb_per_hand_best    << ','
         << r.bb_per_hand_mean << ','
         << r.bb_per_hand_min  << ','
         << r.bb_per_hand_std  << ','
-        << r.win_rate_a << ',' << r.wall_ms << '\n';
+        << r.win_rate_best << ',' << r.wall_ms << '\n';
     br_.flush();
 }
 

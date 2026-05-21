@@ -33,8 +33,7 @@ public:
     virtual std::unique_ptr<IPokerEnvironment> create(const BetConfig& cfg) = 0;
 };
 
-// N independent envs stepped lockstep on one thread. Game step is cheap
-// enough that batched inference dominates.
+// N independent envs stepped on one thread, inference is dominant
 class VectorizedEnv {
 public:
     VectorizedEnv(IPokerEnvironmentFactory& factory,

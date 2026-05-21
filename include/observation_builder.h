@@ -9,8 +9,6 @@
 //
 
 #include "config.h"
-#include "features.h"
-
 #include <torch/torch.h>
 
 #include <array>

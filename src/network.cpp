@@ -1,8 +1,7 @@
 #include "network.h"
-#include "features.h"
-
 #include <torch/torch.h>
 #include <stdexcept>
+#include "config.h"
 
 namespace poker_ppo {
 

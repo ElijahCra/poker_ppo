@@ -33,7 +33,7 @@ public:
         std::string anchor_name;
         int   num_hands     = 0;
         float avg_reward_a  = 0.0f;   // mean scaled per-hand reward
-        float bb_per_hand_a = 0.0f;   // = avg_reward_a * bb_per_unit_reward
+        float bb_per_hand_a = 0.0f;   // = avg_reward_best * bb_per_unit_reward
         float win_rate_a    = 0.0f;
         // Action histogram for the trained policy — mode-collapse diagnostic.
         std::vector<int64_t> action_counts_a;

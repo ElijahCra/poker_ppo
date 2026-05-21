@@ -169,12 +169,12 @@ int cmd_train(IPokerEnvironmentFactory& factory,
             std::cout << "[best-response eval @ update " << s.update
                       << "  seeds=" << br_result.num_seeds
                       << "  bb/hand max=" << std::fixed << std::setprecision(3)
-                      << br_result.bb_per_hand_a
+                      << br_result.bb_per_hand_best
                       << "  mean=" << br_result.bb_per_hand_mean
                       << "  min=" << br_result.bb_per_hand_min
                       << "  std=" << br_result.bb_per_hand_std
                       << "  best-win%=" << std::setprecision(1)
-                      << (100.0f * br_result.win_rate_a)
+                      << (100.0f * br_result.win_rate_best)
                       << "  duration=" << std::setprecision(0)
                       << br_result.wall_ms << "ms]"
                       << std::defaultfloat << "\n\n";

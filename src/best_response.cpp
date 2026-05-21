@@ -113,10 +113,10 @@ BestResponseEvaluator::evaluate(const ActorCritic& target,
     r.br_updates_run = cfg_.updates_per_eval;
     // Best seed = tightest measured lower bound.
     r.num_hands      = best_num_hands;
-    r.avg_reward_a   = best_num_hands > 0
+    r.avg_reward_best   = best_num_hands > 0
                        ? static_cast<float>(best_total_rew / best_num_hands) : 0.0f;
-    r.bb_per_hand_a  = best_bb;
-    r.win_rate_a     = best_num_hands > 0
+    r.bb_per_hand_best  = best_bb;
+    r.win_rate_best     = best_num_hands > 0
                        ? (static_cast<float>(best_wins) + 0.5f * best_ties) /
                          static_cast<float>(best_num_hands) : 0.0f;
     r.num_seeds      = num_seeds;
