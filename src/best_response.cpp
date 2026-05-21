@@ -73,7 +73,7 @@ BestResponseEvaluator::evaluate(const ActorCritic& target,
     float  best_bb        = -std::numeric_limits<float>::infinity();
 
     for (int s = 0; s < num_seeds; ++s) {
-        // Multi-seed always re-inits — seeds must be independent for the
+        // Multi-seed always re-inits, seeds must be independent for the
         // max-over-seeds bound to mean anything.
         if (multi_seed || !cfg_.warm_start || !warm_started_) {
             init_exploiter();
@@ -148,8 +148,7 @@ BestResponseEvaluator::run_one_seed(ActorCritic& frozen_target) {
         auto rr = envs_[i]->reset();
         carry_obs[i]  = rr.observation;
         carry_mask[i] = rr.legal_action_mask;
-        carry_player.accessor<int32_t, 1>()[i] =
-            static_cast<int32_t>(envs_[i]->current_player());
+        carry_player.accessor<int32_t, 1>()[i] = envs_[i]->current_player();
     }
 
     double total_reward = 0.0;
@@ -170,8 +169,8 @@ BestResponseEvaluator::run_one_seed(ActorCritic& frozen_target) {
         {
             torch::NoGradGuard ng;
             for (int step = 0; step < cfg_.num_steps; ++step) {
-                // Forward both networks on the full batch. Wasteful (one
-                // output is unused per env) but simpler than splitting
+                // Forward both networks on the full batch. Slightly inefficient as one
+                // output is unused per env but simpler than splitting
                 // by acting seat, and env stepping dominates anyway.
                 auto er = exploiter_->get_action(cur_obs, cur_mask);
                 auto tr = frozen_target->get_action(cur_obs, cur_mask);
@@ -249,8 +248,8 @@ BestResponseEvaluator::run_one_seed(ActorCritic& frozen_target) {
 
         // Treat truncated tails as terminals (V_next = 0). The exploiter's
         // value head is only trained on exploiter-acting states, so V at
-        // a target-acting carry_obs is OOD — V=0 avoids injecting garbage.
-        // Biases ≤ 1 tail transition per (player, env) per rollout.
+        // a target-acting carry_obs is OOD. V=0 avoids injecting bad data but does
+        // bias ≤ 1 tail transition per (player, env) per rollout.
         auto bs_values   = torch::zeros({2, N}, f_cpu);
         auto bs_terminal = torch::zeros({2, N}, f_cpu);
         bs_terminal.fill_(1.0f);
@@ -331,10 +330,7 @@ BestResponseEvaluator::run_one_seed(ActorCritic& frozen_target) {
         }
     }
 
-    // Post-training eval match. Averaging training rewards would bias
-    // the bound downward (early-training exploiter plays badly); the
-    // match measures only the trained exploiter — matches the spirit of
-    // Timbers et al. (2020) §4's "last few updates" reporting.
+    // Post-training eval match
     EvalStats es;
     if (cfg_.eval_hands > 0) {
         es = eval_match(frozen_target);

@@ -5,7 +5,7 @@
 
 namespace poker_ppo {
 
-// ─── HistoryEncoder ──────────────────────────────────────────────────────
+// HistoryEncoder
 
 HistoryEncoderImpl::HistoryEncoderImpl(BetHistoryConfig hist)
     : hist_(hist)
@@ -101,7 +101,7 @@ HistoryEncoderImpl::forward(const torch::Tensor& history_block) {
         auto v = reshape_heads(qkv_split[2]);
 
         // Fused kernel: Flash on CUDA, oneDNN on CPU. Replaces a manual
-        // matmul → scale → mask-add → softmax → matmul chain.
+        // matmul -> scale -> mask-add -> softmax -> matmul chain.
         auto out = torch::scaled_dot_product_attention(
             q, k, v,
             /*attn_mask=*/add_mask,

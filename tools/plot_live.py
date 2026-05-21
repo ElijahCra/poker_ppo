@@ -155,7 +155,7 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 1
-        print(f"--latest → {run_dir}")
+        print(f"--latest -> {run_dir}")
     if not run_dir:
         print("usage: plot_live.py <run_dir> | --latest", file=sys.stderr)
         return 1

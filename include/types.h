@@ -1,5 +1,5 @@
 #pragma once
-// Env↔PPO interaction types. Hyperparameters live in config.h.
+// Env <-> PPO interaction types. Hyperparameters live in config.h.
 
 #include <torch/torch.h>
 #include <cassert>
@@ -18,7 +18,7 @@ struct BetConfig {
 
     constexpr int action_count() const noexcept { return 2 + num_raise_sizes; }
 
-    // Not constexpr — std::pow isn't until C++26.
+    // Not constexpr std::pow isn't until C++26.
     double raise_amount(int i) const {
         assert(i >= 0 && i < num_raise_sizes);
         return min_raise * std::pow(geometric_ratio, i);

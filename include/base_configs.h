@@ -66,7 +66,7 @@ struct OpponentPoolConfig {
     float    p_use_pool             = 0.5f;
     // Cap on distinct snapshots used per rollout — bounds inference cost.
     int      max_unique_per_rollout = 1;
-    uint64_t seed                   = 0;   // 0 → random_device
+    uint64_t seed                   = 0;   // 0 -> random_device
 };
 
 struct PPOConfig {
@@ -84,7 +84,7 @@ struct PPOConfig {
     // Floor for the LR schedule, as a fraction of learning_rate. 0 = linear-to-zero.
     float min_lr_frac      = 0.1f;
 
-    // Cosine entropy decay from ent_coef → ent_coef_min.
+    // Cosine entropy decay from ent_coef -> ent_coef_min.
 
     bool  anneal_ent_coef  = false;
     float ent_coef_min     = 0.01f;

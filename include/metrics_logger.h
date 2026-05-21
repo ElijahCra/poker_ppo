@@ -38,8 +38,7 @@ private:
     std::ofstream metrics_;
     std::ofstream league_;
     std::ofstream br_;
-    // CSVs may be written from background eval threads — serialise to
-    // avoid partial-line interleaving.
+    // Multiple eval threads may write
     std::mutex    mu_;
 };
 

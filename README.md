@@ -14,7 +14,7 @@ A C++ implementation of **Proximal Policy Optimization** for two-player, zero-su
 - **PPO + GAE** with clipped surrogate objective, clipped value loss, and per-minibatch advantage normalization
 - **Independent actor & critic** — no shared trunk, so value gradients can't pollute the policy ([include/network.h](include/network.h), [src/network.cpp](src/network.cpp))
 - **Vectorized self-play** — `N` parallel hands per rollout via [`VectorizedEnv`](include/environment.h:99)
-- **Legal-action masking** baked into the policy head (illegal logits → −1e8 before softmax)
+- **Legal-action masking** baked into the policy head (illegal logits -> −1e8 before softmax)
 - **Zero-sum GAE correction** — value bootstrap and advantage flip sign on every player-switch boundary ([src/rollout_buffer.cpp](src/rollout_buffer.cpp))
 - **Magnetic Mirror Descent regularization** ([Sokota et al., ICLR 2023](https://arxiv.org/abs/2206.05825)) — loss adds `kl_coef · KL(π_θ ‖ ρ)`, where ρ is a frozen "magnet" snapshot of the policy refreshed every `magnet_update_every` updates. Drives last-iterate convergence in imperfect-information games; set `kl_coef = 0` to recover vanilla PPO ([include/config.h:101](include/config.h:101))
 - **Geometric raise sizing** — discrete `{Fold, Check/Call, Raise₁…Raiseₙ}` action space configured via [`BetConfig`](include/types.h:26)

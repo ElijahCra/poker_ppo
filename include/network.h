@@ -7,20 +7,16 @@
 
 namespace poker_ppo {
 
-// Additive logit for illegal actions. -1e8 instead of -inf so log-probs
-// stay finite if a caller gathers an illegal slot.
+// Additive logit for illegal actions
 inline constexpr float kIllegalActionLogit = -1e8f;
 
 // More aggressive than kIllegalActionLogit because attention's softmax
-// runs over keys that are already attended; -1e8 leaks ~1e-9 weight on
-// padded positions (caught by attention tests).
+// runs over keys that are already attended
 inline constexpr float kAttentionMaskLogit = -1e9f;
 
 inline constexpr float kAdvantageEps = 1e-8f;
 
-// Bet-history transformer encoder. Owned by ActorCritic and shared
-// across actor and critic — running it once per forward halves the
-// attention compute compared to giving each tower its own encoder.
+// Bet-history transformer encoder shared across actor and critic
 // Only instantiated when hist.enabled.
 class HistoryEncoderImpl : public torch::nn::Module {
 public:
@@ -48,7 +44,7 @@ private:
 TORCH_MODULE(HistoryEncoder);
 
 // MLP trunk + linear head. Used twice by ActorCritic so the value-loss
-// gradient doesn't flow into the actor's representation (CleanRL convention).
+// gradient doesn't flow into the actor's representation
 // Pre-flattened input: ActorCritic does the obs slicing and (optional)
 // history encoding, then hands the tower a single trunk-input tensor.
 class TowerImpl : public torch::nn::Module {
@@ -93,22 +89,20 @@ public:
     };
     ActionResult get_action(torch::Tensor obs, torch::Tensor legal_mask);
 
-    /// `log_probs_all` is the full masked log-softmax;
-    /// `log_prob.gather(action)` recovers `log_prob`. Free to expose
-    /// since `evaluate()` already runs `log_softmax` internally; needed
-    /// by the MMD regulariser, which computes KL across all actions.
+    // `log_probs_all` is the full masked log-softmax;
+    // `log_prob.gather(action)` recovers `log_prob`.
+    // needed by the MMD regulariser, which computes KL across all actions.
     struct EvalResult {
         torch::Tensor log_prob;       // [B]    log π(a|s) for stored a
         torch::Tensor log_probs_all;  // [B, A] full masked log-softmax
         torch::Tensor value;          // [B]
         torch::Tensor entropy;        // [B]
     };
+
     EvalResult evaluate(torch::Tensor obs, torch::Tensor legal_mask,
                         const torch::Tensor &action);
 
-    /// Masked log-softmax over the full action set, NoGrad-friendly.
-    /// Used by the MMD regulariser to evaluate the frozen magnet on the
-    /// same obs the live policy is updating against. Returns [B, A].
+    // Masked log-softmax over the full action set
     torch::Tensor masked_log_probs(torch::Tensor obs,
                                    torch::Tensor legal_mask);
 
@@ -116,7 +110,7 @@ private:
     torch::Tensor apply_mask(torch::Tensor logits, torch::Tensor mask);
 
     // Encoder runs only when hist_.enabled. Returns an undefined tensor
-    // otherwise — callers check .defined() to skip the cat.
+    // otherwise callers check .defined() to skip the cat.
     torch::Tensor encode_history(const torch::Tensor& obs);
 
     // Concatenate the tower input from obs slices + (optional) encoded
@@ -136,9 +130,8 @@ private:
 TORCH_MODULE(ActorCritic);
 
 // Typed deep copy. libtorch's Module::clone() returns a base Module and
-// needs param re-registration, which the pool and the BR evaluator both
-// don't want. Allocates a fresh ActorCritic, copies params + buffers
-// under NoGradGuard, moves to device, sets eval() (clones are always frozen).
+// needs param re-registration, which errors in the  pool and the BR evaluator
+// Allocates a fresh ActorCritic and copies params + buffers
 [[nodiscard]] ActorCritic clone_actor_critic(
     const ActorCritic&  src,
     int                 obs_dim,

@@ -12,7 +12,7 @@
 // feature gives no clean pair signal.
 //
 // This helper computes the standard TwoPlusTwo-aligned hand category
-// (high card → straight flush) directly from rank/suit counts. It works
+// (high card -> straight flush) directly from rank/suit counts. It works
 // for any 2..7 card subset (preflop hole cards through river hole +
 // board), so the env can use the same routine for all four streets.
 // Output is monotonic in strength, and pocket pairs appear at category
@@ -46,7 +46,7 @@ constexpr int suit_of(uint8_t card) noexcept { return card & 3; }
 
 // Detect a 5-in-a-row run in a 13-bit rank-presence mask. Returns true
 // for any of: 23456 (mask 0x001F), ..., TJQKA (mask 0x1F00). Treats the
-// ace as both high (rank 12) and low (the wheel A2345 → 0x100F).
+// ace as both high (rank 12) and low (the wheel A2345 -> 0x100F).
 constexpr bool has_straight(uint16_t rank_mask) noexcept {
     // Standard 9 high-card straights. The wheel needs an explicit check
     // since A's bit (rank 12) doesn't sit adjacent to 2's bit (rank 0).
@@ -109,7 +109,7 @@ constexpr bool has_straight(uint16_t rank_mask) noexcept {
     if (straight_flush)              return 9;
     if (n_quads > 0)                 return 8;
     if (n_trips > 0 && n_pairs > 0)  return 7;   // full house
-    if (n_trips >= 2)                return 7;   // two trips → also FH (pick higher trips, lower as pair)
+    if (n_trips >= 2)                return 7;   // two trips -> also FH (pick higher trips, lower as pair)
     if (flush_suit >= 0)             return 6;
     if (any_straight)                return 5;
     if (n_trips > 0)                 return 4;
@@ -187,7 +187,7 @@ inline constexpr int kHandCategoryCount = 9;
     };
 
     int alive = 0;
-    // Standard windows TJQKA → 23456 (window low rank ∈ [0, 8]).
+    // Standard windows TJQKA -> 23456 (window low rank ∈ [0, 8]).
     for (int low = 0; low <= 8; ++low) {
         const uint16_t window5 = (mask >> low) & 0x1Fu;
         if (popcount5(window5) >= threshold) ++alive;
@@ -214,7 +214,7 @@ inline constexpr int kHandCategoryCount = 9;
 ///   2     — open-ended / wheel-OESD / double belly-buster (typical 8 outs)
 ///   3+    — rare multi-way draws
 ///
-/// The obs-builder normalises by 8, so 0 → 0.0, 1 → 0.125, 2 → 0.25, …,
+/// The obs-builder normalises by 8, so 0 -> 0.0, 1 -> 0.125, 2 -> 0.25, …,
 /// effectively distinguishing OESD (≈1.0) from gutshot (≈0.5) cleanly.
 /// Returns 0 if a straight is already made (callers should suppress
 /// against `hand_category` ≥ 5 to avoid double-counting).

@@ -1,9 +1,7 @@
 #pragma once
-//
+
 // PPO trainer. Owns network + optimiser, drives RolloutCollector +
-// OpponentManager. Self-play: same ActorCritic plays both seats; rewards
-// are recorded from the acting player's perspective (sign-flipped on seat 1).
-//
+// OpponentManager. Self-play: same ActorCritic plays both seats
 
 #include "config.h"
 #include "environment.h"
@@ -52,8 +50,7 @@ public:
 
     void set_rollout_strategy(Strategy s) noexcept { strategy_ = s; }
 
-    // Thin shims around collector_->collect(strategy, ...). Used by
-    // benchmarks/tests that don't want to know about OpponentManager.
+    // Small wrappers over collector_->collect(strategy).
     void collect_rollout_serial();
     void collect_rollout_threadpool();
 
@@ -63,8 +60,7 @@ public:
         int num_steps;
         int iters;
         int samples;
-        // (name, stats), preserves insertion order. benchmark_rollouts()
-        // emits serial then threadpool.
+        // (name, stats)
         std::vector<std::pair<std::string, Stats>> by_strategy;
 
         const Stats* find(const std::string& name) const {
@@ -73,8 +69,7 @@ public:
         }
     };
 
-    // A/B-time the two built-in strategies. Iterations interleave per round
-    // so each strategy faces a similar env distribution. No update().
+    // A/B-time the two built-in strategies
     BenchmarkResult benchmark_rollouts(int iters = 20, int warmup = 3,
                                        bool verbose = true);
 
@@ -95,8 +90,8 @@ public:
 private:
     [[nodiscard]] UpdateStats update();
 
-    static inline constexpr const PPOConfig& cfg_      = config::kPPOConfig;
-    static inline constexpr const BetConfig& bet_cfg_  = config::kBetConfig;
+    static constexpr const PPOConfig& cfg_      = config::kPPOConfig;
+    static constexpr const BetConfig& bet_cfg_  = config::kBetConfig;
     torch::Device device_;
 
     ActorCritic                          network_;
@@ -104,9 +99,8 @@ private:
     std::unique_ptr<RolloutCollector>    collector_;
     std::unique_ptr<OpponentManager>     opp_mgr_;
 
-    // MMD magnet — frozen snapshot of `network_`, refreshed every
+    // MMD magnet frozen snapshot of `network_`, refreshed every
     // `cfg_.magnet_update_every` updates. Null when `cfg_.kl_coef == 0`
-    // (vanilla self-play PPO; the regulariser is bypassed entirely).
     ActorCritic                          magnet_{nullptr};
 
     int update_idx_ = 0;

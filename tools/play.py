@@ -38,7 +38,7 @@ from typing import IO, Optional
 
 # ─── Card rendering ────────────────────────────────────────────────────────────
 # Engine encoding: card_id = (rank << 2) | suit, rank 0..12 = {2..A},
-# suit 0..3 = {♣, ♦, ♥, ♠}. The exact suit→symbol mapping doesn't affect
+# suit 0..3 = {♣, ♦, ♥, ♠}. The exact suit->symbol mapping doesn't affect
 # gameplay; only display.
 
 RANK_LABELS = ["2", "3", "4", "5", "6", "7", "8", "9", "T", "J", "Q", "K", "A"]
@@ -492,7 +492,7 @@ def main(argv=None):
               f"start_stack={info.initial_stack} mbb")
         print(f"  pot_fractions: {info.pot_fractions}")
         if args.log:
-            print(f"  logging human actions → {args.log}")
+            print(f"  logging human actions -> {args.log}")
         print()
         try:
             input("  press enter to deal first hand...")

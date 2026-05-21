@@ -1,5 +1,4 @@
 #pragma once
-//
 // Frozen past-policy pool + the trainer-side wrapper that drives it to avoid self play cycling
 // Keep k past model snapshots, uses reservoir sampling
 
@@ -32,7 +31,7 @@ public:
     int  capacity() const { return max_size_; }
     bool empty()    const { return snapshots_.empty(); }
 
-    // Algorithm R: store unconditionally until full, then accept with
+    // store unconditionally until full, then accept with
     // probability max_size/seen_count and replace a random slot. Returns
     // the new id, or 0 if rejected (or max_size <= 0).
     [[nodiscard]] SnapshotId add_snapshot(const ActorCritic& src);
@@ -45,8 +44,6 @@ public:
 
     [[nodiscard]] bool has_id(SnapshotId id) const;
 
-    // obs/legal_mask must be on device_. Caller must ensure has_id(id)
-    // (TORCH_CHECK otherwise). Returns int64 CPU actions.
     torch::Tensor select_actions(SnapshotId id,
                                  const torch::Tensor& obs,
                                  const torch::Tensor& legal_mask);
@@ -66,8 +63,7 @@ private:
     std::mt19937        rng_;
 };
 
-// Trainer-side state. All entry points are no-ops when the pool is
-// disabled or empty (warmup).
+// Trainer-side state
 class OpponentManager {
 public:
     OpponentManager(OpponentPoolConfig  cfg,
@@ -101,8 +97,7 @@ public:
                                 const torch::Tensor& cur_player_cpu,
                                 torch::Tensor&       actions_cpu);
 
-    // Append network when (a) enabled, (b) past warmup, (c) update_idx
-    // hits snapshot_every.
+    // Append network when enabled, past warmup, and update_idx matches snapshot_every
     void maybe_snapshot(int update_idx, const ActorCritic& network);
 
     [[nodiscard]] int  size()     const noexcept;

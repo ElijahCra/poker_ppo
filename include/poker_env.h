@@ -69,7 +69,7 @@ private:
     int   allin_slot_     = -1;     // -1 if disabled
     float reward_norm_    = 1.0f;   // 10 * big_blind
 
-    // PPO action index → Game::Action, or nullopt if illegal in current state.
+    // PPO action index -> Game::Action, or nullopt if illegal in current state.
     std::vector<std::optional<::Game::Action>> action_table_;
 
     std::vector<BetHistoryEntry> bet_history_;

@@ -1,22 +1,14 @@
 #pragma once
-//
-// Rollout-phase machinery:
-//   StepThreadPool      persistent worker pool for the parallel strategy
-//   RolloutBuffer       per-(player, env) transition storage + GAE
-//   PlayerRolloutState  per-env bookkeeping that drives the buffer
-//   RolloutCollector    owns VectorizedEnv + buffer + thread pool, runs the loop
-//
 
-#include "config.h"
+// Rollout Collection
+
 #include "environment.h"
 #include "network.h"
 #include "types.h"
 
 #include <torch/torch.h>
-
 #include <atomic>
 #include <condition_variable>
-#include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -28,9 +20,8 @@ namespace poker_ppo {
 
 class OpponentManager;
 
-// Generation-based pool: parallel_for bumps a counter, workers steal via
-// an atomic index. Avoids per-job allocations — the rollout loop calls
-// parallel_for hundreds of times per training update.
+// Generation based pool: parallel_for bumps a counter, workers steal via
+// an atomic index
 class StepThreadPool {
 public:
     explicit StepThreadPool(int n_workers)
@@ -44,7 +35,7 @@ public:
 
     ~StepThreadPool() {
         {
-            std::lock_guard<std::mutex> lk(mu_);
+            std::lock_guard lk(mu_);
             stopping_ = true;
             ++generation_;
         }
@@ -57,24 +48,23 @@ public:
 
     int size() const { return n_; }
 
-    // Run body(i) for i in [0, n_jobs). Blocks until done. body must be
-    // safe to call concurrently — only `i` distinguishes calls.
+    // Run body(i) for i in [0, n_jobs). Blocks until done only `i` distinguishes calls.
     void parallel_for(int n_jobs, std::function<void(int)> body) {
         if (n_jobs <= 0) return;
         {
-            std::lock_guard<std::mutex> lk(mu_);
+            std::lock_guard lk(mu_);
             body_   = std::move(body);
             n_jobs_ = n_jobs;
             next_idx_.store(0, std::memory_order_relaxed);
             ++generation_;
         }
         {
-            std::lock_guard<std::mutex> lk(done_mu_);
+            std::lock_guard lk(done_mu_);
             active_ = n_;
         }
         cv_.notify_all();
 
-        std::unique_lock<std::mutex> lk(done_mu_);
+        std::unique_lock lk(done_mu_);
         done_cv_.wait(lk, [this] { return active_ == 0; });
     }
 
@@ -85,7 +75,7 @@ private:
             std::function<void(int)> body;
             int n_jobs = 0;
             {
-                std::unique_lock<std::mutex> lk(mu_);
+                std::unique_lock lk(mu_);
                 cv_.wait(lk, [this, my_gen] {
                     return stopping_ || generation_ > my_gen;
                 });
@@ -102,7 +92,7 @@ private:
             }
 
             {
-                std::lock_guard<std::mutex> lk(done_mu_);
+                std::lock_guard lk(done_mu_);
                 if (--active_ == 0) done_cv_.notify_one();
             }
         }
@@ -127,43 +117,32 @@ private:
 
 // Per-player transition storage for alternating self-play. Each (player,
 // env) trajectory has its own GAE.
-//
+
 // Reward attribution: env emits zero-sum r in player-0's frame; we
 // accumulate +r for player 0 and -r for player 1 between their actions.
 // At a player's next action, the accumulator becomes the previous
 // transition's reward.
-//
-// Rollout-end truncation: the last transition per (player, env) is
-// treated as terminal. ≤ 1 biased tail per player per env per rollout;
-// decays out across updates.
 class RolloutBuffer {
 public:
     RolloutBuffer(int num_steps, int num_envs, int obs_dim, int action_count,
                   torch::Device device = torch::kCPU);
 
-    // Reset counts; reuse storage tensors.
+    // Reset counts reuse storage tensors.
     void clear();
 
-    // Thread-safe as long as one thread per (player, env_idx) — naturally
-    // satisfied by one-thread-per-env rollouts.
     void push(int player, int env_idx,
-              torch::Tensor obs,      // [obs_dim]      CPU or device_
+              torch::Tensor obs,      // [obs_dim]
               int64_t action,
               float log_prob,
               float reward,
               float done,
               float value,
-              torch::Tensor mask);    // [action_count] CPU or device_
+              torch::Tensor mask);    // [action_count]
 
-    // GAE per (player, env_idx) trajectory.
-    //
+    // GAE per (player, env_idx) trajectory
     // Per (p, e) tail, bootstrap_terminal[p][e] selects:
-    //   1.0 → episode terminal, V_next = 0.
-    //   0.0 → rollout-end truncation, V_next = bootstrap_values[p][e].
-    //
-    // bootstrap_values: V(carry_obs) with zero-sum negation for the
-    // non-acting player. bootstrap_terminal: from PlayerRolloutState::
-    // tail_was_terminal. Both float32 [2, num_envs] CPU.
+    //   1.0 -> episode terminal, V_next = 0.
+    //   0.0 -> rollout-end truncation, V_next = bootstrap_values[p][e].
     void compute_returns(float gamma, float gae_lambda,
                          const torch::Tensor& bootstrap_values,
                          const torch::Tensor& bootstrap_terminal);
@@ -206,16 +185,6 @@ private:
 // Per-env per-player bookkeeping driving the buffer. The rollout loop
 // instantiates one per env and calls record_step / step_reward /
 // flush_on_terminal / flush_on_rollout_end.
-//
-// pending[p]:        most recent transition for p whose reward isn't closed
-//                    out yet. Closed at p's next action or on termination.
-// accumulated[p]:    env reward in p's frame since p's last action.
-// next_done_flag[p]: dones flag for p's next recorded transition. Flips
-//                    to 1 after termination so the new episode's first
-//                    transition carries the boundary marker.
-// tail_was_terminal[p]: whether the most recent push for p was followed
-//                       by an episode terminal (vs. another action). Read
-//                       at rollout-end to pick the right bootstrap V.
 struct PlayerRolloutState {
     struct Pending {
         bool           has = false;
@@ -226,10 +195,18 @@ struct PlayerRolloutState {
         float          value    = 0.0f;
         float          done     = 0.0f;
     };
-
+    // most recent transition for p whose reward isn't closed
+    // out yet. Closed at p's next action or on termination.
     Pending pending[2];
+    // env reward in p's frame since p's last action.
     float   accumulated[2]      = {0.0f, 0.0f};
+    // dones flag for p's next recorded transition. Flips
+    // to 1 after termination so the new episode's first
+    // transition carries the boundary marker.
     float   next_done_flag[2]   = {0.0f, 0.0f};
+    // tail_was_terminal[p]: whether the most recent push for p was followed
+    // by an episode terminal (vs. another action). Read
+    // at rollout-end to pick the right bootstrap V.
     bool    tail_was_terminal[2] = {false, false};
 
     void record_step(int player, int env_idx, RolloutBuffer& buf,
@@ -273,10 +250,6 @@ struct PlayerRolloutState {
             }
         }
         // Reset accumulators unconditionally:
-        // - SB-fold walk: one seat never acted this hand.
-        // - Pool rollouts: we skip recording the non-learner — its
-        //   accumulator must not leak into the next episode where seat
-        //   assignments may have flipped.
         accumulated[0] = 0.0f;
         accumulated[1] = 0.0f;
         next_done_flag[0] = 1.0f;
@@ -321,7 +294,7 @@ public:
 
     // One rollout: fill buffer, bootstrap, compute returns, update carry,
     // advance global_step_. update_idx is forwarded to opp_mgr for warmup
-    // and snapshot cadence.
+    // and snapshot tracking.
     void collect(Strategy           strategy,
                  ActorCritic&       network,
                  OpponentManager&   opp_mgr,

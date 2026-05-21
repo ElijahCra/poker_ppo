@@ -37,7 +37,6 @@ int cmd_train(IPokerEnvironmentFactory& factory,
     League::Config league_cfg;
     league_cfg.num_hands_per_match = 10000;
     league_cfg.num_parallel_envs   = 32;
-    // Matches reward_norm = 10 * big_blind in poker_env.
     league_cfg.bb_per_unit_reward  = 10.0f;
 
     League league(factory, bet_cfg,
@@ -55,8 +54,6 @@ int cmd_train(IPokerEnvironmentFactory& factory,
     for (const auto& a : league.anchors()) std::cout << "  " << a->name();
     std::cout << "\n";
 
-    // League/BR run synchronously — wall-clock cost shows up as gaps
-    // between [update K] lines, not added to rollout/update timings.
     constexpr int snapshot_every = 200;
 
     const BestResponseConfig& br_cfg = config::kBRConfig;
@@ -125,8 +122,6 @@ int cmd_train(IPokerEnvironmentFactory& factory,
                       << "  duration=" << eval_ms << "ms]\n";
             league.print_results(results);
 
-            // pair_all_in folds ~94% preflop, so a healthy policy shows
-            // high raise/all-in and low fold against it.
             auto print_action_mix = [&](const char* anchor_name) {
                 int idx = -1;
                 for (size_t i = 0; i < results.size(); ++i) {
@@ -214,8 +209,6 @@ int cmd_play(IPokerEnvironmentFactory& factory,
     auto& net = trainer.network();
     net->eval();
 
-    // Need PokerEnvironment, not just IPokerEnvironment, for the state
-    // accessors (hole_cards, pot, ...).
     auto env_base = factory.create(bet_cfg);
     auto* env = dynamic_cast<PokerEnvironment*>(env_base.get());
     if (!env) {

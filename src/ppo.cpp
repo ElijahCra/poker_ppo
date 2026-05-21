@@ -212,7 +212,7 @@ PPOTrainer::benchmark_strategies(
     }
 
     if (verbose) {
-        // Slowest median = baseline → all printed multipliers are ≥ 1×.
+        // Slowest median = baseline -> all printed multipliers are ≥ 1×.
         const auto* slowest = &r.by_strategy.front().second;
         for (const auto& kv : r.by_strategy)
             if (kv.second.median_ms > slowest->median_ms) slowest = &kv.second;

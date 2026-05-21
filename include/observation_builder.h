@@ -1,18 +1,13 @@
 #pragma once
-//
 // Obs-tensor layout + builder. Layout:
 //
 //   [hole(52) | community(52) | static | round_summary? | history?]
 //
 // Both env (write) and network (read) go through ObservationLayout, so
 // offsets can't drift between the two sides.
-//
 
 #include "config.h"
 #include <torch/torch.h>
-
-#include <array>
-#include <cstdint>
 #include <vector>
 
 namespace Game {
@@ -23,11 +18,12 @@ namespace poker_ppo {
 
 struct ObservationLayout {
     static constexpr int CARD_SLOTS              = 52;
+
     // stacks(2) + pot + cur_bet + raises + round one-hot(4) + seat = 10
     static constexpr int FEAT_BASIC              = 10;
+
     // Per-round hand features: cat/9, flush_draw, straight_outs/8,
     // straight_alive_windows/4, overcards/2. 4 rounds × 5 = 20.
-    // Stripped from binary when features::HAND_STRENGTH is false.
     static constexpr int HAND_FEATS_PER_ROUND    = 5;
     static constexpr int HAND_FEAT_ROUNDS        = 4;
     static constexpr int FEAT_HAND_STRENGTH      =

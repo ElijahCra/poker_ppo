@@ -72,7 +72,7 @@ bool parse_cli(int argc, char** argv, CliOptions& out) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    std::cout.setf(std::ios::unitbuf);  // unbuffered for PTY/log capture
+    std::cout.setf(std::ios::unitbuf);
 
     CliOptions opt;
     if (!parse_cli(argc, argv, opt)) return 1;

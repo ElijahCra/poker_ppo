@@ -1,10 +1,7 @@
 #pragma once
-//
-// IPolicy: minimal action-selection interface for league head-to-heads.
-// Trained networks and rule-based anchors share the same API so the match
-// loop doesn't special-case them. Operates on CPU tensors at the call site;
-// NetworkPolicy moves to device internally.
-//
+
+// minimal action-selection interface for league head-to-heads.
+// also provides some of th league opponents we baseline compare the model against
 
 #include "network.h"
 
@@ -28,8 +25,7 @@ public:
                                          const torch::Tensor& legal_mask) = 0;
 };
 
-// Wraps an ActorCritic. Also used for the "random_init" anchor — a fresh
-// ActorCritic with the original orthogonal init, never trained.
+// Wraps an ActorCritic
 class NetworkPolicy : public IPolicy {
 public:
     NetworkPolicy(ActorCritic net, torch::Device device, std::string name)
@@ -56,7 +52,7 @@ private:
     std::string   name_;
 };
 
-// Uniform over legal actions. The "every model should beat this" baseline.
+// Uniform over legal actions.
 class UniformPolicy : public IPolicy {
 public:
     [[nodiscard]] std::string name() const override { return "uniform"; }
@@ -70,9 +66,6 @@ public:
     }
 };
 
-// Walk priority list; fall back to any legal slot. The env may not expose
-// Fold (e.g. BB preflop unraised) so a hard-coded "fold fallback" wedge
-// would crash with illegal-action.
 inline int64_t first_legal(const torch::TensorAccessor<float, 1>& mask,
                            int64_t A,
                            std::initializer_list<int64_t> priority) {
@@ -85,7 +78,7 @@ inline int64_t first_legal(const torch::TensorAccessor<float, 1>& mask,
     return 0;
 }
 
-// Prefer Check/Call → Fold → anything legal.
+// Prefer Check/Call -> Fold
 class AlwaysCallPolicy : public IPolicy {
 public:
     [[nodiscard]] std::string name() const override { return "always_call"; }
@@ -105,7 +98,7 @@ public:
     }
 };
 
-// Smallest legal raise → Check/Call → Fold → anything legal.
+// Smallest legal raise -> Check/Call -> Fold -> anything legal.
 class AlwaysRaisePolicy : public IPolicy {
 public:
     [[nodiscard]] std::string name() const override { return "always_raise"; }
@@ -129,11 +122,7 @@ public:
     }
 };
 
-// Pocket pair → shove (largest legal raise / all-in slot). Else fold/check.
-//
-// Reads hole one-hot from obs[0:52]. Two cards are paired iff
-// card_id/4 matches (card_id = rank*4 + suit). Short-deck variants still
-// occupy the same 52-slot space — non-existent cards are just never set.
+// Pocket pair -> shove. Else fold/check.
 class PairAllInPolicy : public IPolicy {
 public:
     [[nodiscard]] std::string name() const override { return "pair_all_in"; }
