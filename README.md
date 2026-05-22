@@ -129,31 +129,6 @@ Example with `num_raise_sizes = 5`, `min_raise = 0.5`, `geometric_ratio = 2.0`:
 ```
 
 `max_bets_per_round` caps re-raises per street; the environment masks raise actions once the cap is hit.
-
-## Hyperparameter reference
-
-Defaults from [`PPOConfig`](include/types.h:94):
-
-| Parameter | Default | Notes |
-|---|---|---|
-| `gamma` | `0.99` | Discount factor |
-| `gae_lambda` | `0.95` | GAE smoothing |
-| `clip_coef` | `0.1` | PPO clipping ε |
-| `ent_coef` | `0.05` | Entropy bonus — kept high for imperfect-information exploration |
-| `vf_coef` | `0.5` | Value-loss weight |
-| `max_grad_norm` | `0.5` | Global gradient clip |
-| `clip_vloss` | `true` | Clipped value loss |
-| `norm_advantages` | `true` | Per-minibatch advantage normalization |
-| `learning_rate` | `2.5e-4` | Adam |
-| `anneal_lr` | `true` | Linear LR decay over training |
-| `num_envs` | `8` | Parallel self-play games |
-| `num_steps` | `128` | Steps per env per rollout |
-| `update_epochs` | `4` | Passes over the rollout buffer |
-| `num_minibatches` | `4` | Minibatches per epoch |
-| `total_timesteps` | `10 000 000` | Training budget |
-| `hidden_dim` | `512` | MLP hidden width |
-| `num_layers` | `3` | MLP depth (per actor & critic) |
-
 ## Training output
 
 Each PPO update emits a `PPOTrainer::UpdateStats` record to the registered log callback ([include/ppo.h:35](include/ppo.h)):
