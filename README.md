@@ -129,22 +129,6 @@ Example with `num_raise_sizes = 5`, `min_raise = 0.5`, `geometric_ratio = 2.0`:
 ```
 
 `max_bets_per_round` caps re-raises per street; the environment masks raise actions once the cap is hit.
-## Training output
-
-Each PPO update emits a `PPOTrainer::UpdateStats` record to the registered log callback ([include/ppo.h:35](include/ppo.h)):
-
-| Field | Meaning |
-|---|---|
-| `update`, `global_step` | Update index and total env steps so far |
-| `policy_loss` | Clipped surrogate loss |
-| `value_loss` | (Optionally clipped) value-function MSE |
-| `entropy` | Mean policy entropy |
-| `approx_kl` | Approximate KL between old and new policy |
-| `clip_fraction` | Fraction of samples hit by the PPO clip |
-| `explained_variance` | `1 − Var(returns − V) / Var(returns)` |
-| `learning_rate` | Current (possibly annealed) LR |
-
-`trainer.save("path.pt")` writes a single file containing the combined `ActorCritic` module (actor tower + critic tower + optional shared history encoder). The Python utility [`tools/plot_live.py`](tools/plot_live.py) renders live training curves from `runs/<timestamp>/`.
 
 ## References
 
