@@ -57,6 +57,12 @@ private:
     void rebuild_action_table();
     torch::Tensor compute_mask() const;
 
+    // Seat-0 expected utility (in mbb) at an all-in showdown, computed over
+    // the remaining board run-outs. Called only when the terminal is an
+    // all-in SHOWDOWN with an incomplete board. Non-const: the preflop
+    // Monte-Carlo path advances rng_.
+    float allin_equity_utility_p0();
+
     PokerConfig         poker_cfg_;
     BetConfig           bet_cfg_;
     std::mt19937        rng_;
@@ -68,6 +74,9 @@ private:
     int   A_              = 0;
     int   allin_slot_     = -1;     // -1 if disabled
     float reward_norm_    = 1.0f;   // 10 * big_blind
+
+    bool  allin_equity_       = true;   // from cfg + POKER_PPO_NO_ALLIN_EQUITY
+    int   allin_equity_mc_    = 1000;   // preflop Monte-Carlo run-outs
 
     // PPO action index → Game::Action, or nullopt if illegal in current state.
     std::vector<std::optional<::Game::Action>> action_table_;

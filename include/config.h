@@ -126,6 +126,15 @@ struct PokerConfig {
     BetHistoryConfig    hist{};
     RoundSummaryConfig  round_summary{};
 
+    // All-in equity rewards: when both players are all-in before the river,
+    // reward the *expected* showdown equity over remaining board run-outs
+    // instead of the realised (random-card) outcome. Removes run-out
+    // variance from the gradient — the standard poker-RL variance reduction.
+    // Exact for flop/turn; Monte-Carlo (allin_equity_mc_samples run-outs)
+    // preflop. POKER_PPO_NO_ALLIN_EQUITY=1 disables at runtime for A/B.
+    bool allin_equity             = true;
+    int  allin_equity_mc_samples  = 1000;
+
     // Base seed; each env gets seed ^ instance hash.
     uint64_t seed = std::random_device()();
 

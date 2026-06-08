@@ -83,6 +83,16 @@ void reInitialize() {
     return std::holds_alternative<TerminalState>(m_current_state);
 }
 
+// Why the hand ended. Only meaningful when isTerminal(); returns SHOWDOWN
+// otherwise. Lets callers tell an all-in showdown (equity-worthy) from a
+// fold (forfeiture — no equity).
+[[nodiscard]] TerminalState::Reason getTerminalReason() const noexcept {
+    if (const auto* terminal = std::get_if<TerminalState>(&m_current_state)) {
+        return terminal->reason;
+    }
+    return TerminalState::SHOWDOWN;
+}
+
 [[nodiscard]] int32_t getUtility(int player) const {
     if (const auto* terminal = std::get_if<TerminalState>(&m_current_state)) {
         const auto contribution = static_cast<int32_t>(

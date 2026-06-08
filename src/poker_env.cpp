@@ -4,7 +4,10 @@
 #include "BettingConfig.hpp"
 #include "Context/GameContext.hpp"
 #include "GameBase.hpp"
+#include "GameState.hpp"
+#include "Utility/AllInEquity.hpp"
 
+#include <cstdlib>
 #include <stdexcept>
 
 namespace poker_ppo {
@@ -43,6 +46,12 @@ PokerEnvironment::PokerEnvironment(const PokerConfig& poker_cfg,
     // Reward scaling lands per-hand rewards in O(0.1) — avoids vanishing
     // gradients (stack-normalised) and mode collapse (BB-normalised).
     reward_norm_ = 10.0f * static_cast<float>(gcfg.big_blind);
+
+    allin_equity_    = poker_cfg_.allin_equity;
+    allin_equity_mc_ = poker_cfg_.allin_equity_mc_samples;
+    if (std::getenv("POKER_PPO_NO_ALLIN_EQUITY") != nullptr) {
+        allin_equity_ = false;
+    }
 
     action_table_.assign(A_, std::nullopt);
 }
@@ -149,7 +158,20 @@ StepResult PokerEnvironment::step(int action_idx) {
     }
 
     if (game_->isTerminal()) {
-        const float r = static_cast<float>(game_->getUtility(0)) / reward_norm_;
+        // All-in before the river resolves straight to a SHOWDOWN terminal
+        // with an incomplete board (equal stacks + matched betting ⇒ both
+        // players are all-in, never a covering call). Reward the expected
+        // equity over run-outs instead of the realised random outcome.
+        const bool allin_showdown =
+            allin_equity_ &&
+            game_->getTerminalReason() == ::Game::TerminalState::SHOWDOWN &&
+            game_->getContext().getCommunityCount() < 5;
+
+        const float util = allin_showdown
+            ? allin_equity_utility_p0()
+            : static_cast<float>(game_->getUtility(0));
+        const float r = util / reward_norm_;
+
         // Obs/mask unused after terminal; PPO resets next.
         auto obs  = torch::zeros({obs_builder_.obs_dim()});
         auto mask = torch::zeros({A_});
@@ -164,6 +186,27 @@ void PokerEnvironment::auto_advance_chance() {
     while (!game_->isTerminal() && game_->getType() == "chance") {
         game_->transition(::Game::Chance{});
     }
+}
+
+float PokerEnvironment::allin_equity_utility_p0() {
+    const auto& ctx   = game_->getContext();
+    const auto  h0    = ctx.getHoleCards(0);
+    const auto  h1    = ctx.getHoleCards(1);
+    const int   count = ctx.getCommunityCount();   // 0 (preflop), 3, or 4
+
+    uint8_t board[5];
+    for (int i = 0; i < count; ++i) board[i] = ctx.getCommunityCard(i);
+
+    const double eq0 = ::Game::all_in_equity_p0(
+        h0.data(), h1.data(), board, count, rng_, allin_equity_mc_);
+
+    // Mirror Game::getUtility's framing so the equity reward shares a mean
+    // with the realised one: EU0 = pot·equity0 − contribution0, where
+    // contribution0 = initial_stack − stack(0). Zero-sum by construction.
+    const double pot     = static_cast<double>(ctx.getPot());
+    const double contrib = static_cast<double>(poker_cfg_.game.initial_stack)
+                         - static_cast<double>(ctx.getStack(0));
+    return static_cast<float>(eq0 * pot - contrib);
 }
 
 void PokerEnvironment::rebuild_action_table() {

@@ -74,6 +74,15 @@ target_link_libraries(mmd_test PRIVATE
     GTest::gtest_main
 )
 
+# All-in equity tests. Header-only helper over the TwoPlusTwo evaluator, so
+# only the Game include root + Utility (evaluator impl) are needed.
+add_executable(allin_equity_test allin_equity_test.cpp)
+target_link_libraries(allin_equity_test PRIVATE
+    Game
+    Utility
+    GTest::gtest_main
+)
+
 # Register with CTest so `ctest` discovers the cases automatically.
 include(GoogleTest)
 gtest_discover_tests(showdown_test)
@@ -82,3 +91,4 @@ gtest_discover_tests(betting_config_test)
 gtest_discover_tests(poker_config_test)
 gtest_discover_tests(hand_strength_test)
 gtest_discover_tests(mmd_test)
+gtest_discover_tests(allin_equity_test)
