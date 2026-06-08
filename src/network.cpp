@@ -2,9 +2,32 @@
 #include "features.h"
 
 #include <torch/torch.h>
+#include <cstdlib>
 #include <stdexcept>
+#include <string>
 
 namespace poker_ppo {
+
+namespace {
+// Whether the critic detaches the history encoder. Default is now to let
+// the value-loss gradient flow, making the encoder a shared backbone
+// trained by both heads: in this history-dependent game the value and
+// policy want the same betting-history features, so the sharing is
+// constructive (and an A/B showed a small early explained-variance edge
+// with no destabilisation). The old PPG "policy-phase" detach is kept
+// behind the env var for comparison.
+//   unset / 1 / true  → gradients flow (shared encoder; default)
+//   0 / false         → detach (value loss can't reshape the encoder)
+bool critic_detaches_encoder() {
+    static const bool detaches = [] {
+        const char* e = std::getenv("POKER_PPO_CRITIC_ENCODER_GRAD");
+        if (!e) return false;  // default: gradients flow
+        const std::string v(e);
+        return v == "0" || v == "false";
+    }();
+    return detaches;
+}
+}  // namespace
 
 // ─── HistoryEncoder ──────────────────────────────────────────────────────
 
@@ -232,14 +255,18 @@ std::pair<torch::Tensor, torch::Tensor>
 ActorCriticImpl::forward(torch::Tensor obs) {
     auto encoded = encode_history(obs);
 
-    // Detach for the critic so value-loss gradient can't reshape the
-    // encoder representation — preserves the CleanRL "no shared trunk"
-    // semantics for the encoder. When no encoder, both inputs are
-    // identical and we share the cat result.
+    // By default the value-loss gradient flows into the encoder (shared
+    // backbone trained by both heads). POKER_PPO_CRITIC_ENCODER_GRAD=0
+    // restores the PPG policy-phase detach for comparison. When there's no
+    // encoder both inputs are identical and we share the cat result.
     auto actor_in = build_trunk_input(obs, encoded);
-    auto critic_in = encoded.defined()
-        ? build_trunk_input(obs, encoded.detach())
-        : actor_in;
+    torch::Tensor critic_in;
+    if (encoded.defined()) {
+        auto critic_enc = critic_detaches_encoder() ? encoded.detach() : encoded;
+        critic_in = build_trunk_input(obs, critic_enc);
+    } else {
+        critic_in = actor_in;
+    }
 
     auto logits = actor_->forward(actor_in);
     auto value  = critic_->forward(critic_in).squeeze(-1);
@@ -248,8 +275,10 @@ ActorCriticImpl::forward(torch::Tensor obs) {
 
 torch::Tensor ActorCriticImpl::get_value(torch::Tensor obs) {
     auto encoded = encode_history(obs);
-    auto critic_in = build_trunk_input(
-        obs, encoded.defined() ? encoded.detach() : encoded);
+    auto critic_enc = (encoded.defined() && critic_detaches_encoder())
+        ? encoded.detach()
+        : encoded;
+    auto critic_in = build_trunk_input(obs, critic_enc);
     return critic_->forward(critic_in).squeeze(-1);
 }
 
