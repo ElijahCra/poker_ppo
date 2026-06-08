@@ -28,6 +28,23 @@ namespace poker_ppo {
 
 class OpponentManager;
 
+// Per-phase wall-time accumulator for the rollout loop. Filled only when
+// POKER_PPO_PROFILE is set in the environment; printed once at collector
+// teardown. Times are summed across all rollouts for one strategy; divide
+// by `rollouts` for per-rollout averages.
+struct RolloutProfile {
+    double infer_ms        = 0.0;  // policy forward (sync'd)
+    double d2h_ms          = 0.0;  // device→host copies of step outputs
+    double overrides_ms    = 0.0;  // opponent-pool action overrides
+    double alloc_next_ms   = 0.0;  // per-step next_obs/mask/player zero-allocs
+    double env_step_ms     = 0.0;  // env step + obs build + buffer push
+    double terminal_rng_ms = 0.0;  // per-episode opponent reassignment
+    double h2d_ms          = 0.0;  // host→device upload of next state
+    double returns_ms      = 0.0;  // bootstrap + GAE + carry update
+    double total_ms        = 0.0;  // whole collect() call
+    int    rollouts        = 0;
+};
+
 // Generation-based pool: parallel_for bumps a counter, workers steal via
 // an atomic index. Avoids per-job allocations — the rollout loop calls
 // parallel_for hundreds of times per training update.
@@ -346,6 +363,11 @@ private:
     std::unique_ptr<VectorizedEnv>  vec_env_;
     std::unique_ptr<RolloutBuffer>  buffer_;
     std::unique_ptr<StepThreadPool> step_pool_;
+
+    // Opt-in phase profiling (POKER_PPO_PROFILE). Indexed by Strategy so a
+    // serial/threadpool A/B keeps the two breakdowns separate.
+    bool           profiling_ = false;
+    RolloutProfile prof_[2];   // [Serial, Threadpool]
 
     // CPU tensors; consumed by the next rollout via one batched H2D copy.
     torch::Tensor carry_obs_;             // [num_envs, obs_dim]

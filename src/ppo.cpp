@@ -2,15 +2,35 @@
 
 #include "opponent_manager.h"
 
+#include <ATen/autocast_mode.h>
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <iomanip>
 #include <iostream>
 #include <numeric>
 #include <thread>
 
 namespace poker_ppo {
+
+namespace {
+
+// Toggle CUDA autocast for the update's forward+loss. bf16 keeps fp32's
+// exponent range, so no GradScaler is needed (unlike fp16). autocast also
+// runs softmax/log_softmax/loss reductions in fp32, so the policy
+// distribution, entropy and KL stay numerically identical to the fp32
+// path — only the encoder/tower matmuls drop to bf16. clear_cache() on
+// disable drops the cached bf16 weight casts, which go stale after each
+// optimiser step.
+inline void set_update_autocast(bool on) {
+    at::autocast::set_autocast_enabled(at::kCUDA, on);
+    if (on)  at::autocast::set_autocast_dtype(at::kCUDA, at::kBFloat16);
+    if (!on) at::autocast::clear_cache();
+}
+
+}  // namespace
 
 VectorizedEnv::VectorizedEnv(IPokerEnvironmentFactory& factory,
                              const BetConfig& cfg, int num_envs) {
@@ -42,8 +62,18 @@ PPOTrainer::PPOTrainer(IPokerEnvironmentFactory& env_factory,
     : device_(device),
       network_(nullptr)
 {
+    num_envs_ = cfg_.num_envs;
+    if (const char* e = std::getenv("POKER_PPO_NUM_ENVS")) {
+        const int v = std::atoi(e);
+        if (v > 0) {
+            num_envs_ = v;
+            std::cout << "[override] num_envs=" << num_envs_
+                      << " (benchmark only)\n";
+        }
+    }
+
     collector_ = std::make_unique<RolloutCollector>(
-        env_factory, bet_cfg_, cfg_.num_envs, cfg_.num_steps, device_);
+        env_factory, bet_cfg_, num_envs_, cfg_.num_steps, device_);
 
     const int obs_dim      = collector_->obs_dim();
     const int action_count = collector_->action_count();
@@ -61,7 +91,7 @@ PPOTrainer::PPOTrainer(IPokerEnvironmentFactory& env_factory,
         cfg_.opp_pool, obs_dim, action_count,
         cfg_.hidden_dim, cfg_.num_layers,
         cfg_.hist, cfg_.round_summary, device_);
-    opp_mgr_->reset_assignments(cfg_.num_envs);
+    opp_mgr_->reset_assignments(num_envs_);
 
     // MMD magnet — initialise from the random-init network so the very
     // first update's KL term is well-defined. Refreshed every
@@ -83,7 +113,7 @@ int PPOTrainer::opponent_pool_size() const {
 
 void PPOTrainer::train() {
     collector_->init_carry();
-    opp_mgr_->reset_assignments(cfg_.num_envs);
+    opp_mgr_->reset_assignments(num_envs_);
 
     const int total_updates = cfg_.num_updates();
 
@@ -163,7 +193,7 @@ PPOTrainer::benchmark_strategies(
     using ms    = std::chrono::duration<double, std::milli>;
 
     collector_->init_carry();
-    opp_mgr_->reset_assignments(cfg_.num_envs);
+    opp_mgr_->reset_assignments(num_envs_);
 
     const int saved_update_idx = update_idx_;
     update_idx_ = 1;  // not %10 — silences the train() log
@@ -202,10 +232,10 @@ PPOTrainer::benchmark_strategies(
     };
 
     BenchmarkResult r;
-    r.num_envs  = cfg_.num_envs;
+    r.num_envs  = num_envs_;
     r.num_steps = cfg_.num_steps;
     r.iters     = iters;
-    r.samples   = cfg_.num_envs * cfg_.num_steps;
+    r.samples   = num_envs_ * cfg_.num_steps;
     r.by_strategy.reserve(strategies.size());
     for (size_t s = 0; s < strategies.size(); ++s) {
         r.by_strategy.emplace_back(strategies[s].first, pack(samples[s]));
@@ -252,6 +282,11 @@ PPOTrainer::benchmark_rollouts(int iters, int warmup, bool verbose) {
 
 PPOTrainer::UpdateStats PPOTrainer::update() {
     network_->train();
+
+    // bf16 autocast for the update's heavy matmuls. On by default on CUDA;
+    // POKER_PPO_NO_AMP=1 forces the fp32 path for A/B comparison.
+    const bool use_amp =
+        device_.is_cuda() && std::getenv("POKER_PPO_NO_AMP") == nullptr;
 
     auto& buffer = collector_->buffer();
     auto batch   = buffer.flatten();
@@ -312,6 +347,8 @@ PPOTrainer::UpdateStats PPOTrainer::update() {
                 }
             }
 
+            if (use_amp) set_update_autocast(true);
+
             auto er = network_->evaluate(mb_obs, mb_masks, mb_actions);
 
             // Clipped surrogate.
@@ -369,6 +406,10 @@ PPOTrainer::UpdateStats PPOTrainer::update() {
             if constexpr (cfg_.kl_coef > 0.0f) {
                 loss = loss + cfg_.kl_coef * mmd_kl_loss;
             }
+
+            // Backward + step run in fp32 (master weights); disable autocast
+            // and drop the stale bf16 weight-cast cache first.
+            if (use_amp) set_update_autocast(false);
 
             optimizer_->zero_grad();
             loss.backward();

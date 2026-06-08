@@ -3,6 +3,10 @@
 #include "opponent_manager.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
+#include <iomanip>
+#include <iostream>
 #include <thread>
 #include <vector>
 
@@ -169,6 +173,58 @@ RolloutBuffer::FlatBatch RolloutBuffer::flatten() const {
 
 namespace {
 
+// Phase stopwatch for the rollout loop. When `active`, lap() syncs the
+// CUDA stream so async kernels are attributed to the phase that launched
+// them, then accumulates elapsed time into the target counter. Inert
+// (no clock reads, no syncs) when profiling is off, so the normal path
+// pays only a predicted-not-taken branch per phase.
+struct PhaseTimer {
+    bool active;
+    bool cuda;
+    std::chrono::steady_clock::time_point last;
+
+    PhaseTimer(bool active_, bool cuda_) : active(active_), cuda(cuda_) {
+        if (active) last = std::chrono::steady_clock::now();
+    }
+    void reset() {
+        if (active) last = std::chrono::steady_clock::now();
+    }
+    void lap(double& acc) {
+        if (!active) return;
+        if (cuda) torch::cuda::synchronize();
+        const auto t = std::chrono::steady_clock::now();
+        acc += std::chrono::duration<double, std::milli>(t - last).count();
+        last = t;
+    }
+};
+
+void print_profile(const char* name, const RolloutProfile& p) {
+    if (p.rollouts == 0) return;
+    const double n = static_cast<double>(p.rollouts);
+    const double tot = p.total_ms;
+    auto row = [&](const char* phase, double ms) {
+        std::cout << "  " << std::setw(16) << std::left << phase << std::right
+                  << std::setw(10) << std::fixed << std::setprecision(2)
+                  << (ms / n) << " ms/rollout"
+                  << std::setw(8) << std::setprecision(1)
+                  << (tot > 0 ? 100.0 * ms / tot : 0.0) << "%\n";
+    };
+    std::cout << "\n────────── rollout phase profile [" << name << "] ──────────\n"
+              << "  rollouts=" << p.rollouts
+              << "  total=" << std::fixed << std::setprecision(2) << (tot / n)
+              << " ms/rollout\n  ────────────────────────────────────────────\n";
+    row("infer",        p.infer_ms);
+    row("d2h",          p.d2h_ms);
+    row("overrides",    p.overrides_ms);
+    row("alloc_next",   p.alloc_next_ms);
+    row("env_step",     p.env_step_ms);
+    row("terminal_rng", p.terminal_rng_ms);
+    row("h2d",          p.h2d_ms);
+    row("returns",      p.returns_ms);
+    std::cout << "  ────────────────────────────────────────────\n";
+    std::cout.unsetf(std::ios::fixed);
+}
+
 struct BootstrapTensors {
     torch::Tensor values;     // [2, N] float32 CPU
     torch::Tensor terminal;   // [2, N] float32 CPU
@@ -221,9 +277,15 @@ RolloutCollector::RolloutCollector(IPokerEnvironmentFactory& factory,
     const int action_count = vec_env_->action_count();
     buffer_ = std::make_unique<RolloutBuffer>(
         num_steps, num_envs, obs_dim, action_count, device_);
+
+    profiling_ = std::getenv("POKER_PPO_PROFILE") != nullptr;
 }
 
-RolloutCollector::~RolloutCollector() = default;
+RolloutCollector::~RolloutCollector() {
+    if (!profiling_) return;
+    print_profile("serial",     prof_[0]);
+    print_profile("threadpool", prof_[1]);
+}
 
 void RolloutCollector::ensure_step_pool() {
     if (step_pool_) return;
@@ -267,6 +329,12 @@ void RolloutCollector::collect(Strategy         strategy,
 
     if (strategy == Strategy::Threadpool) ensure_step_pool();
 
+    // Opt-in phase profiling. `prof` aggregates across rollouts for this
+    // strategy; `total` brackets the whole collect() call.
+    auto&      prof = prof_[strategy == Strategy::Threadpool ? 1 : 0];
+    const bool cuda = device_.is_cuda();
+    PhaseTimer total(profiling_, cuda);
+
     buffer_->clear();
     opp_mgr.prepare_rollout(update_idx);
 
@@ -287,25 +355,39 @@ void RolloutCollector::collect(Strategy         strategy,
         player_state[i].next_done_flag[1] = d;
     }
 
-    auto cur_obs    = carry_obs_.to(device_);
-    auto cur_mask   = carry_legal_mask_.to(device_);
-    auto cur_player = carry_current_player_.to(device_);
+    // Carried state lives on the CPU; it's the source of truth. Each step
+    // uploads obs+mask to the device for the forward and downloads only what
+    // the forward produces (action/log_prob/value). current_player never
+    // feeds a device kernel, so it stays on the CPU — the old code uploaded
+    // it and obs/mask only to download them again the next step, a pure
+    // host↔device round trip.
+    auto cur_obs_cpu    = carry_obs_;             // [N, D]   CPU
+    auto cur_mask_cpu   = carry_legal_mask_;      // [N, A]   CPU
+    auto cur_player_cpu = carry_current_player_;  // [N] int32 CPU
+
+    torch::Tensor cur_obs, cur_mask;  // device mirrors, refreshed each step
 
     std::vector<uint8_t> did_reset(N, 0);
 
     for (int step = 0; step < num_steps_; ++step) {
+        PhaseTimer pt(profiling_, cuda);
+
+        cur_obs  = cur_obs_cpu.to(device_);
+        cur_mask = cur_mask_cpu.to(device_);
+        pt.lap(prof.h2d_ms);
+
         // One full-batch forward per step regardless of strategy.
         auto ar = network->get_action(cur_obs, cur_mask);
+        pt.lap(prof.infer_ms);
 
-        auto actions_cpu    = ar.action.to(torch::kCPU).contiguous();
-        auto logp_cpu       = ar.log_prob.to(torch::kCPU).contiguous();
-        auto value_cpu      = ar.value.to(torch::kCPU).contiguous();
-        auto cur_obs_cpu    = cur_obs.to(torch::kCPU).contiguous();
-        auto cur_mask_cpu   = cur_mask.to(torch::kCPU).contiguous();
-        auto cur_player_cpu = cur_player.to(torch::kCPU).contiguous();
+        auto actions_cpu = ar.action.to(torch::kCPU).contiguous();
+        auto logp_cpu    = ar.log_prob.to(torch::kCPU).contiguous();
+        auto value_cpu   = ar.value.to(torch::kCPU).contiguous();
+        pt.lap(prof.d2h_ms);
 
         opp_mgr.apply_action_overrides(
             cur_obs, cur_mask, cur_player_cpu, actions_cpu);
+        pt.lap(prof.overrides_ms);
 
         auto a_acc  = actions_cpu.accessor<int64_t, 1>();
         auto lp_acc = logp_cpu.accessor<float, 1>();
@@ -318,6 +400,7 @@ void RolloutCollector::collect(Strategy         strategy,
         auto np_acc      = next_player.accessor<int32_t, 1>();
 
         std::fill(did_reset.begin(), did_reset.end(), 0);
+        pt.lap(prof.alloc_next_ms);
 
         // Per-i state is disjoint, so step_body is safe to parallelise
         // across i. Buffer pushes at (player, i) are also disjoint.
@@ -353,32 +436,51 @@ void RolloutCollector::collect(Strategy         strategy,
         } else {
             for (int i = 0; i < N; ++i) step_body(i);
         }
+        pt.lap(prof.env_step_ms);
 
         // Serial: opp_mgr's RNG isn't thread-safe.
         for (int i = 0; i < N; ++i) {
             if (did_reset[i]) opp_mgr.on_episode_terminal(i, update_idx);
         }
+        pt.lap(prof.terminal_rng_ms);
 
-        cur_obs    = next_obs.to(device_);
-        cur_mask   = next_mask.to(device_);
-        cur_player = next_player.to(device_);
+        // Hand next state to the carried CPU buffers. These are freshly
+        // allocated (no aliasing with what step_body just wrote), so moving
+        // the handles is safe; the device upload happens at the top of the
+        // next iteration.
+        cur_obs_cpu    = std::move(next_obs);
+        cur_mask_cpu   = std::move(next_mask);
+        cur_player_cpu = std::move(next_player);
     }
+
+    total.reset();  // bracket the returns/bootstrap tail separately
 
     // Truncations, not terminals — bootstrapped from V(carry_obs).
     for (int i = 0; i < N; ++i) {
         player_state[i].flush_on_rollout_end(i, *buffer_);
     }
 
-    auto cur_player_cpu = cur_player.to(torch::kCPU).contiguous();
+    // Bootstrap V(carry_obs) needs the final state on the device; upload the
+    // carried CPU obs once (current_player is already on the CPU).
+    cur_obs = cur_obs_cpu.to(device_);
     auto bootstrap = build_bootstrap(network, cur_obs, cur_player_cpu, player_state);
     buffer_->compute_returns(gamma, gae_lambda,
                              bootstrap.values, bootstrap.terminal);
 
-    carry_obs_            = cur_obs.to(torch::kCPU);
-    carry_legal_mask_     = cur_mask.to(torch::kCPU);
+    carry_obs_            = cur_obs_cpu;
+    carry_legal_mask_     = cur_mask_cpu;
     carry_current_player_ = cur_player_cpu;
     // Pending transitions are already flushed; clear the boundary state.
     carry_done_.zero_();
+
+    total.lap(prof.returns_ms);
+
+    if (profiling_) {
+        prof.total_ms = prof.infer_ms + prof.d2h_ms + prof.overrides_ms
+                      + prof.alloc_next_ms + prof.env_step_ms
+                      + prof.terminal_rng_ms + prof.h2d_ms + prof.returns_ms;
+        ++prof.rollouts;
+    }
 
     global_step_ += num_envs_ * num_steps_;
 }

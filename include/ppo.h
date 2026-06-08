@@ -99,6 +99,12 @@ private:
     static inline constexpr const BetConfig& bet_cfg_  = config::kBetConfig;
     torch::Device device_;
 
+    // Usually cfg_.num_envs; overridable at construction via the
+    // POKER_PPO_NUM_ENVS env var for throughput sweeps (benchmark only —
+    // update() minibatching still assumes cfg_.num_envs, so don't train
+    // with an override, change the constexpr in config.h instead).
+    int num_envs_;
+
     ActorCritic                          network_;
     std::unique_ptr<torch::optim::Adam>  optimizer_;
     std::unique_ptr<RolloutCollector>    collector_;
