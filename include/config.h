@@ -193,8 +193,12 @@ static constexpr BetConfig kBetConfig{
 static constexpr PPOConfig kPPOConfig{
     .gamma            = 1.0f,
     .gae_lambda       = 0.90f,
-    .clip_coef        = 0.1f,
-    .ent_coef         = 0.4f,
+    .clip_coef        = 0.1f,   // matches Rudolph et al. 2026 (ICLR) PPO default
+    // Constant entropy in the 0.05–0.2 band that Rudolph et al. 2026 found
+    // minimises exploitability for PG methods in imperfect-info games (their
+    // default 0.05; #1-importance hyperparameter). 0.4 was above the band;
+    // a 0.1-diagnostic on this game sharpened the policy without collapse.
+    .ent_coef         = 0.1f,
     .vf_coef          = 0.5f,
     .max_grad_norm    = 0.5f,
     .clip_vloss       = true,
@@ -204,8 +208,11 @@ static constexpr PPOConfig kPPOConfig{
     .anneal_lr        = true,
     .min_lr_frac      = 0.2f,
 
-    .anneal_ent_coef  = true,
-    .ent_coef_min     = 0.01f,
+    // Off: Rudolph et al. 2026 use a CONSTANT entropy coefficient ("instead
+    // of a custom schedule") — annealing toward 0.01 ends in the standard-RL
+    // regime they show is bad for exploitability.
+    .anneal_ent_coef  = false,
+    .ent_coef_min     = 0.1f,
 
     .num_envs         = 96,
     .num_steps        = 128,
