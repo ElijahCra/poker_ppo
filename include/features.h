@@ -36,4 +36,16 @@ inline constexpr bool ROUND_SUMMARY = true;
 // next reintroduction slots into the same pattern without churn.
 inline constexpr bool POOL_CONDITIONING = false;
 
+// VRPO-style privileged Q-critic (Liu et al. 2026, "GAE Falls Short").
+// When ON: (1) the critic is an action-value head Q(s,a) instead of a
+// scalar V, fed the OPPONENT's hole cards as a privileged obs tail block
+// (centralised training, decentralised execution — the actor never sees
+// it); (2) the advantage is the Expected-SARSA(λ) "Q-boosting" estimator
+// Â = Q(s,a) − V̄(s) + Σ(λγ)^k δ⁺, δ⁺ = r + γV̄(s') − Q(s,a), with
+// V̄(s) = Σ_a π(a|s)Q(s,a) — averaging over the action distribution
+// removes the future-action sampling noise that inflates GAE's variance
+// in imperfect-information self-play. When OFF the V-critic + GAE path is
+// unchanged. The privileged tail and Q-head strip from the binary when OFF.
+inline constexpr bool PRIVILEGED_Q_CRITIC = true;
+
 }  // namespace poker_ppo::features

@@ -83,6 +83,14 @@ target_link_libraries(allin_equity_test PRIVATE
     GTest::gtest_main
 )
 
+# VRPO advantage tests. Exercise RolloutBuffer::compute_returns (the unified
+# GAE / Expected-SARSA(λ) trace), so link poker_ppo_lib for the buffer.
+add_executable(vrpo_advantage_test vrpo_advantage_test.cpp)
+target_link_libraries(vrpo_advantage_test PRIVATE
+    poker_ppo_lib
+    GTest::gtest_main
+)
+
 # Register with CTest so `ctest` discovers the cases automatically.
 include(GoogleTest)
 gtest_discover_tests(showdown_test)
@@ -92,3 +100,4 @@ gtest_discover_tests(poker_config_test)
 gtest_discover_tests(hand_strength_test)
 gtest_discover_tests(mmd_test)
 gtest_discover_tests(allin_equity_test)
+gtest_discover_tests(vrpo_advantage_test)

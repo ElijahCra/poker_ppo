@@ -280,7 +280,8 @@ int cmd_play(IPokerEnvironmentFactory& factory,
         torch::NoGradGuard ng;
         auto obs  = env->observation().unsqueeze(0).to(device);
         auto mask = env->legal_action_mask().unsqueeze(0).to(device);
-        auto [logits, value] = net->forward(obs);
+        auto [logits, critic_raw] = net->forward(obs);
+        (void)critic_raw;  // VRPO: Q(s,·); report the masked expected value V̄
         const auto masked = logits + (1.0f - mask) * kIllegalActionLogit;
         const auto probs  = torch::softmax(masked, -1).squeeze(0).to(torch::kCPU).contiguous();
         // Stochastic sample (matches the training rollout).
@@ -288,9 +289,10 @@ int cmd_play(IPokerEnvironmentFactory& factory,
         const auto sampled = ar.action.to(torch::kCPU).item<int64_t>();
         // Argmax for diagnostics.
         const auto greedy  = std::get<1>(probs.max(0)).item<int64_t>();
+        const float value  = net->get_state_value(obs, mask).item<float>();
         std::cout << "sampled "  << sampled << "\n";
         std::cout << "greedy "   << greedy  << "\n";
-        std::cout << "value "    << value.squeeze(0).item<float>() << "\n";
+        std::cout << "value "    << value << "\n";
         const auto p_acc = probs.accessor<float, 1>();
         std::cout << "probs " << probs.size(0);
         for (int i = 0; i < probs.size(0); ++i)

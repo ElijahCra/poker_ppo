@@ -169,7 +169,8 @@ public:
               float log_prob,
               float reward,
               float done,
-              float value,
+              float value,            // VRPO: Q(s,a); else V(s)
+              float vbar,             // VRPO: V̄(s)=Σ π Q; else == value
               torch::Tensor mask);    // [action_count] CPU or device_
 
     // GAE per (player, env_idx) trajectory.
@@ -212,7 +213,8 @@ private:
     torch::Tensor log_probs_[2];    // [T, N]
     torch::Tensor rewards_[2];      // [T, N]
     torch::Tensor dones_[2];        // [T, N]
-    torch::Tensor values_[2];       // [T, N]
+    torch::Tensor values_[2];       // [T, N]   VRPO: Q(s,a); else V(s)
+    torch::Tensor vbar_[2];         // [T, N]   VRPO: V̄(s); else == values_
     torch::Tensor legal_masks_[2];  // [T, N, A]
     torch::Tensor advantages_[2];   // [T, N]
     torch::Tensor returns_[2];      // [T, N]
@@ -241,6 +243,7 @@ struct PlayerRolloutState {
         int64_t        action   = 0;
         float          log_prob = 0.0f;
         float          value    = 0.0f;
+        float          vbar     = 0.0f;
         float          done     = 0.0f;
     };
 
@@ -251,12 +254,12 @@ struct PlayerRolloutState {
 
     void record_step(int player, int env_idx, RolloutBuffer& buf,
                      torch::Tensor obs, torch::Tensor mask,
-                     int64_t action, float log_prob, float value) {
+                     int64_t action, float log_prob, float value, float vbar) {
         Pending& p = pending[player];
         if (p.has) {
             buf.push(player, env_idx,
                      p.obs, p.action, p.log_prob,
-                     accumulated[player], p.done, p.value, p.mask);
+                     accumulated[player], p.done, p.value, p.vbar, p.mask);
             accumulated[player] = 0.0f;
             p.has = false;
             // Followed by another action, not a terminal.
@@ -268,6 +271,7 @@ struct PlayerRolloutState {
         p.action   = action;
         p.log_prob = log_prob;
         p.value    = value;
+        p.vbar     = vbar;
         p.done     = next_done_flag[player];
         next_done_flag[player] = 0.0f;
     }
@@ -284,7 +288,7 @@ struct PlayerRolloutState {
             if (pp.has) {
                 buf.push(p, env_idx,
                          pp.obs, pp.action, pp.log_prob,
-                         accumulated[p], pp.done, pp.value, pp.mask);
+                         accumulated[p], pp.done, pp.value, pp.vbar, pp.mask);
                 pp.has = false;
                 tail_was_terminal[p] = true;
             }
@@ -309,7 +313,7 @@ struct PlayerRolloutState {
             if (pp.has) {
                 buf.push(p, env_idx,
                          pp.obs, pp.action, pp.log_prob,
-                         accumulated[p], pp.done, pp.value, pp.mask);
+                         accumulated[p], pp.done, pp.value, pp.vbar, pp.mask);
                 accumulated[p] = 0.0f;
                 pp.has = false;
                 tail_was_terminal[p] = false;

@@ -44,9 +44,11 @@ struct ObservationLayout {
     int static_off;
     int round_summary_off;
     int history_off;
+    int privileged_off;        // opponent hole-card one-hot (critic-only)
 
     int round_summary_dim;     // 0 if disabled
     int history_dim;           // 0 if disabled
+    int privileged_dim;        // 52 if PRIVILEGED_Q_CRITIC, else 0
 
     int total_dim;
 
@@ -61,7 +63,12 @@ struct ObservationLayout {
         L.round_summary_dim = rs.dim();
         L.history_off       = L.round_summary_off + L.round_summary_dim;
         L.history_dim       = hist.history_block_dim();
-        L.total_dim         = L.history_off + L.history_dim;
+        // Privileged opponent-cards tail. Last block so the actor's
+        // [0, tower_static_dim) + round-summary + history slices never
+        // touch it — only the critic narrows it in.
+        L.privileged_off    = L.history_off + L.history_dim;
+        L.privileged_dim    = features::PRIVILEGED_Q_CRITIC ? CARD_SLOTS : 0;
+        L.total_dim         = L.privileged_off + L.privileged_dim;
         return L;
     }
 };

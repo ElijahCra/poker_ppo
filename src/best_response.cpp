@@ -179,6 +179,7 @@ BestResponseEvaluator::run_one_seed(ActorCritic& frozen_target) {
                 auto e_actions = er.action.to(torch::kCPU).contiguous();
                 auto e_logp    = er.log_prob.to(torch::kCPU).contiguous();
                 auto e_value   = er.value.to(torch::kCPU).contiguous();
+                auto e_vbar    = er.v_bar.to(torch::kCPU).contiguous();
                 auto t_actions = tr.action.to(torch::kCPU).contiguous();
 
                 auto cur_obs_cpu    = cur_obs.to(torch::kCPU).contiguous();
@@ -188,6 +189,7 @@ BestResponseEvaluator::run_one_seed(ActorCritic& frozen_target) {
                 auto ea = e_actions.accessor<int64_t, 1>();
                 auto el = e_logp.accessor<float, 1>();
                 auto ev = e_value.accessor<float, 1>();
+                auto evb = e_vbar.accessor<float, 1>();
                 auto ta = t_actions.accessor<int64_t, 1>();
                 auto cp = cur_player_cpu.accessor<int32_t, 1>();
 
@@ -207,7 +209,7 @@ BestResponseEvaluator::run_one_seed(ActorCritic& frozen_target) {
                         player_state[i].record_step(
                             acting, i, *buffer_,
                             cur_obs_cpu[i], cur_mask_cpu[i],
-                            ea[i], el[i], ev[i]);
+                            ea[i], el[i], ev[i], evb[i]);
                     } else {
                         action = ta[i];
                     }

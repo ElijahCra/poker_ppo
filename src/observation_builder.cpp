@@ -123,6 +123,15 @@ torch::Tensor ObservationBuilder::build(
         if (hist_cfg_.enabled) write_history(a, bet_history, me);
     }
 
+    // Privileged block: the OPPONENT's hole cards, one-hot. Read only by
+    // the critic (VRPO centralised value); the actor's obs slices stop
+    // before privileged_off so the policy can't condition on it.
+    if constexpr (features::PRIVILEGED_Q_CRITIC) {
+        const auto opp_hole = ctx.getHoleCards(opp);
+        a[layout_.privileged_off + opp_hole[0]] = 1.0f;
+        a[layout_.privileged_off + opp_hole[1]] = 1.0f;
+    }
+
     return obs;
 }
 

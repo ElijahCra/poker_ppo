@@ -79,16 +79,23 @@ public:
                     BetHistoryConfig    hist,
                     RoundSummaryConfig  round_summary = {});
 
-    // {logits, value}. Logits unmasked — use get_action()/evaluate() for masking.
+    // {logits, critic_raw}. critic_raw is the raw critic head: [B, A] action-
+    // values Q(s,·) when features::PRIVILEGED_Q_CRITIC, else [B, 1] scalar V.
+    // Logits unmasked — use get_action()/evaluate() for masking.
     std::pair<torch::Tensor, torch::Tensor> forward(torch::Tensor obs);
 
-    // Critic-only. Skips the actor tower (e.g. for GAE bootstrap).
+    // Expected state value with masking, for the trajectory-tail bootstrap.
+    // VRPO: V̄(s)=Σ_a π(a|s)Q(s,a). Else: V(s). Returns [B].
+    torch::Tensor get_state_value(torch::Tensor obs, torch::Tensor legal_mask);
+
+    // Critic-only scalar value, unmasked policy weighting (tests/play). [B].
     torch::Tensor get_value(torch::Tensor obs);
 
     struct ActionResult {
         torch::Tensor action;    // [B] int64
         torch::Tensor log_prob;  // [B]
-        torch::Tensor value;     // [B]
+        torch::Tensor value;     // [B]  VRPO: Q(s,a_taken); else V(s)
+        torch::Tensor v_bar;     // [B]  VRPO: Σ_a π(a|s)Q(s,a); else == value
         torch::Tensor entropy;   // [B]
     };
     ActionResult get_action(torch::Tensor obs, torch::Tensor legal_mask);
@@ -123,6 +130,11 @@ private:
     // history. `encoded` may be detached (critic side) or live (actor side).
     torch::Tensor build_trunk_input(const torch::Tensor& obs,
                                     const torch::Tensor& encoded);
+
+    // Critic input = actor trunk input + (VRPO) the privileged opponent-card
+    // tail block. Identical to build_trunk_input when the flag is off.
+    torch::Tensor build_critic_input(const torch::Tensor& obs,
+                                     const torch::Tensor& encoded);
 
     BetHistoryConfig    hist_;
     RoundSummaryConfig  round_summary_;

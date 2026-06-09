@@ -32,6 +32,7 @@ RolloutBuffer::RolloutBuffer(int num_steps, int num_envs,
         rewards_[p]     = torch::zeros({num_steps, num_envs},              cpu_f);
         dones_[p]       = torch::zeros({num_steps, num_envs},              cpu_f);
         values_[p]      = torch::zeros({num_steps, num_envs},              cpu_f);
+        vbar_[p]        = torch::zeros({num_steps, num_envs},              cpu_f);
         legal_masks_[p] = torch::zeros({num_steps, num_envs, action_count}, cpu_f);
         advantages_[p]  = torch::zeros({num_steps, num_envs},              cpu_f);
         returns_[p]     = torch::zeros({num_steps, num_envs},              cpu_f);
@@ -52,6 +53,7 @@ void RolloutBuffer::push(int player, int env_idx,
                          float reward,
                          float done,
                          float value,
+                         float vbar,
                          torch::Tensor mask) {
     const int t = counts_[player][env_idx]++;
 
@@ -66,6 +68,7 @@ void RolloutBuffer::push(int player, int env_idx,
     rewards_[player]  .accessor<float,   2>()[t][env_idx] = reward;
     dones_[player]    .accessor<float,   2>()[t][env_idx] = done;
     values_[player]   .accessor<float,   2>()[t][env_idx] = value;
+    vbar_[player]     .accessor<float,   2>()[t][env_idx] = vbar;
 }
 
 void RolloutBuffer::compute_returns(
@@ -85,43 +88,53 @@ void RolloutBuffer::compute_returns(
     auto bv_a = bv.accessor<float, 2>();
     auto bt_a = bt.accessor<float, 2>();
 
+    // Unified GAE / Expected-SARSA(λ) "Q-boosting" trace. In the GAE path
+    // values_==vbar_==V(s), so this reduces exactly to GAE. In VRPO,
+    // values_=Q(s,a), vbar_=V̄(s); the bootstrap term uses V̄ (an exact
+    // expectation over the next action distribution — no sampling noise):
+    //   δ⁺_t = r_t + γ·V̄(s_{t+1}) − Q(s_t,a_t)
+    //   Â_t  = Q(s_t,a_t) − V̄(s_t) + Σ_{k≥0}(λγ)^k δ⁺_{t+k}
+    //        = Q_target_t − V̄(s_t),   Q_target_t = Q(s_t,a_t) + trace
     for (int p = 0; p < 2; ++p) {
         advantages_[p].zero_();
         returns_[p].zero_();
 
         auto rewards_a = rewards_[p].accessor<float, 2>();
         auto dones_a   = dones_[p].accessor<float, 2>();
-        auto values_a  = values_[p].accessor<float, 2>();
+        auto values_a  = values_[p].accessor<float, 2>();  // Q(s,a) / V(s)
+        auto vbar_a    = vbar_[p].accessor<float, 2>();     // V̄(s)   / V(s)
         auto advs_a    = advantages_[p].accessor<float, 2>();
+        auto rets_a    = returns_[p].accessor<float, 2>();
 
         for (int e = 0; e < num_envs_; ++e) {
             const int T = counts_[p][e];
             if (T == 0) continue;
-            float lastgae = 0.0f;
+            float lasttrace = 0.0f;
             for (int t = T - 1; t >= 0; --t) {
-                float next_nonterminal, next_value;
+                float next_nonterminal, next_vbar;
                 if (t == T - 1) {
                     if (bt_a[p][e] > 0.5f) {
-                        // Terminal: V_next = 0.
+                        // Terminal: V̄_next = 0.
                         next_nonterminal = 0.0f;
-                        next_value       = 0.0f;
+                        next_vbar        = 0.0f;
                     } else {
-                        // Truncation: bootstrap from carry_obs.
+                        // Truncation: bootstrap V̄(carry_obs).
                         next_nonterminal = 1.0f;
-                        next_value       = bv_a[p][e];
+                        next_vbar        = bv_a[p][e];
                     }
                 } else {
                     next_nonterminal = 1.0f - dones_a[t + 1][e];
-                    next_value       = values_a[t + 1][e];
+                    next_vbar        = vbar_a[t + 1][e];
                 }
                 const float delta =
-                    rewards_a[t][e] + gamma * next_value * next_nonterminal
+                    rewards_a[t][e] + gamma * next_vbar * next_nonterminal
                     - values_a[t][e];
-                lastgae = delta + gamma * lam * next_nonterminal * lastgae;
-                advs_a[t][e] = lastgae;
+                lasttrace = delta + gamma * lam * next_nonterminal * lasttrace;
+                const float q_target = values_a[t][e] + lasttrace;
+                rets_a[t][e] = q_target;
+                advs_a[t][e] = q_target - vbar_a[t][e];
             }
         }
-        returns_[p] = advantages_[p] + values_[p];
     }
 }
 
@@ -232,9 +245,11 @@ struct BootstrapTensors {
 
 // Critic-forwards cur_obs (next acting player's view), then zero-sum
 // negates for the other player to fill compute_returns' [2, N] tensors.
+// VRPO uses the masked expected value V̄(carry); GAE uses V(carry).
 BootstrapTensors build_bootstrap(
     ActorCritic&                            network,
     const torch::Tensor&                    cur_obs,           // [N, D] device
+    const torch::Tensor&                    cur_mask,          // [N, A] device
     const torch::Tensor&                    cur_player_cpu,    // [N] int32 CPU
     const std::vector<PlayerRolloutState>&  player_state)
 {
@@ -242,7 +257,8 @@ BootstrapTensors build_bootstrap(
     auto f_cpu = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
 
     // NoGrad is in scope at the call site.
-    auto V_carry = network->get_value(cur_obs).detach().to(torch::kCPU).contiguous();
+    auto V_carry = network->get_state_value(cur_obs, cur_mask)
+                       .detach().to(torch::kCPU).contiguous();
 
     auto values   = torch::zeros({2, N}, f_cpu);
     auto terminal = torch::zeros({2, N}, f_cpu);
@@ -383,6 +399,7 @@ void RolloutCollector::collect(Strategy         strategy,
         auto actions_cpu = ar.action.to(torch::kCPU).contiguous();
         auto logp_cpu    = ar.log_prob.to(torch::kCPU).contiguous();
         auto value_cpu   = ar.value.to(torch::kCPU).contiguous();
+        auto vbar_cpu    = ar.v_bar.to(torch::kCPU).contiguous();
         pt.lap(prof.d2h_ms);
 
         opp_mgr.apply_action_overrides(
@@ -392,6 +409,7 @@ void RolloutCollector::collect(Strategy         strategy,
         auto a_acc  = actions_cpu.accessor<int64_t, 1>();
         auto lp_acc = logp_cpu.accessor<float, 1>();
         auto v_acc  = value_cpu.accessor<float, 1>();
+        auto vb_acc = vbar_cpu.accessor<float, 1>();
         auto cp_acc = cur_player_cpu.accessor<int32_t, 1>();
 
         auto next_obs    = torch::zeros({N, D}, f_cpu);
@@ -411,7 +429,7 @@ void RolloutCollector::collect(Strategy         strategy,
                 player_state[i].record_step(
                     acting, i, *buffer_,
                     cur_obs_cpu[i], cur_mask_cpu[i],
-                    a_acc[i], lp_acc[i], v_acc[i]);
+                    a_acc[i], lp_acc[i], v_acc[i], vb_acc[i]);
             }
 
             auto res = envs[i]->step(static_cast<int>(a_acc[i]));
@@ -460,10 +478,12 @@ void RolloutCollector::collect(Strategy         strategy,
         player_state[i].flush_on_rollout_end(i, *buffer_);
     }
 
-    // Bootstrap V(carry_obs) needs the final state on the device; upload the
-    // carried CPU obs once (current_player is already on the CPU).
-    cur_obs = cur_obs_cpu.to(device_);
-    auto bootstrap = build_bootstrap(network, cur_obs, cur_player_cpu, player_state);
+    // Bootstrap V̄(carry_obs) needs the final state + mask on the device;
+    // upload the carried CPU tensors once (current_player stays on the CPU).
+    cur_obs  = cur_obs_cpu.to(device_);
+    cur_mask = cur_mask_cpu.to(device_);
+    auto bootstrap = build_bootstrap(network, cur_obs, cur_mask,
+                                     cur_player_cpu, player_state);
     buffer_->compute_returns(gamma, gae_lambda,
                              bootstrap.values, bootstrap.terminal);
 

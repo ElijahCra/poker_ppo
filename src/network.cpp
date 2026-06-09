@@ -206,8 +206,11 @@ ActorCriticImpl::ActorCriticImpl(int obs_dim, int action_count,
                               Tower(trunk_in_dim, action_count,
                                     hidden_dim, num_layers,
                                     /*head_init_std=*/0.01f));
+    // VRPO: action-value critic Q(s,·) fed the privileged opponent-card
+    // tail. Otherwise a scalar V head. head_init_std=1.0 either way.
     critic_ = register_module("critic",
-                              Tower(trunk_in_dim, /*output_dim=*/1,
+                              Tower(trunk_in_dim + layout_.privileged_dim,
+                                    features::PRIVILEGED_Q_CRITIC ? action_count : 1,
                                     hidden_dim, num_layers,
                                     /*head_init_std=*/1.0f));
 }
@@ -251,35 +254,55 @@ ActorCriticImpl::build_trunk_input(const torch::Tensor& obs,
     return (parts.size() == 1) ? parts[0] : torch::cat(parts, /*dim=*/-1);
 }
 
+torch::Tensor
+ActorCriticImpl::build_critic_input(const torch::Tensor& obs,
+                                    const torch::Tensor& encoded) {
+    auto base = build_trunk_input(obs, encoded);
+    if constexpr (features::PRIVILEGED_Q_CRITIC) {
+        auto priv = obs.narrow(/*dim=*/1, layout_.privileged_off,
+                               layout_.privileged_dim);
+        return torch::cat({base, priv}, /*dim=*/-1);
+    }
+    return base;
+}
+
 std::pair<torch::Tensor, torch::Tensor>
 ActorCriticImpl::forward(torch::Tensor obs) {
     auto encoded = encode_history(obs);
 
     // By default the value-loss gradient flows into the encoder (shared
     // backbone trained by both heads). POKER_PPO_CRITIC_ENCODER_GRAD=0
-    // restores the PPG policy-phase detach for comparison. When there's no
-    // encoder both inputs are identical and we share the cat result.
+    // restores the PPG policy-phase detach for comparison.
     auto actor_in = build_trunk_input(obs, encoded);
-    torch::Tensor critic_in;
-    if (encoded.defined()) {
-        auto critic_enc = critic_detaches_encoder() ? encoded.detach() : encoded;
-        critic_in = build_trunk_input(obs, critic_enc);
-    } else {
-        critic_in = actor_in;
-    }
-
-    auto logits = actor_->forward(actor_in);
-    auto value  = critic_->forward(critic_in).squeeze(-1);
-    return {logits, value};
-}
-
-torch::Tensor ActorCriticImpl::get_value(torch::Tensor obs) {
-    auto encoded = encode_history(obs);
     auto critic_enc = (encoded.defined() && critic_detaches_encoder())
         ? encoded.detach()
         : encoded;
-    auto critic_in = build_trunk_input(obs, critic_enc);
-    return critic_->forward(critic_in).squeeze(-1);
+    auto critic_in = build_critic_input(obs, critic_enc);
+
+    auto logits     = actor_->forward(actor_in);
+    auto critic_raw = critic_->forward(critic_in);  // [B, A] (Q) or [B, 1] (V)
+    return {logits, critic_raw};
+}
+
+torch::Tensor ActorCriticImpl::get_value(torch::Tensor obs) {
+    // Unmasked expected value (tests/play); the masked bootstrap form is
+    // get_state_value.
+    auto [logits, critic_raw] = forward(obs);
+    if constexpr (features::PRIVILEGED_Q_CRITIC) {
+        auto dist = torch::softmax(logits, -1);
+        return (dist * critic_raw).sum(-1);
+    }
+    return critic_raw.squeeze(-1);
+}
+
+torch::Tensor
+ActorCriticImpl::get_state_value(torch::Tensor obs, torch::Tensor legal_mask) {
+    auto [logits, critic_raw] = forward(obs);
+    if constexpr (features::PRIVILEGED_Q_CRITIC) {
+        auto dist = torch::softmax(apply_mask(logits, legal_mask), -1);
+        return (dist * critic_raw).sum(-1);  // V̄(s) = Σ_a π(a|s) Q(s,a)
+    }
+    return critic_raw.squeeze(-1);
 }
 
 torch::Tensor
@@ -289,7 +312,7 @@ ActorCriticImpl::apply_mask(torch::Tensor logits, torch::Tensor mask) {
 
 ActorCriticImpl::ActionResult
 ActorCriticImpl::get_action(torch::Tensor obs, torch::Tensor legal_mask) {
-    auto [logits, value] = forward(obs);
+    auto [logits, critic_raw] = forward(obs);
     auto masked = apply_mask(logits, legal_mask);
 
     auto dist    = torch::softmax(masked, /*dim=*/-1);
@@ -300,19 +323,37 @@ ActorCriticImpl::get_action(torch::Tensor obs, torch::Tensor legal_mask) {
     auto log_prob = log_dist.gather(-1, action.unsqueeze(-1)).squeeze(-1);
     auto entropy  = -(dist * log_dist).sum(-1);
 
-    return {action, log_prob, value, entropy};
+    torch::Tensor value, v_bar;
+    if constexpr (features::PRIVILEGED_Q_CRITIC) {
+        // dist is ~0 on illegal actions, so V̄ sums over legal actions only.
+        v_bar = (dist * critic_raw).sum(-1);                              // V̄(s)
+        value = critic_raw.gather(-1, action.unsqueeze(-1)).squeeze(-1);  // Q(s,a)
+    } else {
+        value = critic_raw.squeeze(-1);
+        v_bar = value;
+    }
+
+    return {action, log_prob, value, v_bar, entropy};
 }
 
 ActorCriticImpl::EvalResult
 ActorCriticImpl::evaluate(torch::Tensor obs, torch::Tensor legal_mask,
                           const torch::Tensor &action) {
-    auto [logits, value] = forward(obs);
+    auto [logits, critic_raw] = forward(obs);
     const auto masked = apply_mask(logits, legal_mask);
 
     const auto dist     = torch::softmax(masked, -1);
     const auto log_dist = torch::log_softmax(masked, -1);
     const auto log_prob = log_dist.gather(-1, action.unsqueeze(-1)).squeeze(-1);
     const auto entropy  = -(dist * log_dist).sum(-1);
+
+    // VRPO: regress Q(s,a_taken); else the scalar V. Both shape [B].
+    torch::Tensor value;
+    if constexpr (features::PRIVILEGED_Q_CRITIC) {
+        value = critic_raw.gather(-1, action.unsqueeze(-1)).squeeze(-1);
+    } else {
+        value = critic_raw.squeeze(-1);
+    }
 
     return {log_prob, log_dist, value, entropy};
 }
