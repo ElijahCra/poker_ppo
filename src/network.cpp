@@ -3,6 +3,8 @@
 
 #include <torch/torch.h>
 #include <cstdlib>
+#include <iostream>
+#include <optional>
 #include <stdexcept>
 #include <string>
 
@@ -26,6 +28,34 @@ bool critic_detaches_encoder() {
         return v == "0" || v == "false";
     }();
     return detaches;
+}
+
+// History-encoder kind: config default, overridable via env for A/B runs
+// without a rebuild. Only the ENV override is cached (read once), so every
+// network in a training process (learner, magnet, pool snapshots, BR
+// exploiter, league) agrees under an override, while tests can still
+// construct different kinds via cfg.kind in one process. A checkpoint only
+// loads under the kind it was trained with.
+HistoryEncoderKind history_encoder_kind(HistoryEncoderKind def) {
+    static const std::optional<HistoryEncoderKind> env_kind =
+        []() -> std::optional<HistoryEncoderKind> {
+        const char* e = std::getenv("POKER_PPO_HISTORY_ENCODER");
+        if (!e) return std::nullopt;
+        const std::string v(e);
+        if (v == "attn")    return HistoryEncoderKind::Attention;
+        if (v == "conv")    return HistoryEncoderKind::Conv;
+        if (v == "pool")    return HistoryEncoderKind::AttnPool;
+        if (v == "flatten") return HistoryEncoderKind::Flatten;
+        std::cerr << "[network] unknown POKER_PPO_HISTORY_ENCODER='" << v
+                  << "' (want attn|conv|pool|flatten); using config default\n";
+        return std::nullopt;
+    }();
+    return env_kind.value_or(def);
+}
+
+void xavier_lin_init(torch::nn::Linear& lin) {
+    torch::nn::init::xavier_uniform_(lin->weight);
+    torch::nn::init::constant_(lin->bias, 0.0);
 }
 }  // namespace
 
@@ -146,6 +176,138 @@ HistoryEncoderImpl::forward(const torch::Tensor& history_block) {
     return x.select(/*dim=*/1, /*index=*/0);   // CLS, [B, D]
 }
 
+// ─── ConvHistoryEncoder ──────────────────────────────────────────────────
+
+ConvHistoryEncoderImpl::ConvHistoryEncoderImpl(BetHistoryConfig hist)
+    : hist_(hist)
+{
+    const int C = hist_.attn_dim;
+    const int F = BetHistoryConfig::feat_per_action;
+
+    conv1_ = register_module("conv1", torch::nn::Conv1d(
+        torch::nn::Conv1dOptions(F, C, /*kernel=*/3).padding(1)));
+    conv2_ = register_module("conv2", torch::nn::Conv1d(
+        torch::nn::Conv1dOptions(C, C, /*kernel=*/3).padding(1)));
+
+    for (auto* conv : {&conv1_, &conv2_}) {
+        torch::nn::init::xavier_uniform_((*conv)->weight);
+        torch::nn::init::constant_((*conv)->bias, 0.0);
+    }
+}
+
+torch::Tensor
+ConvHistoryEncoderImpl::forward(const torch::Tensor& history_block) {
+    const int T = hist_.max_history_len;
+    const int F = BetHistoryConfig::feat_per_action;
+    const int64_t B = history_block.size(0);
+
+    auto mask   = history_block.narrow(1, 0, T);                    // [B, T]
+    auto tokens = history_block.narrow(1, T, T * F)
+                      .reshape({B, T, F})
+                      .transpose(1, 2);                             // [B, F, T]
+
+    auto x = torch::gelu(conv1_->forward(tokens));
+    x      = torch::gelu(conv2_->forward(x));                       // [B, C, T]
+
+    // Masked mean-pool over time. Padded positions contribute zero; the
+    // clamp keeps the empty-history (preflop-first-action) row finite.
+    auto m   = mask.unsqueeze(1);                                   // [B, 1, T]
+    auto sum = (x * m).sum(/*dim=*/-1);                             // [B, C]
+    auto cnt = m.sum(/*dim=*/-1).clamp_min(1.0);                    // [B, 1]
+    return sum / cnt;
+}
+
+// ─── AttnPoolHistoryEncoder ──────────────────────────────────────────────
+
+AttnPoolHistoryEncoderImpl::AttnPoolHistoryEncoderImpl(BetHistoryConfig hist)
+    : hist_(hist)
+{
+    const int D  = hist_.attn_dim;
+    const int H  = hist_.attn_heads;
+    const int T  = hist_.max_history_len;
+    const int F  = BetHistoryConfig::feat_per_action;
+    const int FF = hist_.ffn_mult * D;
+
+    if (D <= 0 || H <= 0 || D % H != 0) {
+        throw std::invalid_argument(
+            "BetHistoryConfig: attn_dim must be a positive multiple of attn_heads");
+    }
+
+    token_embed_ = register_module("token_embed", torch::nn::Linear(F, D));
+    pos_embed_   = register_parameter("pos_embed", torch::zeros({1, T, D}));
+    query_       = register_parameter("query",     torch::zeros({1, 1, D}));
+    torch::nn::init::normal_(pos_embed_, /*mean=*/0.0, /*std=*/0.02);
+    torch::nn::init::normal_(query_,     /*mean=*/0.0, /*std=*/0.02);
+
+    kv_ln_    = register_module("kv_ln",
+                    torch::nn::LayerNorm(torch::nn::LayerNormOptions({D})));
+    kv_proj_  = register_module("kv_proj",  torch::nn::Linear(D, 2 * D));
+    out_proj_ = register_module("out_proj", torch::nn::Linear(D, D));
+    ffn_ln_   = register_module("ffn_ln",
+                    torch::nn::LayerNorm(torch::nn::LayerNormOptions({D})));
+    ffn1_     = register_module("ffn1", torch::nn::Linear(D, FF));
+    ffn2_     = register_module("ffn2", torch::nn::Linear(FF, D));
+
+    xavier_lin_init(token_embed_);
+    xavier_lin_init(kv_proj_);
+    xavier_lin_init(out_proj_);
+    xavier_lin_init(ffn1_);
+    xavier_lin_init(ffn2_);
+}
+
+torch::Tensor
+AttnPoolHistoryEncoderImpl::forward(const torch::Tensor& history_block) {
+    const int T = hist_.max_history_len;
+    const int F = BetHistoryConfig::feat_per_action;
+    const int D = hist_.attn_dim;
+    const int H = hist_.attn_heads;
+    const int d_head = D / H;
+    const int64_t B = history_block.size(0);
+
+    auto mask   = history_block.narrow(1, 0, T);                    // [B, T]
+    auto tokens = history_block.narrow(1, T, T * F).reshape({B, T, F});
+
+    auto x = token_embed_->forward(tokens) + pos_embed_;            // [B, T, D]
+
+    auto kv       = kv_proj_->forward(kv_ln_->forward(x)).chunk(2, -1);
+    auto reshape_heads = [&](torch::Tensor t) {
+        return t.reshape({B, T, H, d_head}).transpose(1, 2);        // [B, H, T, dh]
+    };
+    auto k = reshape_heads(kv[0]);
+    auto v = reshape_heads(kv[1]);
+    auto q = query_.expand({B, 1, D})
+                 .reshape({B, 1, H, d_head}).transpose(1, 2);       // [B, H, 1, dh]
+
+    // Fully-masked rows (empty history) degrade to uniform attention over
+    // f(pos_embed) — a learned "no history yet" constant, never NaN
+    // (equal finite logits, not -inf).
+    auto add_mask = (1.0 - mask).unsqueeze(1).unsqueeze(1) * kAttentionMaskLogit;
+
+    auto out = torch::scaled_dot_product_attention(
+        q, k, v, /*attn_mask=*/add_mask, /*dropout_p=*/0.0, /*is_causal=*/false);
+
+    auto y = out_proj_->forward(
+        out.transpose(1, 2).reshape({B, D}));                       // [B, D]
+    auto f = ffn2_->forward(torch::gelu(ffn1_->forward(ffn_ln_->forward(y))));
+    return y + f;
+}
+
+// ─── FlattenHistoryEncoder ───────────────────────────────────────────────
+
+FlattenHistoryEncoderImpl::FlattenHistoryEncoderImpl(BetHistoryConfig hist)
+    : hist_(hist)
+{
+    const int in_dim = hist_.history_block_dim();
+    proj_ = register_module("proj", torch::nn::Linear(in_dim, hist_.attn_dim));
+    xavier_lin_init(proj_);
+}
+
+torch::Tensor
+FlattenHistoryEncoderImpl::forward(const torch::Tensor& history_block) {
+    // Tanh matches the trunk's activation family; the trunk does the rest.
+    return torch::tanh(proj_->forward(history_block));
+}
+
 // ─── Tower (MLP trunk + head) ────────────────────────────────────────────
 
 TowerImpl::TowerImpl(int in_dim, int output_dim,
@@ -196,9 +358,27 @@ ActorCriticImpl::ActorCriticImpl(int obs_dim, int action_count,
 
     if constexpr (features::ATTENTION_ENCODER) {
         if (hist_.enabled) {
-            encoder_ = register_module("history_encoder",
-                                       HistoryEncoder(hist_));
-            trunk_in_dim += encoder_->output_dim();
+            enc_kind_ = history_encoder_kind(hist_.kind);
+            switch (enc_kind_) {
+                case HistoryEncoderKind::Attention:
+                    encoder_ = register_module("history_encoder",
+                                               HistoryEncoder(hist_));
+                    break;
+                case HistoryEncoderKind::Conv:
+                    conv_encoder_ = register_module("history_encoder_conv",
+                                                    ConvHistoryEncoder(hist_));
+                    break;
+                case HistoryEncoderKind::AttnPool:
+                    pool_encoder_ = register_module("history_encoder_pool",
+                                                    AttnPoolHistoryEncoder(hist_));
+                    break;
+                case HistoryEncoderKind::Flatten:
+                    flat_encoder_ = register_module("history_encoder_flat",
+                                                    FlattenHistoryEncoder(hist_));
+                    break;
+            }
+            // All kinds emit [B, attn_dim].
+            trunk_in_dim += hist_.attn_dim;
         }
     }
 
@@ -218,10 +398,19 @@ ActorCriticImpl::ActorCriticImpl(int obs_dim, int action_count,
 torch::Tensor
 ActorCriticImpl::encode_history(const torch::Tensor& obs) {
     if constexpr (features::ATTENTION_ENCODER) {
-        if (hist_.enabled && !encoder_.is_empty()) {
+        if (hist_.enabled) {
             auto history_blk = obs.narrow(1, layout_.history_off,
                                           layout_.history_dim);
-            return encoder_->forward(history_blk);
+            switch (enc_kind_) {
+                case HistoryEncoderKind::Attention:
+                    return encoder_->forward(history_blk);
+                case HistoryEncoderKind::Conv:
+                    return conv_encoder_->forward(history_blk);
+                case HistoryEncoderKind::AttnPool:
+                    return pool_encoder_->forward(history_blk);
+                case HistoryEncoderKind::Flatten:
+                    return flat_encoder_->forward(history_blk);
+            }
         }
     }
     return {};
@@ -367,6 +556,24 @@ ActorCriticImpl::masked_log_probs(torch::Tensor obs, torch::Tensor legal_mask) {
     return torch::log_softmax(apply_mask(logits, legal_mask), -1);
 }
 
+void copy_actor_critic_params(const ActorCritic& src, ActorCritic& dst) {
+    torch::NoGradGuard ng;
+    auto sp = src->parameters();
+    auto dp = dst->parameters();
+    TORCH_CHECK(sp.size() == dp.size(),
+                "copy_actor_critic_params: parameter count mismatch");
+    for (size_t i = 0; i < sp.size(); ++i) {
+        dp[i].copy_(sp[i]);  // copy_ handles cross-device
+    }
+    auto sb = src->buffers();
+    auto db = dst->buffers();
+    TORCH_CHECK(sb.size() == db.size(),
+                "copy_actor_critic_params: buffer count mismatch");
+    for (size_t i = 0; i < sb.size(); ++i) {
+        db[i].copy_(sb[i]);
+    }
+}
+
 ActorCritic clone_actor_critic(const ActorCritic&  src,
                                int                 obs_dim,
                                int                 action_count,
@@ -379,22 +586,7 @@ ActorCritic clone_actor_critic(const ActorCritic&  src,
     ActorCritic dst(obs_dim, action_count, hidden_dim, num_layers,
                     hist, round_summary);
     dst->to(device);
-
-    torch::NoGradGuard ng;
-    auto sp = src->parameters();
-    auto dp = dst->parameters();
-    TORCH_CHECK(sp.size() == dp.size(),
-                "clone_actor_critic: parameter count mismatch");
-    for (size_t i = 0; i < sp.size(); ++i) {
-        dp[i].copy_(sp[i].detach().to(device));
-    }
-    auto sb = src->buffers();
-    auto db = dst->buffers();
-    TORCH_CHECK(sb.size() == db.size(),
-                "clone_actor_critic: buffer count mismatch");
-    for (size_t i = 0; i < sb.size(); ++i) {
-        db[i].copy_(sb[i].detach().to(device));
-    }
+    copy_actor_critic_params(src, dst);
     dst->eval();
     return dst;
 }

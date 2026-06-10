@@ -142,7 +142,25 @@ MBLossOut compute_mb_loss(ActorCritic&         network,
         v_loss = 0.5f * (er.value - mb_ret).pow(2).mean();
     }
 
-    auto entropy_loss = er.entropy.mean();
+    // POKER_PPO_NORM_ENTROPY=1: divide each state's entropy by ln|legal(s)|
+    // before averaging. A constant coefficient on raw entropy pushes harder
+    // toward uniform in wide-action states (max entropy spans ln2..ln14
+    // across spots); normalising equalises the pressure. OFF by default —
+    // Rudolph et al.'s 0.05–0.2 band was tuned on the raw bonus, and the
+    // normalised entropy lives in [0,1], so ent_coef needs re-centering
+    // (~2.5× higher) and a BR A/B before adopting. The env read is a
+    // static branch, so it's baked consistently into the CUDA graph.
+    static const bool norm_entropy =
+        std::getenv("POKER_PPO_NORM_ENTROPY") != nullptr;
+    torch::Tensor entropy_loss;
+    if (norm_entropy) {
+        // clamp_min(2): single-legal-action states have zero entropy
+        // anyway; this just keeps the denominator away from ln(1)=0.
+        auto max_ent = torch::log(mb_masks.sum(-1).clamp_min(2.0f));
+        entropy_loss = (er.entropy / max_ent).mean();
+    } else {
+        entropy_loss = er.entropy.mean();
+    }
 
     // MMD regularisation: KL(π_θ || ρ) per state, mean over the minibatch.
     // ρ is the magnet — a slowly-refreshed snapshot of π_θ whose log-probs
@@ -317,10 +335,10 @@ void PPOTrainer::train() {
                 global_step - last_magnet_refresh_step_
                     >= cfg_.magnet_refresh_steps) {
                 last_magnet_refresh_step_ = global_step;
-                magnet_ = clone_actor_critic(
-                    network_, collector_->obs_dim(), collector_->action_count(),
-                    cfg_.hidden_dim, cfg_.num_layers,
-                    cfg_.hist, cfg_.round_summary, device_);
+                // In place, not a fresh clone: stable parameter storage
+                // means any captured CUDA graph that reads the magnet
+                // stays valid across refreshes.
+                copy_actor_critic_params(network_, magnet_);
             }
         }
     }

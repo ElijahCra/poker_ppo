@@ -11,6 +11,19 @@
 
 namespace poker_ppo {
 
+// How the bet-history block is summarised into a [B, attn_dim] embedding.
+// All kinds share the same input layout and output width, so the trunk —
+// and everything downstream — is identical; only the encoder differs.
+// Selectable at runtime via POKER_PPO_HISTORY_ENCODER=attn|conv|pool|flatten
+// (overrides the config default; checkpoints only load under the same kind).
+//   Attention  2-block self-attention transformer, CLS readout (original).
+//   Conv       2× Conv1d(k=3) + masked mean-pool. ~1/6 the encoder FLOPs;
+//              relies on padded token slots being zero (obs builder zeroes).
+//   AttnPool   single learned query cross-attending over tokens (PMA-style):
+//              keeps content-weighted readout, drops token↔token mixing.
+//   Flatten    one Linear over the raw block — the null hypothesis.
+enum class HistoryEncoderKind : uint8_t { Attention, Conv, AttnPool, Flatten };
+
 // Bet-history attention encoder. Per-action features (F=8):
 //   0  amount / initial_stack
 //   1  amount / (2 * initial_stack)
@@ -21,8 +34,10 @@ struct BetHistoryConfig {
     static constexpr int feat_per_action = 8;
 
     bool enabled         = true;
+    HistoryEncoderKind kind = HistoryEncoderKind::Attention;
     int  max_history_len = 32;    // T
-    int  attn_dim        = 64;    // D, must be divisible by attn_heads
+    int  attn_dim        = 64;    // D (= encoder output dim for all kinds),
+                                  // must be divisible by attn_heads
     int  attn_heads      = 4;
     int  ffn_mult        = 4;
     int  num_blocks      = 1;

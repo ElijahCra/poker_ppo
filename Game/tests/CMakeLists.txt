@@ -99,6 +99,14 @@ target_link_libraries(optim_test PRIVATE
     GTest::gtest_main
 )
 
+# History-encoder variants (attn/conv/pool/flatten): shapes, masking
+# semantics, ActorCritic integration + clone.
+add_executable(history_encoder_test history_encoder_test.cpp)
+target_link_libraries(history_encoder_test PRIVATE
+    poker_ppo_lib
+    GTest::gtest_main
+)
+
 # Register with CTest so `ctest` discovers the cases automatically.
 include(GoogleTest)
 gtest_discover_tests(showdown_test)
@@ -110,3 +118,4 @@ gtest_discover_tests(mmd_test)
 gtest_discover_tests(allin_equity_test)
 gtest_discover_tests(vrpo_advantage_test)
 gtest_discover_tests(optim_test)
+gtest_discover_tests(history_encoder_test)

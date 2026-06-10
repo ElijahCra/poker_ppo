@@ -47,6 +47,65 @@ private:
 };
 TORCH_MODULE(HistoryEncoder);
 
+// Temporal-conv history encoder: 2× Conv1d(k=3) + masked mean-pool.
+// Full receptive field at T≤16, inherently positional, ~1/6 the FLOPs of
+// the transformer. Padding bleed: k=3 mixes padded slots into valid
+// positions, which is deterministic only because the obs builder zeroes
+// padded token slots — keep that invariant.
+class ConvHistoryEncoderImpl : public torch::nn::Module {
+public:
+    explicit ConvHistoryEncoderImpl(BetHistoryConfig hist);
+    torch::Tensor forward(const torch::Tensor& history_block);
+    [[nodiscard]] int output_dim() const noexcept { return hist_.attn_dim; }
+
+private:
+    BetHistoryConfig  hist_;
+    torch::nn::Conv1d conv1_{nullptr};
+    torch::nn::Conv1d conv2_{nullptr};
+};
+TORCH_MODULE(ConvHistoryEncoder);
+
+// Attention-pooling history encoder (PMA/Perceiver-style readout): one
+// learned query cross-attends over the token embeddings, then a small
+// FFN. Keeps content-weighted readout — the part of attention that
+// plausibly matters at T≤16 — at ~1/8 the cost of self-attention blocks
+// (the query side has 1 row instead of T+1).
+class AttnPoolHistoryEncoderImpl : public torch::nn::Module {
+public:
+    explicit AttnPoolHistoryEncoderImpl(BetHistoryConfig hist);
+    torch::Tensor forward(const torch::Tensor& history_block);
+    [[nodiscard]] int output_dim() const noexcept { return hist_.attn_dim; }
+
+private:
+    BetHistoryConfig hist_;
+
+    torch::nn::Linear token_embed_{nullptr};
+    torch::Tensor     pos_embed_;
+    torch::Tensor     query_;          // [1, 1, D] learned readout seed
+    torch::nn::LayerNorm kv_ln_{nullptr};
+    torch::nn::Linear kv_proj_{nullptr};
+    torch::nn::Linear out_proj_{nullptr};
+    torch::nn::LayerNorm ffn_ln_{nullptr};
+    torch::nn::Linear ffn1_{nullptr};
+    torch::nn::Linear ffn2_{nullptr};
+};
+TORCH_MODULE(AttnPoolHistoryEncoder);
+
+// Null-hypothesis encoder: one Linear over the raw history block (mask +
+// tokens, position-aligned and zero-padded). The 4×512 trunk does any
+// further mixing.
+class FlattenHistoryEncoderImpl : public torch::nn::Module {
+public:
+    explicit FlattenHistoryEncoderImpl(BetHistoryConfig hist);
+    torch::Tensor forward(const torch::Tensor& history_block);
+    [[nodiscard]] int output_dim() const noexcept { return hist_.attn_dim; }
+
+private:
+    BetHistoryConfig  hist_;
+    torch::nn::Linear proj_{nullptr};
+};
+TORCH_MODULE(FlattenHistoryEncoder);
+
 // MLP trunk + linear head. Used twice by ActorCritic so the value-loss
 // gradient doesn't flow into the actor's representation (CleanRL convention).
 // Pre-flattened input: ActorCritic does the obs slicing and (optional)
@@ -139,12 +198,23 @@ private:
     RoundSummaryConfig  round_summary_;
     ObservationLayout   layout_;
 
-    HistoryEncoder encoder_{nullptr};   // unset when hist_.enabled is false
+    // Exactly one encoder is non-null when hist_.enabled, per enc_kind_
+    // (config default, overridable via POKER_PPO_HISTORY_ENCODER).
+    HistoryEncoderKind     enc_kind_ = HistoryEncoderKind::Attention;
+    HistoryEncoder         encoder_{nullptr};
+    ConvHistoryEncoder     conv_encoder_{nullptr};
+    AttnPoolHistoryEncoder pool_encoder_{nullptr};
+    FlattenHistoryEncoder  flat_encoder_{nullptr};
     Tower actor_{nullptr};
     Tower critic_{nullptr};
 };
 
 TORCH_MODULE(ActorCritic);
+
+// In-place parameter+buffer copy between structurally identical networks.
+// Used for the magnet refresh: keeping the destination's storage stable
+// (no realloc) means captured CUDA graphs that reference it stay valid.
+void copy_actor_critic_params(const ActorCritic& src, ActorCritic& dst);
 
 // Typed deep copy. libtorch's Module::clone() returns a base Module and
 // needs param re-registration, which the pool and the BR evaluator both
