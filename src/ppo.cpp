@@ -83,9 +83,8 @@ PPOTrainer::PPOTrainer(IPokerEnvironmentFactory& env_factory,
                            cfg_.hist, cfg_.round_summary);
     network_->to(device_);
 
-    optimizer_ = std::make_unique<torch::optim::Adam>(
-        network_->parameters(),
-        torch::optim::AdamOptions(cfg_.learning_rate));
+    optimizer_ = std::make_unique<ForeachAdam>(
+        network_->parameters(), cfg_.learning_rate);
 
     opp_mgr_ = std::make_unique<OpponentManager>(
         cfg_.opp_pool, obs_dim, action_count,
@@ -124,8 +123,7 @@ void PPOTrainer::train() {
             const float frac = 1.0f - static_cast<float>(update_idx_) / total_updates;
             constexpr float floor_frac = cfg_.min_lr_frac > 0.0f ? cfg_.min_lr_frac : 0.0f;
             const float lr = cfg_.learning_rate * std::max(frac, floor_frac);
-            for (auto& pg : optimizer_->param_groups())
-                static_cast<torch::optim::AdamOptions&>(pg.options()).lr(lr);
+            optimizer_->set_lr(lr);
         }
 
         using clock = std::chrono::steady_clock;
@@ -300,6 +298,19 @@ PPOTrainer::UpdateStats PPOTrainer::update() {
     auto& b_val     = batch.values;
     auto& b_masks   = batch.legal_masks;
 
+    // MMD magnet log-probs for the whole batch, computed once. The magnet
+    // is frozen for the duration of an update, so the per-minibatch values
+    // are just rows of this table — recomputing the magnet forward in all
+    // update_epochs × num_minibatches loop bodies was pure waste. [B, A],
+    // fp32 (log_softmax stays fp32 under autocast).
+    torch::Tensor magnet_logp_all;
+    if constexpr (cfg_.kl_coef > 0.0f) {
+        torch::NoGradGuard ng;
+        if (use_amp) set_update_autocast(true);
+        magnet_logp_all = magnet_->masked_log_probs(b_obs, b_masks);
+        if (use_amp) set_update_autocast(false);
+    }
+
     auto stat_opts = torch::TensorOptions().dtype(torch::kFloat32).device(device_);
     auto total_policy_loss = torch::zeros({}, stat_opts);
     auto total_value_loss  = torch::zeros({}, stat_opts);
@@ -385,11 +396,7 @@ PPOTrainer::UpdateStats PPOTrainer::update() {
             // from the binary when `cfg_.kl_coef == 0` (vanilla PPO).
             torch::Tensor mmd_kl_loss;
             if constexpr (cfg_.kl_coef > 0.0f) {
-                torch::Tensor magnet_log_probs;
-                {
-                    torch::NoGradGuard ng;
-                    magnet_log_probs = magnet_->masked_log_probs(mb_obs, mb_masks);
-                }
+                auto magnet_log_probs = magnet_logp_all.index_select(0, mb_idx);
                 // KL(π || ρ) = Σ_a π(a) (log π(a) − log ρ(a)).
                 // Use exp(log π) for the weight rather than a separate
                 // softmax — keeps gradients flowing through the same
@@ -413,7 +420,7 @@ PPOTrainer::UpdateStats PPOTrainer::update() {
 
             optimizer_->zero_grad();
             loss.backward();
-            torch::nn::utils::clip_grad_norm_(network_->parameters(), cfg_.max_grad_norm);
+            foreach_clip_grad_norm(optimizer_->params(), cfg_.max_grad_norm);
             optimizer_->step();
 
             // Accumulate on device; one .item() sync after the loop.

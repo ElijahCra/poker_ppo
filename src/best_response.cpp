@@ -42,9 +42,9 @@ void BestResponseEvaluator::init_exploiter() {
     exploiter_ = ActorCritic(obs_dim_, action_count_, hidden_dim_, num_layers_,
                              hist_, round_summary_);
     exploiter_->to(device_);
-    optimizer_ = std::make_unique<torch::optim::Adam>(
-        exploiter_->parameters(),
-        torch::optim::AdamOptions(cfg_.learning_rate).eps(1e-5));
+    optimizer_ = std::make_unique<ForeachAdam>(
+        exploiter_->parameters(), cfg_.learning_rate,
+        /*beta1=*/0.9, /*beta2=*/0.999, /*eps=*/1e-5);
 }
 
 // evaluate
@@ -326,8 +326,7 @@ BestResponseEvaluator::run_one_seed(ActorCritic& frozen_target) {
 
                 optimizer_->zero_grad();
                 loss.backward();
-                torch::nn::utils::clip_grad_norm_(
-                    exploiter_->parameters(), cfg_.max_grad_norm);
+                foreach_clip_grad_norm(optimizer_->params(), cfg_.max_grad_norm);
                 optimizer_->step();
             }
         }

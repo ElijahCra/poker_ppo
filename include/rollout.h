@@ -24,6 +24,10 @@
 #include <utility>
 #include <vector>
 
+namespace at::cuda {
+struct CUDAGraph;  // avoid pulling CUDA headers into every consumer
+}
+
 namespace poker_ppo {
 
 class OpponentManager;
@@ -359,6 +363,16 @@ public:
 private:
     void ensure_step_pool();
 
+    // Lazily capture `network`'s get_action forward into a CUDA graph with
+    // static input/output buffers (g_*). The 128 per-step forwards are tiny
+    // (B = num_envs) and dominated by kernel-launch overhead — replaying
+    // one pre-built graph collapses ~70 launches into 1. Returns true when
+    // the graph is ready for this network; false → eager path (CPU device,
+    // POKER_PPO_NO_CUDA_GRAPH set, capture failed, or different network).
+    // In-place optimiser updates keep parameter storage stable, so one
+    // capture stays valid across training updates.
+    bool ensure_cuda_graph(ActorCritic& network);
+
     torch::Device                   device_;
     int                             num_envs_;
     int                             num_steps_;
@@ -367,6 +381,18 @@ private:
     std::unique_ptr<VectorizedEnv>  vec_env_;
     std::unique_ptr<RolloutBuffer>  buffer_;
     std::unique_ptr<StepThreadPool> step_pool_;
+
+    // CUDA-graphed inference state. graph_net_ keys the capture to one
+    // ActorCriticImpl — a different network falls back to eager.
+    enum class GraphState { Unset, Ready, Failed };
+    GraphState                            graph_state_ = GraphState::Unset;
+    const void*                           graph_net_   = nullptr;
+    std::unique_ptr<at::cuda::CUDAGraph>  graph_;
+    torch::Tensor g_obs_, g_mask_;  // static inputs
+    // Static output: [4, N] fp32 {action, log_prob, value, v_bar} packed
+    // in-graph so each step pays a single D2H copy (into packed_pin_).
+    torch::Tensor g_packed_;
+    torch::Tensor packed_pin_;      // [4, N] pinned CPU staging
 
     // Opt-in phase profiling (POKER_PPO_PROFILE). Indexed by Strategy so a
     // serial/threadpool A/B keeps the two breakdowns separate.

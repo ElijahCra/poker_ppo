@@ -36,6 +36,7 @@ find_package(Torch REQUIRED)
 # ── PPO library ───────────────────────────────────────────────────────────────
 add_library(poker_ppo_lib
     src/network.cpp
+    src/optim.cpp
     src/ppo.cpp
     src/rollout.cpp
     src/poker_env.cpp

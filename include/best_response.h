@@ -7,6 +7,7 @@
 #include "config.h"
 #include "environment.h"
 #include "network.h"
+#include "optim.h"
 #include "rollout.h"
 
 #include <torch/torch.h>
@@ -87,7 +88,7 @@ private:
     torch::Device             device_;
 
     ActorCritic                                        exploiter_{nullptr};
-    std::unique_ptr<torch::optim::Adam>                optimizer_;
+    std::unique_ptr<ForeachAdam>                       optimizer_;
     std::unique_ptr<RolloutBuffer>                     buffer_;
     std::vector<std::unique_ptr<IPokerEnvironment>>    envs_;
 

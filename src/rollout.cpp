@@ -2,6 +2,11 @@
 
 #include "opponent_manager.h"
 
+#include <ATen/autocast_mode.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <ATen/cuda/CUDAGraph.h>
+#include <c10/cuda/CUDAGuard.h>
+
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
@@ -238,6 +243,18 @@ void print_profile(const char* name, const RolloutProfile& p) {
     std::cout.unsetf(std::ios::fixed);
 }
 
+// {action, log_prob, value, v_bar} as one [4, B] fp32 tensor — a single
+// D2H round trip per step instead of four. Action indices are < the action
+// count (≪ 2^24), so the float32 round trip is exact. The explicit fp32
+// casts are no-ops in eager fp32 but required under bf16 autocast capture
+// (critic outputs come back bf16 there).
+torch::Tensor pack_action_result(const ActorCriticImpl::ActionResult& ar) {
+    return torch::stack({ar.action.to(torch::kFloat32),
+                         ar.log_prob.to(torch::kFloat32),
+                         ar.value.to(torch::kFloat32),
+                         ar.v_bar.to(torch::kFloat32)}, 0);
+}
+
 struct BootstrapTensors {
     torch::Tensor values;     // [2, N] float32 CPU
     torch::Tensor terminal;   // [2, N] float32 CPU
@@ -310,14 +327,88 @@ void RolloutCollector::ensure_step_pool() {
     step_pool_   = std::make_unique<StepThreadPool>(n);
 }
 
+bool RolloutCollector::ensure_cuda_graph(ActorCritic& network) {
+    if (!device_.is_cuda()) return false;
+    if (std::getenv("POKER_PPO_NO_CUDA_GRAPH") != nullptr) return false;
+    if (graph_state_ == GraphState::Failed) return false;
+    if (graph_state_ == GraphState::Ready) {
+        // One capture per network; pool snapshots / exploiters run eager.
+        return graph_net_ == static_cast<const void*>(network.get());
+    }
+
+    graph_net_ = network.get();
+    try {
+        const int N = num_envs_;
+        const int D = vec_env_->obs_dim();
+        const int A = vec_env_->action_count();
+        auto f_dev = torch::TensorOptions().dtype(torch::kFloat32).device(device_);
+
+        // Static inputs, allocated from the regular pool before capture.
+        // All-ones mask = every action legal; shapes are all capture needs.
+        g_obs_  = torch::zeros({N, D}, f_dev);
+        g_mask_ = torch::ones({N, A}, f_dev);
+
+        // bf16 autocast inside the graph: same numerics regime the update
+        // already runs in. The autocast CACHE must be off during capture —
+        // a cached bf16 weight cast from warmup would be baked in as a
+        // stale constant, while uncached casts are recorded as kernels
+        // that re-read the live fp32 weights on every replay (the
+        // torch.cuda.make_graphed_callables rule).
+        const bool graph_amp =
+            std::getenv("POKER_PPO_NO_GRAPH_AMP") == nullptr;
+        auto set_amp = [](bool on) {
+            at::autocast::set_autocast_enabled(at::kCUDA, on);
+            if (on) at::autocast::set_autocast_dtype(at::kCUDA, at::kBFloat16);
+            at::autocast::set_autocast_cache_enabled(!on);
+        };
+
+        // Capture must run on a non-default stream; warmup on the same
+        // stream first so cuBLAS handles + workspaces exist before the
+        // capture window (allocating them inside capture is illegal).
+        auto stream = at::cuda::getStreamFromPool();
+        {
+            c10::cuda::CUDAStreamGuard guard(stream);
+            if (graph_amp) set_amp(true);
+            for (int i = 0; i < 3; ++i) {
+                (void)pack_action_result(network->get_action(g_obs_, g_mask_));
+            }
+            at::cuda::getCurrentCUDAStream().synchronize();
+
+            graph_ = std::make_unique<at::cuda::CUDAGraph>();
+            graph_->capture_begin();
+            // Packed output storage lives in the graph's private pool;
+            // each replay rewrites it in place.
+            g_packed_ = pack_action_result(network->get_action(g_obs_, g_mask_));
+            graph_->capture_end();
+            if (graph_amp) set_amp(false);
+        }
+        torch::cuda::synchronize();
+        graph_state_ = GraphState::Ready;
+        std::cout << "[rollout] CUDA-graphed inference forward "
+                  << "(POKER_PPO_NO_CUDA_GRAPH=1 disables)\n";
+        return true;
+    } catch (const std::exception& e) {
+        std::cerr << "[rollout] CUDA graph capture failed, eager fallback: "
+                  << e.what() << "\n";
+        // Capture may have died inside the autocast window — restore.
+        at::autocast::set_autocast_enabled(at::kCUDA, false);
+        at::autocast::set_autocast_cache_enabled(true);
+        graph_.reset();
+        g_obs_ = g_mask_ = g_packed_ = torch::Tensor();
+        graph_state_ = GraphState::Failed;
+        return false;
+    }
+}
+
 void RolloutCollector::init_carry() {
     const int D = vec_env_->obs_dim();
     const int A = vec_env_->action_count();
     auto f_cpu   = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
     auto i32_cpu = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU);
+    auto f_pin   = f_cpu.pinned_memory(device_.is_cuda());
 
-    carry_obs_            = torch::zeros({num_envs_, D}, f_cpu);
-    carry_legal_mask_     = torch::zeros({num_envs_, A}, f_cpu);
+    carry_obs_            = torch::zeros({num_envs_, D}, f_pin);
+    carry_legal_mask_     = torch::zeros({num_envs_, A}, f_pin);
     carry_current_player_ = torch::zeros({num_envs_},    i32_cpu);
     carry_done_           = torch::zeros({num_envs_},    f_cpu);
 
@@ -344,6 +435,7 @@ void RolloutCollector::collect(Strategy         strategy,
     torch::NoGradGuard no_grad;
 
     if (strategy == Strategy::Threadpool) ensure_step_pool();
+    const bool use_graph = ensure_cuda_graph(network);
 
     // Opt-in phase profiling. `prof` aggregates across rollouts for this
     // strategy; `total` brackets the whole collect() call.
@@ -359,8 +451,13 @@ void RolloutCollector::collect(Strategy         strategy,
     const int D = vec_env_->obs_dim();
     const int A = vec_env_->action_count();
 
-    auto f_cpu   = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
     auto i32_cpu = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU);
+    // Pinned staging for the per-step obs/mask: H2D from pinned memory is a
+    // single DMA instead of a pageable→staging→device double copy. The
+    // caching host allocator makes the per-step alloc cheap after warmup,
+    // and tracks the in-flight non_blocking upload before reusing a block.
+    auto f_pin = torch::TensorOptions().dtype(torch::kFloat32)
+                     .device(torch::kCPU).pinned_memory(device_.is_cuda());
 
     // Seed from carry_done_ so the first transition after a previous-
     // rollout reset carries the new-episode marker.
@@ -385,21 +482,47 @@ void RolloutCollector::collect(Strategy         strategy,
 
     std::vector<uint8_t> did_reset(N, 0);
 
+    // Pinned staging for the packed step outputs (reused across steps;
+    // fully consumed before the next step overwrites it).
+    if (!packed_pin_.defined()) {
+        packed_pin_ = torch::zeros({4, N}, f_pin);
+    }
+
     for (int step = 0; step < num_steps_; ++step) {
         PhaseTimer pt(profiling_, cuda);
 
-        cur_obs  = cur_obs_cpu.to(device_);
-        cur_mask = cur_mask_cpu.to(device_);
-        pt.lap(prof.h2d_ms);
+        // One full-batch forward per step regardless of strategy. Graph
+        // path: refill the static buffers, replay; the packed output lands
+        // in g_packed_. Eager path: plain upload + forward + pack.
+        // non_blocking is safe either way: the forward is queued on the
+        // same stream, and cur_obs_cpu / cur_mask_cpu stay alive and
+        // unwritten for the rest of the step.
+        torch::Tensor packed_dev;
+        if (use_graph) {
+            g_obs_ .copy_(cur_obs_cpu,  /*non_blocking=*/true);
+            g_mask_.copy_(cur_mask_cpu, /*non_blocking=*/true);
+            cur_obs  = g_obs_;
+            cur_mask = g_mask_;
+            pt.lap(prof.h2d_ms);
 
-        // One full-batch forward per step regardless of strategy.
-        auto ar = network->get_action(cur_obs, cur_mask);
-        pt.lap(prof.infer_ms);
+            graph_->replay();
+            packed_dev = g_packed_;
+            pt.lap(prof.infer_ms);
+        } else {
+            cur_obs  = cur_obs_cpu.to(device_, /*non_blocking=*/true);
+            cur_mask = cur_mask_cpu.to(device_, /*non_blocking=*/true);
+            pt.lap(prof.h2d_ms);
 
-        auto actions_cpu = ar.action.to(torch::kCPU).contiguous();
-        auto logp_cpu    = ar.log_prob.to(torch::kCPU).contiguous();
-        auto value_cpu   = ar.value.to(torch::kCPU).contiguous();
-        auto vbar_cpu    = ar.v_bar.to(torch::kCPU).contiguous();
+            packed_dev = pack_action_result(network->get_action(cur_obs, cur_mask));
+            pt.lap(prof.infer_ms);
+        }
+
+        // One packed D2H round trip for everything the step needs back on
+        // the host. The blocking copy_ into pinned staging is the step's
+        // single sync point. The override API mutates an int64 tensor in
+        // place, so peel actions off as a (cheap, host-side) cast.
+        packed_pin_.copy_(packed_dev, /*non_blocking=*/false);
+        auto actions_cpu = packed_pin_[0].to(torch::kInt64);
         pt.lap(prof.d2h_ms);
 
         opp_mgr.apply_action_overrides(
@@ -407,13 +530,11 @@ void RolloutCollector::collect(Strategy         strategy,
         pt.lap(prof.overrides_ms);
 
         auto a_acc  = actions_cpu.accessor<int64_t, 1>();
-        auto lp_acc = logp_cpu.accessor<float, 1>();
-        auto v_acc  = value_cpu.accessor<float, 1>();
-        auto vb_acc = vbar_cpu.accessor<float, 1>();
+        auto pk_acc = packed_pin_.accessor<float, 2>();  // [4,N]: a, logp, Q, V̄
         auto cp_acc = cur_player_cpu.accessor<int32_t, 1>();
 
-        auto next_obs    = torch::zeros({N, D}, f_cpu);
-        auto next_mask   = torch::zeros({N, A}, f_cpu);
+        auto next_obs    = torch::zeros({N, D}, f_pin);
+        auto next_mask   = torch::zeros({N, A}, f_pin);
         auto next_player = torch::zeros({N},    i32_cpu);
         auto np_acc      = next_player.accessor<int32_t, 1>();
 
@@ -429,7 +550,7 @@ void RolloutCollector::collect(Strategy         strategy,
                 player_state[i].record_step(
                     acting, i, *buffer_,
                     cur_obs_cpu[i], cur_mask_cpu[i],
-                    a_acc[i], lp_acc[i], v_acc[i], vb_acc[i]);
+                    a_acc[i], pk_acc[1][i], pk_acc[2][i], pk_acc[3][i]);
             }
 
             auto res = envs[i]->step(static_cast<int>(a_acc[i]));
@@ -480,8 +601,8 @@ void RolloutCollector::collect(Strategy         strategy,
 
     // Bootstrap V̄(carry_obs) needs the final state + mask on the device;
     // upload the carried CPU tensors once (current_player stays on the CPU).
-    cur_obs  = cur_obs_cpu.to(device_);
-    cur_mask = cur_mask_cpu.to(device_);
+    cur_obs  = cur_obs_cpu.to(device_, /*non_blocking=*/true);
+    cur_mask = cur_mask_cpu.to(device_, /*non_blocking=*/true);
     auto bootstrap = build_bootstrap(network, cur_obs, cur_mask,
                                      cur_player_cpu, player_state);
     buffer_->compute_returns(gamma, gae_lambda,

@@ -321,7 +321,6 @@ ActorCriticImpl::get_action(torch::Tensor obs, torch::Tensor legal_mask) {
 
     auto log_dist = torch::log_softmax(masked, -1);
     auto log_prob = log_dist.gather(-1, action.unsqueeze(-1)).squeeze(-1);
-    auto entropy  = -(dist * log_dist).sum(-1);
 
     torch::Tensor value, v_bar;
     if constexpr (features::PRIVILEGED_Q_CRITIC) {
@@ -333,7 +332,7 @@ ActorCriticImpl::get_action(torch::Tensor obs, torch::Tensor legal_mask) {
         v_bar = value;
     }
 
-    return {action, log_prob, value, v_bar, entropy};
+    return {action, log_prob, value, v_bar};
 }
 
 ActorCriticImpl::EvalResult

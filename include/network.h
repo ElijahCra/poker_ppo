@@ -96,7 +96,6 @@ public:
         torch::Tensor log_prob;  // [B]
         torch::Tensor value;     // [B]  VRPO: Q(s,a_taken); else V(s)
         torch::Tensor v_bar;     // [B]  VRPO: Σ_a π(a|s)Q(s,a); else == value
-        torch::Tensor entropy;   // [B]
     };
     ActionResult get_action(torch::Tensor obs, torch::Tensor legal_mask);
 

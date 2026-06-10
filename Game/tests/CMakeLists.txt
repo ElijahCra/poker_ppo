@@ -91,6 +91,14 @@ target_link_libraries(vrpo_advantage_test PRIVATE
     GTest::gtest_main
 )
 
+# ForeachAdam / foreach_clip_grad_norm equivalence vs torch::optim::Adam +
+# torch::nn::utils::clip_grad_norm_. Needs poker_ppo_lib for optim.cpp.
+add_executable(optim_test optim_test.cpp)
+target_link_libraries(optim_test PRIVATE
+    poker_ppo_lib
+    GTest::gtest_main
+)
+
 # Register with CTest so `ctest` discovers the cases automatically.
 include(GoogleTest)
 gtest_discover_tests(showdown_test)
@@ -101,3 +109,4 @@ gtest_discover_tests(hand_strength_test)
 gtest_discover_tests(mmd_test)
 gtest_discover_tests(allin_equity_test)
 gtest_discover_tests(vrpo_advantage_test)
+gtest_discover_tests(optim_test)

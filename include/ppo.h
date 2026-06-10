@@ -8,6 +8,7 @@
 #include "config.h"
 #include "environment.h"
 #include "network.h"
+#include "optim.h"
 #include "rollout.h"
 
 #include <torch/torch.h>
@@ -106,7 +107,7 @@ private:
     int num_envs_;
 
     ActorCritic                          network_;
-    std::unique_ptr<torch::optim::Adam>  optimizer_;
+    std::unique_ptr<ForeachAdam>         optimizer_;
     std::unique_ptr<RolloutCollector>    collector_;
     std::unique_ptr<OpponentManager>     opp_mgr_;
 
