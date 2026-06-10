@@ -438,7 +438,6 @@ void RolloutCollector::init_carry() {
 void RolloutCollector::collect(Strategy         strategy,
                                ActorCritic&     network,
                                OpponentManager& opp_mgr,
-                               int              update_idx,
                                float            gamma,
                                float            gae_lambda)
 {
@@ -458,7 +457,7 @@ void RolloutCollector::collect(Strategy         strategy,
     PhaseTimer total(profiling_, cuda);
 
     buffer_->clear();
-    opp_mgr.prepare_rollout(update_idx);
+    opp_mgr.prepare_rollout(global_step_);
 
     auto& envs = vec_env_->envs_mut();
     const int N = num_envs_;
@@ -598,7 +597,7 @@ void RolloutCollector::collect(Strategy         strategy,
 
         // Serial: opp_mgr's RNG isn't thread-safe.
         for (int i = 0; i < N; ++i) {
-            if (did_reset[i]) opp_mgr.on_episode_terminal(i, update_idx);
+            if (did_reset[i]) opp_mgr.on_episode_terminal(i, global_step_);
         }
         pt.lap(prof.terminal_rng_ms);
 

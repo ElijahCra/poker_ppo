@@ -135,7 +135,8 @@ private:
     // (vanilla self-play PPO; the regulariser is bypassed entirely).
     ActorCritic                          magnet_{nullptr};
 
-    int update_idx_ = 0;
+    int     update_idx_              = 0;
+    int64_t last_magnet_refresh_step_ = 0;
 
     // CUDA-graphed minibatch step (see ensure_update_graph).
     enum class UGraphState { Unset, Ready, Failed };

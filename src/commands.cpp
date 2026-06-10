@@ -57,7 +57,12 @@ int cmd_train(IPokerEnvironmentFactory& factory,
 
     // League/BR run synchronously — wall-clock cost shows up as gaps
     // between [update K] lines, not added to rollout/update timings.
-    constexpr int snapshot_every = 200;
+    // Cadences are in env steps so they survive batch-shape changes;
+    // interval-crossing (not modulo) since global_step rarely lands on
+    // exact multiples.
+    constexpr int64_t league_eval_every_steps = 2'457'600;
+    int64_t last_league_eval_step = 0;
+    int64_t last_br_eval_step     = 0;
 
     const BestResponseConfig& br_cfg = config::kBRConfig;
 
@@ -70,7 +75,7 @@ int cmd_train(IPokerEnvironmentFactory& factory,
             ppo_cfg.hist, ppo_cfg.round_summary,
             br_cfg, device);
         std::cout << "Best-response evaluator: ON  (every "
-                  << br_cfg.eval_every << " updates, "
+                  << br_cfg.eval_every_steps << " env steps, "
                   << br_cfg.num_exploiter_seeds << " seeds × "
                   << br_cfg.updates_per_eval << " exploiter updates, "
                   << br_cfg.eval_hands << "-hand eval match)\n";
@@ -111,7 +116,9 @@ int cmd_train(IPokerEnvironmentFactory& factory,
                       << std::defaultfloat << std::setprecision(6);
         }
 
-        if (s.update > 0 && s.update % snapshot_every == 0) {
+        if (s.update > 0 &&
+            s.global_step - last_league_eval_step >= league_eval_every_steps) {
+            last_league_eval_step = s.global_step;
             using clock = std::chrono::steady_clock;
             using ms    = std::chrono::duration<double, std::milli>;
 
@@ -161,7 +168,9 @@ int cmd_train(IPokerEnvironmentFactory& factory,
             std::cout << "\n";
         }
 
-        if (br_eval && s.update > 0 && s.update % br_cfg.eval_every == 0) {
+        if (br_eval && s.update > 0 &&
+            s.global_step - last_br_eval_step >= br_cfg.eval_every_steps) {
+            last_br_eval_step = s.global_step;
             auto br_result = br_eval->evaluate(
                 trainer.network(), s.update, s.global_step);
             metrics.log_best_response(br_result);

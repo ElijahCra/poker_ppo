@@ -127,22 +127,22 @@ void OpponentManager::reset_assignments(int num_envs) {
     opp_id_.assign(num_envs, 0);
 }
 
-void OpponentManager::prepare_rollout(int update_idx) {
+void OpponentManager::prepare_rollout(int64_t global_step) {
     rollout_pool_ids_.clear();
     if (!pool_ || pool_->empty()) return;
-    if (update_idx < cfg_.warmup_updates) return;
+    if (global_step < cfg_.warmup_steps) return;
 
     const int n = std::max(1, cfg_.max_unique_per_rollout);
     rollout_pool_ids_ = pool_->sample_ids(n);
 }
 
-void OpponentManager::on_episode_terminal(int env_idx, int update_idx) {
+void OpponentManager::on_episode_terminal(int env_idx, int64_t global_step) {
     // Default: pure self-play.
     learner_seat_[env_idx] = 0;
     opp_id_[env_idx]       = 0;
 
     if (!pool_ || pool_->empty()) return;
-    if (update_idx < cfg_.warmup_updates) return;
+    if (global_step < cfg_.warmup_steps) return;
 
     std::uniform_real_distribution<float> u01(0.0f, 1.0f);
     if (u01(episode_rng_) >= cfg_.p_use_pool) return;
@@ -214,15 +214,18 @@ void OpponentManager::apply_action_overrides(
     }
 }
 
-void OpponentManager::maybe_snapshot(int update_idx,
+void OpponentManager::maybe_snapshot(int64_t global_step,
                                      const ActorCritic& network) {
     if (!pool_) return;
-    if (cfg_.snapshot_every <= 0) return;
-    if (update_idx <= 0) return;
+    if (cfg_.snapshot_every_steps <= 0) return;
+    if (global_step <= 0) return;
     // Pre-warmup snapshots are near-random and dilute the gradient signal
     // once we start sampling from them.
-    if (update_idx < cfg_.warmup_updates) return;
-    if (update_idx % cfg_.snapshot_every != 0) return;
+    if (global_step < cfg_.warmup_steps) return;
+    // Interval-crossing rather than modulo: robust to any batch shape
+    // (global_step rarely lands on exact multiples of the interval).
+    if (global_step - last_snapshot_step_ < cfg_.snapshot_every_steps) return;
+    last_snapshot_step_ = global_step;
     [[maybe_unused]] const auto _ = pool_->add_snapshot(network);
 }
 

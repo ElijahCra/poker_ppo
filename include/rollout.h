@@ -345,12 +345,11 @@ public:
     void init_carry();
 
     // One rollout: fill buffer, bootstrap, compute returns, update carry,
-    // advance global_step_. update_idx is forwarded to opp_mgr for warmup
-    // and snapshot cadence.
+    // advance global_step_. global_step_ is forwarded to opp_mgr for its
+    // step-denominated warmup/snapshot cadences.
     void collect(Strategy           strategy,
                  ActorCritic&       network,
                  OpponentManager&   opp_mgr,
-                 int                update_idx,
                  float              gamma,
                  float              gae_lambda);
 

@@ -281,7 +281,7 @@ void PPOTrainer::train() {
         auto t0 = clock::now();
         at::set_num_threads(1);
         collector_->collect(strategy_, network_, *opp_mgr_,
-                            update_idx_, cfg_.gamma, cfg_.gae_lambda);
+                            cfg_.gamma, cfg_.gae_lambda);
         auto t1 = clock::now();
         at::set_num_threads(std::thread::hardware_concurrency());
         auto stats = update();
@@ -304,15 +304,19 @@ void PPOTrainer::train() {
             std::cout << "\n" << std::defaultfloat << std::setprecision(6);
         }
 
-        opp_mgr_->maybe_snapshot(update_idx_, network_);
+        const int64_t global_step = collector_->global_step();
+        opp_mgr_->maybe_snapshot(global_step, network_);
 
-        // Refresh the MMD magnet on cadence. Slow refresh = strong
-        // anchoring (drives π_θ toward older self); fast refresh =
-        // weak anchoring (closer to vanilla PPO). Sokota 2023's grid
-        // landed at K ≈ 100, the default in config.h.
+        // Refresh the MMD magnet on cadence (env steps — invariant to
+        // batch shape). Slow refresh = strong anchoring (drives π_θ
+        // toward older self); fast refresh = weak anchoring (closer to
+        // vanilla PPO). Sokota 2023's grid landed at K ≈ 100 updates of
+        // the original 12,288-step batch — see config.h.
         if constexpr (cfg_.kl_coef > 0.0f) {
-            const int K = std::max(1, cfg_.magnet_update_every);
-            if (update_idx_ > 0 && update_idx_ % K == 0) {
+            if (cfg_.magnet_refresh_steps > 0 &&
+                global_step - last_magnet_refresh_step_
+                    >= cfg_.magnet_refresh_steps) {
+                last_magnet_refresh_step_ = global_step;
                 magnet_ = clone_actor_critic(
                     network_, collector_->obs_dim(), collector_->action_count(),
                     cfg_.hidden_dim, cfg_.num_layers,
@@ -324,12 +328,12 @@ void PPOTrainer::train() {
 
 void PPOTrainer::collect_rollout_serial() {
     collector_->collect(Strategy::Serial, network_, *opp_mgr_,
-                        update_idx_, cfg_.gamma, cfg_.gae_lambda);
+                        cfg_.gamma, cfg_.gae_lambda);
 }
 
 void PPOTrainer::collect_rollout_threadpool() {
     collector_->collect(Strategy::Threadpool, network_, *opp_mgr_,
-                        update_idx_, cfg_.gamma, cfg_.gae_lambda);
+                        cfg_.gamma, cfg_.gae_lambda);
 }
 
 PPOTrainer::BenchmarkResult

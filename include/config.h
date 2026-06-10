@@ -52,11 +52,13 @@ struct RoundSummaryConfig {
 };
 
 // Reservoir-sampled past-policy snapshots for self-play stabilisation.
+// Cadences are in ENVIRONMENT STEPS (global_step), not updates, so they
+// survive batch-shape changes (num_envs/num_steps) unchanged.
 struct OpponentPoolConfig {
     bool     enabled                = false;
     int      max_size               = 20;
-    int      snapshot_every         = 200;
-    int      warmup_updates         = 200;
+    int64_t  snapshot_every_steps   = 2'457'600;   // ≈200 updates @ 12,288-step batches
+    int64_t  warmup_steps           = 2'457'600;
     float    p_use_pool             = 0.5f;
     // Cap on distinct snapshots used per rollout — bounds inference cost.
     int      max_unique_per_rollout = 1;
@@ -104,14 +106,16 @@ struct PPOConfig {
     // vanilla self-play PPO into Magnetic Mirror Descent — a regularised
     // PG method with last-iterate Nash convergence guarantees in the
     // tabular case (and empirically in the deep variant). Cheap to add:
-    // one extra forward pass per minibatch through the magnet network +
-    // a clone of the policy every `magnet_update_every` updates.
+    // one full-batch magnet forward per update (precomputed log-probs) +
+    // a clone of the policy every `magnet_refresh_steps` env steps.
     //
     // 0.05 is the value Sokota 2023 found best-on-average; the sweep
     // range was [2^-3..2^3] × that. Set kl_coef = 0 to disable (recovers
     // vanilla self-play PPO bit-for-bit).
     float kl_coef             = 0.05f;
-    int   magnet_update_every = 100;  // updates between magnet refreshes
+    // Env steps between magnet refreshes. Sokota 2023's grid landed at
+    // K ≈ 100 updates at the original 12,288-step batch ⇒ ≈1.23M steps.
+    int64_t magnet_refresh_steps = 1'228'800;
 
     constexpr int batch_size()     const noexcept { return num_envs * num_steps; }
     constexpr int minibatch_size() const noexcept { return batch_size() / num_minibatches; }
@@ -145,7 +149,10 @@ struct PokerConfig {
 // Approximate best-response evaluator. See best_response.h.
 struct BestResponseConfig {
     bool  enabled            = false;
-    int   eval_every         = 1000;
+    // Env steps between evals (batch-shape-invariant). updates_per_eval
+    // stays in (exploiter) updates — the exploiter has its own fixed
+    // num_envs/num_steps, independent of the learner's batch shape.
+    int64_t eval_every_steps = 12'288'000;  // ≈1000 updates @ 12,288-step batches
     int   updates_per_eval   = 200;
 
     int   num_envs           = 32;
@@ -214,10 +221,17 @@ static constexpr PPOConfig kPPOConfig{
     .anneal_ent_coef  = false,
     .ent_coef_min     = 0.1f,
 
-    .num_envs         = 96,
+    // 384 envs: rollout-throughput knee from the num_envs sweep (~2.2× the
+    // 96-env µs/sample pre-CUDA-graph; still the knee after). minibatch
+    // SIZE stays 3072 (num_minibatches scales with the batch), so gradient
+    // noise scale, optimizer steps per sample, and the update CUDA graph's
+    // captured shape are all unchanged — the batch-shape change only means
+    // 4× more on-policy data per policy version. All schedule-like config
+    // is denominated in env steps, so cadences are unaffected.
+    .num_envs         = 384,
     .num_steps        = 128,
     .update_epochs    = 4,
-    .num_minibatches  = 4,
+    .num_minibatches  = 16,
 
     .total_timesteps  = 600'000'000,
 
@@ -238,8 +252,10 @@ static constexpr PPOConfig kPPOConfig{
     .opp_pool         = OpponentPoolConfig{
         .enabled                 = true,
         .max_size                = 20,
-        .snapshot_every          = 200,
-        .warmup_updates          = 400,
+        // ≈ the old 200-update snapshot / 400-update warmup cadence at the
+        // original 12,288-step batch.
+        .snapshot_every_steps    = 2'457'600,
+        .warmup_steps            = 4'915'200,
         .p_use_pool              = 0.05f,
         .max_unique_per_rollout  = 4,
         .seed                    = 0,
@@ -248,7 +264,9 @@ static constexpr PPOConfig kPPOConfig{
 
 static constexpr BestResponseConfig kBRConfig{
     .enabled            = true,
-    .eval_every         = 3000,    // less frequent → cheaper overall, deeper per eval
+    // ≈ the old 3000-update cadence at the original 12,288-step batch:
+    // less frequent → cheaper overall, deeper per eval.
+    .eval_every_steps   = 36'864'000,
     .updates_per_eval   = 3000,    // more chase time per eval
     .num_envs           = 32,
     .num_steps          = 128,

@@ -6,6 +6,7 @@
 #include "commands.h"
 #include "poker_env.h"
 
+#include <cstdlib>
 #include <iostream>
 #include <string>
 #include <string_view>
@@ -72,6 +73,14 @@ bool parse_cli(int argc, char** argv, CliOptions& out) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    // Expandable-segments CUDA allocator: with the default block allocator
+    // under WSL, per-kernel throughput degrades once resident memory grows
+    // past a few GB (measured: −25% on the update at num_envs=384, even
+    // with identical kernel shapes). Must be set before the first CUDA
+    // allocation; overwrite=0 respects an explicit user setting.
+    setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True",
+           /*overwrite=*/0);
+
     std::cout.setf(std::ios::unitbuf);  // unbuffered for PTY/log capture
 
     CliOptions opt;
@@ -91,8 +100,8 @@ int main(int argc, char** argv) {
                   << (p.opp_pool.enabled ? "ON" : "OFF");
         if (p.opp_pool.enabled) {
             std::cout << "  (size=" << p.opp_pool.max_size
-                      << ", snapshot_every=" << p.opp_pool.snapshot_every
-                      << ", warmup=" << p.opp_pool.warmup_updates
+                      << ", snapshot_every=" << p.opp_pool.snapshot_every_steps << " steps"
+                      << ", warmup=" << p.opp_pool.warmup_steps << " steps"
                       << ", p_use_pool=" << p.opp_pool.p_use_pool
                       << ", max_unique=" << p.opp_pool.max_unique_per_rollout << ")";
         }

@@ -83,12 +83,15 @@ public:
 
     void reset_assignments(int num_envs);
 
+    // All cadences below are in ENV STEPS (global_step), so the pool
+    // schedule is invariant to batch-shape (num_envs/num_steps) changes.
+
     // Sample the rollout's eligible ids. Capped at max_unique_per_rollout
     // so apply_action_overrides runs at most that many forwards per step.
-    void prepare_rollout(int update_idx);
+    void prepare_rollout(int64_t global_step);
 
     // Re-roll learner_seat / opp_id for env_idx after its hand terminates.
-    void on_episode_terminal(int env_idx, int update_idx);
+    void on_episode_terminal(int env_idx, int64_t global_step);
 
     // Pure self-play (op_id == 0): always true. Pool-active: only the
     // learner seat's transitions are recorded.
@@ -101,9 +104,9 @@ public:
                                 const torch::Tensor& cur_player_cpu,
                                 torch::Tensor&       actions_cpu);
 
-    // Append network when (a) enabled, (b) past warmup, (c) update_idx
-    // hits snapshot_every.
-    void maybe_snapshot(int update_idx, const ActorCritic& network);
+    // Append network when (a) enabled, (b) past warmup, (c) at least
+    // snapshot_every_steps env steps since the last snapshot.
+    void maybe_snapshot(int64_t global_step, const ActorCritic& network);
 
     [[nodiscard]] int  size()     const noexcept;
     [[nodiscard]] int  capacity() const noexcept;
@@ -116,6 +119,7 @@ private:
     std::vector<uint64_t>         opp_id_;
     std::vector<uint64_t>         rollout_pool_ids_;
     std::mt19937                  episode_rng_;
+    int64_t                       last_snapshot_step_ = 0;
 };
 
 } // namespace poker_ppo
