@@ -100,11 +100,19 @@ public:
         const std::vector<BetHistoryEntry>&  bet_history,
         int                                  current_bet) const;
 
+    // Alloc-free build: zeroes then fills dst (total_dim floats). The hot
+    // rollout path writes straight into pinned staging rows through this.
+    void build_into(
+        float*                               dst,
+        const Game::GameContext&             ctx,
+        const std::vector<BetHistoryEntry>&  bet_history,
+        int                                  current_bet) const;
+
 private:
-    void write_round_summary(torch::TensorAccessor<float, 1>& a,
+    void write_round_summary(float* a,
                              const std::vector<BetHistoryEntry>& bet_history,
                              int current_player) const;
-    void write_history(torch::TensorAccessor<float, 1>& a,
+    void write_history(float* a,
                        const std::vector<BetHistoryEntry>& bet_history,
                        int current_player) const;
 

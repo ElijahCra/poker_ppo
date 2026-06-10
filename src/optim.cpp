@@ -23,9 +23,6 @@ void ForeachAdam::zero_grad() {
 }
 
 void ForeachAdam::step() {
-    torch::NoGradGuard ng;
-    ++step_count_;
-
     std::vector<torch::Tensor> grads;
     grads.reserve(params_.size());
     for (const auto& p : params_) {
@@ -33,6 +30,14 @@ void ForeachAdam::step() {
                     "ForeachAdam::step: parameter without gradient");
         grads.push_back(p.grad());
     }
+    step(grads);
+}
+
+void ForeachAdam::step(const std::vector<torch::Tensor>& grads) {
+    TORCH_CHECK(grads.size() == params_.size(),
+                "ForeachAdam::step: grads/params size mismatch");
+    torch::NoGradGuard ng;
+    ++step_count_;
 
     // Same update as torch::optim::Adam (no weight decay, no amsgrad):
     //   m ← β₁m + (1−β₁)g
@@ -52,15 +57,9 @@ void ForeachAdam::step() {
     at::_foreach_addcdiv_(params_, exp_avg_, denom, -lr_ / bias_correction1);
 }
 
-torch::Tensor foreach_clip_grad_norm(const std::vector<torch::Tensor>& params,
-                                     double max_norm) {
+torch::Tensor foreach_clip_grads(const std::vector<torch::Tensor>& grads,
+                                 double max_norm) {
     torch::NoGradGuard ng;
-
-    std::vector<torch::Tensor> grads;
-    grads.reserve(params.size());
-    for (const auto& p : params) {
-        if (p.grad().defined()) grads.push_back(p.grad());
-    }
     if (grads.empty()) return torch::zeros({});
 
     auto total_norm = torch::norm(torch::stack(at::_foreach_norm(grads, 2)), 2);
@@ -68,6 +67,16 @@ torch::Tensor foreach_clip_grad_norm(const std::vector<torch::Tensor>& params,
     auto clip_coef  = (max_norm / (total_norm + 1e-6)).clamp_max(1.0);
     at::_foreach_mul_(grads, clip_coef);
     return total_norm;
+}
+
+torch::Tensor foreach_clip_grad_norm(const std::vector<torch::Tensor>& params,
+                                     double max_norm) {
+    std::vector<torch::Tensor> grads;
+    grads.reserve(params.size());
+    for (const auto& p : params) {
+        if (p.grad().defined()) grads.push_back(p.grad());
+    }
+    return foreach_clip_grads(grads, max_norm);
 }
 
 }  // namespace poker_ppo

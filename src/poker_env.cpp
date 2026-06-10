@@ -8,6 +8,7 @@
 #include "Utility/AllInEquity.hpp"
 
 #include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 
 namespace poker_ppo {
@@ -108,15 +109,45 @@ torch::Tensor PokerEnvironment::legal_action_mask() const {
     return compute_mask();
 }
 
+void PokerEnvironment::write_obs_into(float* dst) const {
+    obs_builder_.build_into(
+        dst, game_->getContext(), bet_history_,
+        static_cast<int>(game_->getCurrentBet()));
+}
+
+void PokerEnvironment::write_mask_into(float* dst) const {
+    std::memset(dst, 0, sizeof(float) * static_cast<size_t>(A_));
+    for (int i = 0; i < A_; ++i) {
+        if (action_table_[i].has_value()) dst[i] = 1.0f;
+    }
+}
+
 StepResult PokerEnvironment::reset() {
+    auto obs  = torch::empty({obs_builder_.obs_dim()});
+    auto mask = torch::empty({A_});
+    auto sl   = reset_into(obs.data_ptr<float>(), mask.data_ptr<float>());
+    return { obs, sl.reward, sl.done, mask };
+}
+
+StepLite PokerEnvironment::reset_into(float* obs_dst, float* mask_dst) {
     game_->reInitialize();
     bet_history_.clear();
     auto_advance_chance();
     rebuild_action_table();
-    return { observation(), 0.0f, false, compute_mask() };
+    write_obs_into(obs_dst);
+    write_mask_into(mask_dst);
+    return {0.0f, false};
 }
 
 StepResult PokerEnvironment::step(int action_idx) {
+    auto obs  = torch::empty({obs_builder_.obs_dim()});
+    auto mask = torch::empty({A_});
+    auto sl   = step_into(action_idx, obs.data_ptr<float>(), mask.data_ptr<float>());
+    return { obs, sl.reward, sl.done, mask };
+}
+
+StepLite PokerEnvironment::step_into(int action_idx,
+                                     float* obs_dst, float* mask_dst) {
     if (action_idx < 0 || action_idx >= A_) {
         throw std::invalid_argument("action index out of range");
     }
@@ -173,13 +204,16 @@ StepResult PokerEnvironment::step(int action_idx) {
         const float r = util / reward_norm_;
 
         // Obs/mask unused after terminal; PPO resets next.
-        auto obs  = torch::zeros({obs_builder_.obs_dim()});
-        auto mask = torch::zeros({A_});
-        return { obs, r, true, mask };
+        std::memset(obs_dst, 0,
+                    sizeof(float) * static_cast<size_t>(obs_builder_.obs_dim()));
+        std::memset(mask_dst, 0, sizeof(float) * static_cast<size_t>(A_));
+        return { r, true };
     }
 
     rebuild_action_table();
-    return { observation(), 0.0f, false, compute_mask() };
+    write_obs_into(obs_dst);
+    write_mask_into(mask_dst);
+    return { 0.0f, false };
 }
 
 void PokerEnvironment::auto_advance_chance() {

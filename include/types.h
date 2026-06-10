@@ -50,4 +50,11 @@ struct StepResult {
     torch::Tensor legal_action_mask;  // [action_count]  1=legal, 0=illegal
 };
 
+// Alloc-free step result for hot rollout loops: the observation and mask
+// are written into caller-owned rows instead of freshly allocated tensors.
+struct StepLite {
+    float reward = 0.0f;
+    bool  done   = false;
+};
+
 } // namespace poker_ppo

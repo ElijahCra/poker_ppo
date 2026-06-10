@@ -2,6 +2,7 @@
 
 #include "types.h"
 #include <torch/torch.h>
+#include <cstring>
 #include <memory>
 #include <vector>
 
@@ -21,11 +22,39 @@ public:
     virtual StepResult reset() = 0;
     virtual StepResult step(int action) = 0;
 
+    // Alloc-free variants for hot rollout loops: write the resulting
+    // observation / legal mask into caller-owned rows (obs_dim() and
+    // bet_config().action_count() floats). Per-step tensor allocations
+    // from many worker threads serialise on the torch CPU allocator, so
+    // the rollout collector uses these. Defaults wrap step()/reset();
+    // PokerEnvironment overrides them allocation-free.
+    virtual StepLite step_into(int action, float* obs_dst, float* mask_dst);
+    virtual StepLite reset_into(float* obs_dst, float* mask_dst);
+
     virtual int current_player() const = 0;
     virtual torch::Tensor observation() const = 0;
     virtual torch::Tensor legal_action_mask() const = 0;
     virtual bool is_terminal() const = 0;
 };
+
+inline StepLite IPokerEnvironment::step_into(int action,
+                                             float* obs_dst, float* mask_dst) {
+    auto r = step(action);
+    std::memcpy(obs_dst, r.observation.data_ptr<float>(),
+                sizeof(float) * static_cast<size_t>(obs_dim()));
+    std::memcpy(mask_dst, r.legal_action_mask.data_ptr<float>(),
+                sizeof(float) * static_cast<size_t>(bet_config().action_count()));
+    return {r.reward, r.done};
+}
+
+inline StepLite IPokerEnvironment::reset_into(float* obs_dst, float* mask_dst) {
+    auto r = reset();
+    std::memcpy(obs_dst, r.observation.data_ptr<float>(),
+                sizeof(float) * static_cast<size_t>(obs_dim()));
+    std::memcpy(mask_dst, r.legal_action_mask.data_ptr<float>(),
+                sizeof(float) * static_cast<size_t>(bet_config().action_count()));
+    return {r.reward, r.done};
+}
 
 class IPokerEnvironmentFactory {
 public:

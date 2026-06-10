@@ -96,6 +96,25 @@ public:
 private:
     [[nodiscard]] UpdateStats update();
 
+    // Lazily capture one full-size minibatch's forward+loss+backward into
+    // a CUDA graph (static inputs ug_*, static grads ug_grads_). The
+    // optimiser stays eager: lr anneals and Adam's bias corrections change
+    // every step, and scalars are baked into captured kernels. Replay
+    // requires minibatch_size() rows — partial tail minibatches run eager.
+    // Returns true when the graph is ready. POKER_PPO_NO_UPDATE_GRAPH=1
+    // disables; capture failure falls back to eager permanently.
+    bool ensure_update_graph(const torch::Tensor& b_obs,
+                             const torch::Tensor& b_actions,
+                             const torch::Tensor& b_logp,
+                             const torch::Tensor& b_adv,
+                             const torch::Tensor& b_ret,
+                             const torch::Tensor& b_val,
+                             const torch::Tensor& b_masks,
+                             const torch::Tensor& magnet_logp_all,
+                             const torch::Tensor& mb_idx,
+                             bool  use_amp,
+                             float ent_coef_now);
+
     static inline constexpr const PPOConfig& cfg_      = config::kPPOConfig;
     static inline constexpr const BetConfig& bet_cfg_  = config::kBetConfig;
     torch::Device device_;
@@ -117,6 +136,17 @@ private:
     ActorCritic                          magnet_{nullptr};
 
     int update_idx_ = 0;
+
+    // CUDA-graphed minibatch step (see ensure_update_graph).
+    enum class UGraphState { Unset, Ready, Failed };
+    UGraphState                           ugraph_state_ = UGraphState::Unset;
+    std::unique_ptr<at::cuda::CUDAGraph>  ugraph_;
+    // Static inputs, refilled per minibatch via index_select_out.
+    torch::Tensor ug_obs_, ug_actions_, ug_logp_, ug_adv_, ug_ret_, ug_val_,
+                  ug_masks_, ug_mlogp_;
+    // Static outputs: detached stat scalars + gradients (graph pool).
+    torch::Tensor ug_pg_, ug_vl_, ug_ent_, ug_kl_, ug_clip_;
+    std::vector<torch::Tensor> ug_grads_;
 
     LogCallback log_cb_;
     Strategy    strategy_ = Strategy::Threadpool;

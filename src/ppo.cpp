@@ -3,6 +3,9 @@
 #include "opponent_manager.h"
 
 #include <ATen/autocast_mode.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <ATen/cuda/CUDAGraph.h>
+#include <c10/cuda/CUDAGuard.h>
 
 #include <algorithm>
 #include <chrono>
@@ -28,6 +31,150 @@ inline void set_update_autocast(bool on) {
     at::autocast::set_autocast_enabled(at::kCUDA, on);
     if (on)  at::autocast::set_autocast_dtype(at::kCUDA, at::kBFloat16);
     if (!on) at::autocast::clear_cache();
+}
+
+// Opt-in (POKER_PPO_PROFILE) phase profile for update(), mirroring the
+// rollout one: lap() syncs CUDA so async kernels are attributed to the
+// phase that launched them, which inflates the total vs. the clean path.
+// Printed once at trainer teardown.
+struct UpdateProfile {
+    double flatten_ms = 0, magnet_ms = 0, select_ms = 0, fwd_ms = 0,
+           bwd_ms = 0, optim_ms = 0, stats_ms = 0;
+    int    updates = 0;
+
+    static bool enabled() {
+        static const bool on = std::getenv("POKER_PPO_PROFILE") != nullptr;
+        return on;
+    }
+
+    struct Timer {
+        bool active;
+        std::chrono::steady_clock::time_point last;
+        explicit Timer(bool a) : active(a) {
+            if (active) last = std::chrono::steady_clock::now();
+        }
+        void lap(double& acc) {
+            if (!active) return;
+            torch::cuda::synchronize();
+            const auto t = std::chrono::steady_clock::now();
+            acc += std::chrono::duration<double, std::milli>(t - last).count();
+            last = t;
+        }
+    };
+
+    void print() const {
+        if (updates == 0) return;
+        const double n = updates;
+        const double tot = flatten_ms + magnet_ms + select_ms + fwd_ms
+                         + bwd_ms + optim_ms + stats_ms;
+        auto row = [&](const char* name, double ms) {
+            std::cout << "  " << std::setw(12) << std::left << name << std::right
+                      << std::setw(10) << std::fixed << std::setprecision(2)
+                      << (ms / n) << " ms/update"
+                      << std::setw(8) << std::setprecision(1)
+                      << (tot > 0 ? 100.0 * ms / tot : 0.0) << "%\n";
+        };
+        std::cout << "\n────────── update phase profile ──────────\n"
+                  << "  updates=" << updates << "  total="
+                  << std::fixed << std::setprecision(2) << (tot / n)
+                  << " ms/update\n  ─────────────────────────────────\n";
+        row("flatten",  flatten_ms);
+        row("magnet",   magnet_ms);
+        row("select",   select_ms);
+        row("forward",  fwd_ms);
+        row("backward", bwd_ms);
+        row("optim",    optim_ms);
+        row("stats",    stats_ms);
+        std::cout << "  ─────────────────────────────────\n";
+        std::cout.unsetf(std::ios::fixed);
+    }
+};
+
+UpdateProfile g_update_profile;
+
+struct MBLossOut {
+    torch::Tensor loss;                  // autograd-tracked scalar
+    torch::Tensor pg, v, ent, kl, clip;  // detached stat scalars
+};
+
+// One minibatch's full PPO loss. Single source of truth shared verbatim by
+// the eager path and the CUDA-graph capture so the two cannot drift. The
+// caller manages autocast state around this call.
+MBLossOut compute_mb_loss(ActorCritic&         network,
+                          float                ent_coef_now,
+                          const torch::Tensor& mb_obs,
+                          const torch::Tensor& mb_masks,
+                          const torch::Tensor& mb_actions,
+                          const torch::Tensor& mb_logp,
+                          torch::Tensor        mb_adv,
+                          const torch::Tensor& mb_ret,
+                          const torch::Tensor& mb_val,
+                          const torch::Tensor& magnet_logp) {
+    constexpr const PPOConfig& cfg = config::kPPOConfig;
+
+    if constexpr (cfg.norm_advantages) {
+        if (mb_adv.size(0) > 1) {
+            mb_adv = (mb_adv - mb_adv.mean()) /
+                     (mb_adv.std() + kAdvantageEps);
+        }
+    }
+
+    auto er = network->evaluate(mb_obs, mb_masks, mb_actions);
+
+    // Clipped surrogate.
+    auto logratio = er.log_prob - mb_logp;
+    auto ratio    = logratio.exp();
+
+    auto pg_loss1 = -mb_adv * ratio;
+    auto pg_loss2 = -mb_adv * torch::clamp(
+        ratio, 1.0f - cfg.clip_coef, 1.0f + cfg.clip_coef);
+    auto pg_loss  = torch::max(pg_loss1, pg_loss2).mean();
+
+    torch::Tensor v_loss;
+    if constexpr (cfg.clip_vloss) {
+        auto v_clipped = mb_val + torch::clamp(
+            er.value - mb_val, -cfg.clip_coef, cfg.clip_coef);
+        auto v_loss_unclipped = (er.value - mb_ret).pow(2);
+        auto v_loss_clipped   = (v_clipped - mb_ret).pow(2);
+        v_loss = 0.5f * torch::max(v_loss_unclipped,
+                                   v_loss_clipped).mean();
+    } else {
+        v_loss = 0.5f * (er.value - mb_ret).pow(2).mean();
+    }
+
+    auto entropy_loss = er.entropy.mean();
+
+    // MMD regularisation: KL(π_θ || ρ) per state, mean over the minibatch.
+    // ρ is the magnet — a slowly-refreshed snapshot of π_θ whose log-probs
+    // arrive precomputed in magnet_logp. Pulls π_θ toward an older self,
+    // which gives the regularised-PG family its last-iterate Nash
+    // convergence guarantee (Sokota et al. 2023). Stripped from the binary
+    // when cfg.kl_coef == 0 (vanilla PPO).
+    torch::Tensor mmd_kl_loss;
+    if constexpr (cfg.kl_coef > 0.0f) {
+        // KL(π || ρ) = Σ_a π(a) (log π(a) − log ρ(a)). exp(log π) for the
+        // weight keeps gradients flowing through log_probs_all itself.
+        const auto pi = er.log_probs_all.exp();
+        const auto kl = (pi * (er.log_probs_all - magnet_logp)).sum(-1);
+        mmd_kl_loss   = kl.mean();
+    }
+
+    auto loss = pg_loss
+              - ent_coef_now * entropy_loss
+              + cfg.vf_coef * v_loss;
+    if constexpr (cfg.kl_coef > 0.0f) {
+        loss = loss + cfg.kl_coef * mmd_kl_loss;
+    }
+
+    torch::NoGradGuard ng;
+    auto rd = ratio.detach();
+    auto ld = logratio.detach();
+    return {loss,
+            pg_loss.detach(),
+            v_loss.detach(),
+            entropy_loss.detach(),
+            ((rd - 1.0f) - ld).mean(),
+            ((rd - 1.0f).abs() > cfg.clip_coef).to(torch::kFloat32).mean()};
 }
 
 }  // namespace
@@ -104,7 +251,9 @@ PPOTrainer::PPOTrainer(IPokerEnvironmentFactory& env_factory,
     }
 }
 
-PPOTrainer::~PPOTrainer() = default;
+PPOTrainer::~PPOTrainer() {
+    if (UpdateProfile::enabled()) g_update_profile.print();
+}
 
 int PPOTrainer::opponent_pool_size() const {
     return opp_mgr_ ? opp_mgr_->size() : 0;
@@ -286,9 +435,12 @@ PPOTrainer::UpdateStats PPOTrainer::update() {
     const bool use_amp =
         device_.is_cuda() && std::getenv("POKER_PPO_NO_AMP") == nullptr;
 
+    UpdateProfile::Timer ut(UpdateProfile::enabled());
+
     auto& buffer = collector_->buffer();
     auto batch   = buffer.flatten();
     int  B       = batch.obs.size(0);
+    ut.lap(g_update_profile.flatten_ms);
 
     auto& b_obs     = batch.obs;
     auto& b_actions = batch.actions;
@@ -310,6 +462,7 @@ PPOTrainer::UpdateStats PPOTrainer::update() {
         magnet_logp_all = magnet_->masked_log_probs(b_obs, b_masks);
         if (use_amp) set_update_autocast(false);
     }
+    ut.lap(g_update_profile.magnet_ms);
 
     auto stat_opts = torch::TensorOptions().dtype(torch::kFloat32).device(device_);
     auto total_policy_loss = torch::zeros({}, stat_opts);
@@ -343,98 +496,95 @@ PPOTrainer::UpdateStats PPOTrainer::update() {
             int end = std::min(start + cfg_.minibatch_size(), B);
             auto mb_idx = indices.slice(0, start, end);
 
-            auto mb_obs     = b_obs.index_select(0, mb_idx);
-            auto mb_actions = b_actions.index_select(0, mb_idx);
-            auto mb_logp    = b_logp.index_select(0, mb_idx);
-            auto mb_adv     = b_adv.index_select(0, mb_idx);
-            auto mb_ret     = b_ret.index_select(0, mb_idx);
-            auto mb_val     = b_val.index_select(0, mb_idx);
-            auto mb_masks   = b_masks.index_select(0, mb_idx);
+            UpdateProfile::Timer mt(UpdateProfile::enabled());
 
-            if constexpr (cfg_.norm_advantages) {
-                if (mb_adv.size(0) > 1) {
-                    mb_adv = (mb_adv - mb_adv.mean()) /
-                             (mb_adv.std() + kAdvantageEps);
+            // Graphed path needs exactly minibatch_size rows (static
+            // shapes); the partial tail minibatch — B varies per rollout —
+            // takes the eager path below.
+            const bool graphed =
+                (end - start) == cfg_.minibatch_size() &&
+                ensure_update_graph(b_obs, b_actions, b_logp, b_adv, b_ret,
+                                    b_val, b_masks, magnet_logp_all, mb_idx,
+                                    use_amp, ent_coef_now);
+
+            if (graphed) {
+                at::index_select_out(ug_obs_,     b_obs,     0, mb_idx);
+                at::index_select_out(ug_actions_, b_actions, 0, mb_idx);
+                at::index_select_out(ug_logp_,    b_logp,    0, mb_idx);
+                at::index_select_out(ug_adv_,     b_adv,     0, mb_idx);
+                at::index_select_out(ug_ret_,     b_ret,     0, mb_idx);
+                at::index_select_out(ug_val_,     b_val,     0, mb_idx);
+                at::index_select_out(ug_masks_,   b_masks,   0, mb_idx);
+                if constexpr (cfg_.kl_coef > 0.0f) {
+                    at::index_select_out(ug_mlogp_, magnet_logp_all, 0, mb_idx);
                 }
-            }
+                mt.lap(g_update_profile.select_ms);
 
-            if (use_amp) set_update_autocast(true);
+                // fwd + loss + bwd in one launch; grads land in ug_grads_.
+                ugraph_->replay();
+                mt.lap(g_update_profile.bwd_ms);
 
-            auto er = network_->evaluate(mb_obs, mb_masks, mb_actions);
+                foreach_clip_grads(ug_grads_, cfg_.max_grad_norm);
+                optimizer_->step(ug_grads_);
+                mt.lap(g_update_profile.optim_ms);
 
-            // Clipped surrogate.
-            auto logratio = er.log_prob - mb_logp;
-            auto ratio    = logratio.exp();
-
-            auto pg_loss1 = -mb_adv * ratio;
-            auto pg_loss2 = -mb_adv * torch::clamp(
-                ratio, 1.0f - cfg_.clip_coef, 1.0f + cfg_.clip_coef);
-            auto pg_loss  = torch::max(pg_loss1, pg_loss2).mean();
-
-            // 16 minibatches per update — branch in the binary is worth
-            // killing via if constexpr.
-            torch::Tensor v_loss;
-            if constexpr (cfg_.clip_vloss) {
-                auto v_clipped = mb_val + torch::clamp(
-                    er.value - mb_val,
-                    -cfg_.clip_coef, cfg_.clip_coef);
-                auto v_loss_unclipped = (er.value - mb_ret).pow(2);
-                auto v_loss_clipped   = (v_clipped - mb_ret).pow(2);
-                v_loss = 0.5f * torch::max(v_loss_unclipped,
-                                           v_loss_clipped).mean();
+                {
+                    torch::NoGradGuard ng;
+                    total_policy_loss += ug_pg_;
+                    total_value_loss  += ug_vl_;
+                    total_entropy     += ug_ent_;
+                    total_approx_kl   += ug_kl_;
+                    total_clip_frac   += ug_clip_;
+                }
+                mt.lap(g_update_profile.stats_ms);
             } else {
-                v_loss = 0.5f * (er.value - mb_ret).pow(2).mean();
-            }
+                auto mb_obs     = b_obs.index_select(0, mb_idx);
+                auto mb_actions = b_actions.index_select(0, mb_idx);
+                auto mb_logp    = b_logp.index_select(0, mb_idx);
+                auto mb_adv     = b_adv.index_select(0, mb_idx);
+                auto mb_ret     = b_ret.index_select(0, mb_idx);
+                auto mb_val     = b_val.index_select(0, mb_idx);
+                auto mb_masks   = b_masks.index_select(0, mb_idx);
+                torch::Tensor mb_mlogp;
+                if constexpr (cfg_.kl_coef > 0.0f) {
+                    mb_mlogp = magnet_logp_all.index_select(0, mb_idx);
+                }
+                mt.lap(g_update_profile.select_ms);
 
-            auto entropy_loss = er.entropy.mean();
+                if (use_amp) set_update_autocast(true);
+                auto out = compute_mb_loss(network_, ent_coef_now,
+                                           mb_obs, mb_masks, mb_actions,
+                                           mb_logp, mb_adv, mb_ret, mb_val,
+                                           mb_mlogp);
+                // Backward + step run in fp32 (master weights); disable
+                // autocast and drop the stale bf16 weight-cast cache first.
+                if (use_amp) set_update_autocast(false);
+                mt.lap(g_update_profile.fwd_ms);
 
-            // MMD regularisation: KL(π_θ || ρ) per state, mean over the
-            // minibatch. ρ is the magnet — a slowly-refreshed snapshot of
-            // π_θ. Pulls π_θ toward an older self each step, which gives
-            // the regularised-PG family its last-iterate Nash convergence
-            // guarantee in the tabular case (Sokota et al. 2023). Stripped
-            // from the binary when `cfg_.kl_coef == 0` (vanilla PPO).
-            torch::Tensor mmd_kl_loss;
-            if constexpr (cfg_.kl_coef > 0.0f) {
-                auto magnet_log_probs = magnet_logp_all.index_select(0, mb_idx);
-                // KL(π || ρ) = Σ_a π(a) (log π(a) − log ρ(a)).
-                // Use exp(log π) for the weight rather than a separate
-                // softmax — keeps gradients flowing through the same
-                // tensor that produced log_probs_all.
-                const auto pi   = er.log_probs_all.exp();
-                const auto kl   = (pi * (er.log_probs_all - magnet_log_probs))
-                                  .sum(/*dim=*/-1);
-                mmd_kl_loss     = kl.mean();
-            }
+                optimizer_->zero_grad();
+                out.loss.backward();
+                mt.lap(g_update_profile.bwd_ms);
+                foreach_clip_grad_norm(optimizer_->params(), cfg_.max_grad_norm);
+                optimizer_->step();
+                mt.lap(g_update_profile.optim_ms);
 
-            auto loss = pg_loss
-                      - ent_coef_now * entropy_loss
-                      + cfg_.vf_coef * v_loss;
-            if constexpr (cfg_.kl_coef > 0.0f) {
-                loss = loss + cfg_.kl_coef * mmd_kl_loss;
-            }
-
-            // Backward + step run in fp32 (master weights); disable autocast
-            // and drop the stale bf16 weight-cast cache first.
-            if (use_amp) set_update_autocast(false);
-
-            optimizer_->zero_grad();
-            loss.backward();
-            foreach_clip_grad_norm(optimizer_->params(), cfg_.max_grad_norm);
-            optimizer_->step();
-
-            // Accumulate on device; one .item() sync after the loop.
-            {
-                torch::NoGradGuard ng;
-                total_policy_loss += pg_loss.detach();
-                total_value_loss  += v_loss.detach();
-                total_entropy     += entropy_loss.detach();
-                total_approx_kl   += ((ratio.detach() - 1.0f) - logratio.detach()).mean();
-                total_clip_frac   += ((ratio.detach() - 1.0f).abs() > cfg_.clip_coef)
-                                     .to(torch::kFloat32).mean();
+                // Accumulate on device; one .item() sync after the loop.
+                {
+                    torch::NoGradGuard ng;
+                    total_policy_loss += out.pg;
+                    total_value_loss  += out.v;
+                    total_entropy     += out.ent;
+                    total_approx_kl   += out.kl;
+                    total_clip_frac   += out.clip;
+                }
+                mt.lap(g_update_profile.stats_ms);
             }
             ++num_updates;
         }
+    }
+    if (UpdateProfile::enabled()) {
+        // Periodic print too — SIGTERM (timeout/ctrl-c) skips destructors.
+        if (++g_update_profile.updates % 30 == 0) g_update_profile.print();
     }
 
     float explained_var;
@@ -469,6 +619,151 @@ PPOTrainer::UpdateStats PPOTrainer::update() {
         0.0,  // rollout_ms — set by train()
         0.0,  // update_ms  — set by train()
     };
+}
+
+bool PPOTrainer::ensure_update_graph(const torch::Tensor& b_obs,
+                                     const torch::Tensor& b_actions,
+                                     const torch::Tensor& b_logp,
+                                     const torch::Tensor& b_adv,
+                                     const torch::Tensor& b_ret,
+                                     const torch::Tensor& b_val,
+                                     const torch::Tensor& b_masks,
+                                     const torch::Tensor& magnet_logp_all,
+                                     const torch::Tensor& mb_idx,
+                                     bool  use_amp,
+                                     float ent_coef_now) {
+    if (ugraph_state_ == UGraphState::Ready)  return true;
+    if (ugraph_state_ == UGraphState::Failed) return false;
+
+    auto fail = [&](const char* why) {
+        ugraph_state_ = UGraphState::Failed;
+        if (why) {
+            std::cout << "[update] minibatch CUDA graph disabled (" << why
+                      << ")\n";
+        }
+        return false;
+    };
+
+    if (!device_.is_cuda()) return fail(nullptr);
+    if (std::getenv("POKER_PPO_NO_UPDATE_GRAPH") != nullptr) {
+        return fail("POKER_PPO_NO_UPDATE_GRAPH");
+    }
+    if constexpr (cfg_.anneal_ent_coef) {
+        // ent_coef_now changes per update and scalars are baked into
+        // captured kernels — the graph would freeze the schedule.
+        return fail("anneal_ent_coef");
+    }
+
+    try {
+        const int64_t M = cfg_.minibatch_size();
+        const int64_t D = b_obs.size(1);
+        const int64_t A = b_masks.size(1);
+        auto f_dev = torch::TensorOptions().dtype(torch::kFloat32).device(device_);
+        auto i_dev = torch::TensorOptions().dtype(torch::kInt64).device(device_);
+
+        // Static inputs (regular allocator; only what's INSIDE the capture
+        // lives in the graph's private pool).
+        ug_obs_     = torch::zeros({M, D}, f_dev);
+        ug_actions_ = torch::zeros({M},    i_dev);
+        ug_logp_    = torch::zeros({M},    f_dev);
+        ug_adv_     = torch::zeros({M},    f_dev);
+        ug_ret_     = torch::zeros({M},    f_dev);
+        ug_val_     = torch::zeros({M},    f_dev);
+        ug_masks_   = torch::zeros({M, A}, f_dev);
+        if constexpr (cfg_.kl_coef > 0.0f) {
+            ug_mlogp_ = torch::zeros({M, magnet_logp_all.size(1)}, f_dev);
+        }
+
+        // Live minibatch data for warmup + capture (an all-zero legal mask
+        // would be degenerate input for log_softmax).
+        at::index_select_out(ug_obs_,     b_obs,     0, mb_idx);
+        at::index_select_out(ug_actions_, b_actions, 0, mb_idx);
+        at::index_select_out(ug_logp_,    b_logp,    0, mb_idx);
+        at::index_select_out(ug_adv_,     b_adv,     0, mb_idx);
+        at::index_select_out(ug_ret_,     b_ret,     0, mb_idx);
+        at::index_select_out(ug_val_,     b_val,     0, mb_idx);
+        at::index_select_out(ug_masks_,   b_masks,   0, mb_idx);
+        if constexpr (cfg_.kl_coef > 0.0f) {
+            at::index_select_out(ug_mlogp_, magnet_logp_all, 0, mb_idx);
+        }
+
+        // Autocast cache must be OFF from warmup through capture: a cached
+        // bf16 weight cast from warmup would be baked into the graph as a
+        // stale constant, while uncached casts are recorded as kernels
+        // that re-read the live fp32 weights on every replay (the
+        // make_graphed_callables rule). Note: no clear_cache() inside the
+        // capture window — cache-off means there is nothing to clear.
+        if (use_amp) at::autocast::set_autocast_cache_enabled(false);
+        auto amp_on = [&] {
+            if (!use_amp) return;
+            at::autocast::set_autocast_enabled(at::kCUDA, true);
+            at::autocast::set_autocast_dtype(at::kCUDA, at::kBFloat16);
+        };
+        auto amp_off = [&] {
+            if (use_amp) at::autocast::set_autocast_enabled(at::kCUDA, false);
+        };
+
+        const auto& params = optimizer_->params();
+        torch::autograd::variable_list param_list(params.begin(), params.end());
+
+        // Forward under autocast, backward outside it — same shape as the
+        // eager path. autograd::grad (not .backward()) so gradients land
+        // in fresh graph-pool tensors with stable addresses instead of
+        // param.grad().
+        auto run_once = [&] {
+            amp_on();
+            auto out = compute_mb_loss(network_, ent_coef_now,
+                                       ug_obs_, ug_masks_, ug_actions_,
+                                       ug_logp_, ug_adv_, ug_ret_, ug_val_,
+                                       ug_mlogp_);
+            amp_off();
+            return out;
+        };
+
+        auto stream = at::cuda::getStreamFromPool();
+        {
+            c10::cuda::CUDAStreamGuard guard(stream);
+            // Warmup (cuBLAS handles, autograd engine init, workspaces).
+            for (int i = 0; i < 3; ++i) {
+                auto out = run_once();
+                (void)torch::autograd::grad({out.loss}, param_list);
+            }
+            at::cuda::getCurrentCUDAStream().synchronize();
+
+            ugraph_ = std::make_unique<at::cuda::CUDAGraph>();
+            ugraph_->capture_begin();
+            auto out   = run_once();
+            auto grads = torch::autograd::grad({out.loss}, param_list);
+            ugraph_->capture_end();
+
+            ug_pg_   = out.pg;
+            ug_vl_   = out.v;
+            ug_ent_  = out.ent;
+            ug_kl_   = out.kl;
+            ug_clip_ = out.clip;
+            ug_grads_.assign(grads.begin(), grads.end());
+        }
+        at::autocast::set_autocast_cache_enabled(true);
+        torch::cuda::synchronize();
+
+        ugraph_state_ = UGraphState::Ready;
+        std::cout << "[update] CUDA-graphed minibatch fwd+bwd "
+                  << "(POKER_PPO_NO_UPDATE_GRAPH=1 disables)\n";
+        return true;
+    } catch (const std::exception& e) {
+        std::cerr << "[update] minibatch CUDA graph capture failed, "
+                  << "eager fallback: " << e.what() << "\n";
+        // Capture may have died inside the autocast window — restore.
+        at::autocast::set_autocast_enabled(at::kCUDA, false);
+        at::autocast::set_autocast_cache_enabled(true);
+        ugraph_.reset();
+        ug_grads_.clear();
+        ug_obs_ = ug_actions_ = ug_logp_ = ug_adv_ = ug_ret_ = ug_val_
+                = ug_masks_ = ug_mlogp_ = ug_pg_ = ug_vl_ = ug_ent_
+                = ug_kl_ = ug_clip_ = torch::Tensor();
+        ugraph_state_ = UGraphState::Failed;
+        return false;
+    }
 }
 
 void PPOTrainer::save(const std::string& path) {

@@ -34,6 +34,10 @@ public:
     StepResult reset() override;
     StepResult step(int action) override;
 
+    // Alloc-free hot path: step()/reset() are thin wrappers around these.
+    StepLite step_into(int action, float* obs_dst, float* mask_dst) override;
+    StepLite reset_into(float* obs_dst, float* mask_dst) override;
+
     int current_player() const override;
     torch::Tensor observation() const override;
     torch::Tensor legal_action_mask() const override;
@@ -56,6 +60,8 @@ private:
     void auto_advance_chance();
     void rebuild_action_table();
     torch::Tensor compute_mask() const;
+    void write_obs_into(float* dst) const;
+    void write_mask_into(float* dst) const;
 
     // Seat-0 expected utility (in mbb) at an all-in showdown, computed over
     // the remaining board run-outs. Called only when the terminal is an

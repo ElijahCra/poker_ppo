@@ -62,12 +62,26 @@ void RolloutBuffer::push(int player, int env_idx,
                          torch::Tensor mask) {
     const int t = counts_[player][env_idx]++;
 
-    // Serial collector keeps state on device; force CPU for storage.
     if (obs.device()  != torch::kCPU) obs  = obs.to(torch::kCPU);
     if (mask.device() != torch::kCPU) mask = mask.to(torch::kCPU);
 
-    obs_[player][t][env_idx]         = obs;
-    legal_masks_[player][t][env_idx] = mask;
+    // Hot path: raw memcpy into the contiguous [T, N, D] storage. The
+    // tensor-assign form (obs_[p][t][e] = obs) builds temporaries and a
+    // dispatched copy_ per call — with one push per env-step across all
+    // worker threads, that overhead serialises in the dispatcher.
+    if (obs.is_contiguous() && mask.is_contiguous()) {
+        std::memcpy(obs_[player].data_ptr<float>()
+                        + (static_cast<size_t>(t) * num_envs_ + env_idx) * obs_dim_,
+                    obs.data_ptr<float>(),
+                    sizeof(float) * static_cast<size_t>(obs_dim_));
+        std::memcpy(legal_masks_[player].data_ptr<float>()
+                        + (static_cast<size_t>(t) * num_envs_ + env_idx) * action_count_,
+                    mask.data_ptr<float>(),
+                    sizeof(float) * static_cast<size_t>(action_count_));
+    } else {
+        obs_[player][t][env_idx]         = obs;
+        legal_masks_[player][t][env_idx] = mask;
+    }
     actions_[player]  .accessor<int64_t, 2>()[t][env_idx] = action;
     log_probs_[player].accessor<float,   2>()[t][env_idx] = log_prob;
     rewards_[player]  .accessor<float,   2>()[t][env_idx] = reward;
@@ -533,16 +547,23 @@ void RolloutCollector::collect(Strategy         strategy,
         auto pk_acc = packed_pin_.accessor<float, 2>();  // [4,N]: a, logp, Q, V̄
         auto cp_acc = cur_player_cpu.accessor<int32_t, 1>();
 
-        auto next_obs    = torch::zeros({N, D}, f_pin);
-        auto next_mask   = torch::zeros({N, A}, f_pin);
+        // empty, not zeros: step_into/reset_into fully writes every row.
+        auto next_obs    = torch::empty({N, D}, f_pin);
+        auto next_mask   = torch::empty({N, A}, f_pin);
         auto next_player = torch::zeros({N},    i32_cpu);
         auto np_acc      = next_player.accessor<int32_t, 1>();
+        float* const next_obs_p  = next_obs.data_ptr<float>();
+        float* const next_mask_p = next_mask.data_ptr<float>();
 
         std::fill(did_reset.begin(), did_reset.end(), 0);
         pt.lap(prof.alloc_next_ms);
 
         // Per-i state is disjoint, so step_body is safe to parallelise
         // across i. Buffer pushes at (player, i) are also disjoint.
+        // step_into/reset_into write obs/mask straight into this env's
+        // pinned staging row — the tensor-returning step() allocates
+        // several tensors per call, and with one call per env-step across
+        // all worker threads those allocs serialise in the CPU allocator.
         auto step_body = [&](int i) {
             const int acting = cp_acc[i];
 
@@ -553,21 +574,19 @@ void RolloutCollector::collect(Strategy         strategy,
                     a_acc[i], pk_acc[1][i], pk_acc[2][i], pk_acc[3][i]);
             }
 
-            auto res = envs[i]->step(static_cast<int>(a_acc[i]));
-            player_state[i].step_reward(res.reward);
+            float* const obs_dst  = next_obs_p  + static_cast<size_t>(i) * D;
+            float* const mask_dst = next_mask_p + static_cast<size_t>(i) * A;
 
-            if (res.done) {
+            const auto sl = envs[i]->step_into(static_cast<int>(a_acc[i]),
+                                               obs_dst, mask_dst);
+            player_state[i].step_reward(sl.reward);
+
+            if (sl.done) {
                 player_state[i].flush_on_terminal(i, *buffer_);
-                auto rr = envs[i]->reset();
-                next_obs[i]  = rr.observation;
-                next_mask[i] = rr.legal_action_mask;
-                np_acc[i]    = static_cast<int32_t>(envs[i]->current_player());
+                envs[i]->reset_into(obs_dst, mask_dst);
                 did_reset[i] = 1;
-            } else {
-                next_obs[i]  = res.observation;
-                next_mask[i] = res.legal_action_mask;
-                np_acc[i]    = static_cast<int32_t>(envs[i]->current_player());
             }
+            np_acc[i] = static_cast<int32_t>(envs[i]->current_player());
         };
 
         if (strategy == Strategy::Threadpool) {

@@ -43,6 +43,11 @@ public:
 
     void step();
 
+    // Step from externally-held gradient tensors (same order as params()),
+    // bypassing .grad() — used by the CUDA-graphed update, whose backward
+    // writes into static graph-pool tensors instead of param.grad().
+    void step(const std::vector<torch::Tensor>& grads);
+
 private:
     std::vector<torch::Tensor> params_;
     std::vector<torch::Tensor> exp_avg_;
@@ -57,5 +62,9 @@ private:
 // case is unchanged). Returns the pre-clip total norm (device scalar).
 torch::Tensor foreach_clip_grad_norm(const std::vector<torch::Tensor>& params,
                                      double max_norm);
+
+// Same, but on gradient tensors directly (CUDA-graphed update path).
+torch::Tensor foreach_clip_grads(const std::vector<torch::Tensor>& grads,
+                                 double max_norm);
 
 }  // namespace poker_ppo

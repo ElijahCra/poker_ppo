@@ -5,6 +5,7 @@
 #include "Utility/HandStrength.hpp"
 
 #include <algorithm>
+#include <cstring>
 
 namespace poker_ppo {
 
@@ -27,8 +28,18 @@ torch::Tensor ObservationBuilder::build(
     const std::vector<BetHistoryEntry>&  bet_history,
     int                                  current_bet) const
 {
-    auto obs = torch::zeros({layout_.total_dim});
-    auto a   = obs.accessor<float, 1>();
+    auto obs = torch::empty({layout_.total_dim});
+    build_into(obs.data_ptr<float>(), ctx, bet_history, current_bet);
+    return obs;
+}
+
+void ObservationBuilder::build_into(
+    float*                               a,
+    const Game::GameContext&             ctx,
+    const std::vector<BetHistoryEntry>&  bet_history,
+    int                                  current_bet) const
+{
+    std::memset(a, 0, sizeof(float) * static_cast<size_t>(layout_.total_dim));
 
     const int me  = ctx.getCurrentPlayer();
     const int opp = 1 - me;
@@ -132,11 +143,10 @@ torch::Tensor ObservationBuilder::build(
         a[layout_.privileged_off + opp_hole[1]] = 1.0f;
     }
 
-    return obs;
 }
 
 void ObservationBuilder::write_round_summary(
-    torch::TensorAccessor<float, 1>&     a,
+    float*                               a,
     const std::vector<BetHistoryEntry>&  bet_history,
     int                                  current_player) const
 {
@@ -173,7 +183,7 @@ void ObservationBuilder::write_round_summary(
 }
 
 void ObservationBuilder::write_history(
-    torch::TensorAccessor<float, 1>&     a,
+    float*                               a,
     const std::vector<BetHistoryEntry>&  bet_history,
     int                                  current_player) const
 {
