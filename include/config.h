@@ -240,6 +240,13 @@ static constexpr PPOConfig kPPOConfig{
     .hist             = BetHistoryConfig{
         .enabled         = true,    // build gate: features::ATTENTION_ENCODER
         .max_history_len = 16,       // HUNL caps actions at ~16/hand; T² attn cost
+        // 96 assessed vs 128 (2026-06): +33% encoder width costs +7.5%
+        // wall-clock and capacity is not the binding constraint in this
+        // setup — the EV ceiling traced to imperfect info (fixed by the
+        // privileged critic), tokens are 8 low-entropy features over T≤16,
+        // and the round-summary block already offloads aggregates. If a
+        // capacity experiment is ever warranted, 128 (head_dim 32) is the
+        // step — decide via a BR-exploitability A/B at ≥50M steps.
         .attn_dim        = 96,
         .attn_heads      = 4,
         .ffn_mult        = 3,        // FF hidden = 128, half the trunk width
