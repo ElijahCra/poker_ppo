@@ -128,6 +128,16 @@ struct PPOConfig {
     // range was [2^-3..2^3] × that. Set kl_coef = 0 to disable (recovers
     // vanilla self-play PPO bit-for-bit).
     float kl_coef             = 0.05f;
+    // R-NaD (Perolat et al. 2022): when > 0, the magnet KL moves from the
+    // loss into the REWARDS — each π-controlled action perturbs rewards
+    // zero-sum (actor −η(logπ−logρ), opponent +η), the critic learns the
+    // regularised game, and the loss-side kl_coef term switches off.
+    // 0.1 adopted via paired 3-seed BR A/B at 36.9M steps (conv encoder):
+    // bound 1.545 (MMD loss) → 0.958 (η=0.1), while η=0.3 over-regularises
+    // to 2.047 — a clean inverted-U, so the dose is load-bearing.
+    // POKER_PPO_RNAD_ETA overrides (0 disables → MMD loss form returns).
+    // Requires kl_coef > 0 (that allocates the magnet).
+    float rnad_eta            = 0.1f;
     // Env steps between magnet refreshes. Sokota 2023's grid landed at
     // K ≈ 100 updates at the original 12,288-step batch ⇒ ≈1.23M steps.
     int64_t magnet_refresh_steps = 1'228'800;

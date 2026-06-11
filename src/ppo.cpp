@@ -33,14 +33,16 @@ inline void set_update_autocast(bool on) {
     if (!on) at::autocast::clear_cache();
 }
 
-// R-NaD reward-side regularisation (POKER_PPO_RNAD_ETA > 0). When active,
-// the magnet KL moves from the LOSS into the REWARDS (see
-// RolloutCollector::set_rnad), so the loss-side MMD term switches off —
-// running both would double-regularise.
+// R-NaD reward-side regularisation. When active, the magnet KL moves from
+// the LOSS into the REWARDS (see RolloutCollector::set_rnad), so the
+// loss-side MMD term switches off — running both would double-regularise.
+// Default from config (η=0.1, adopted via paired 3-seed BR A/B);
+// POKER_PPO_RNAD_ETA overrides, 0 restoring the MMD-loss form.
 float rnad_eta() {
     static const float eta = [] {
         const char* e = std::getenv("POKER_PPO_RNAD_ETA");
-        return e ? static_cast<float>(std::atof(e)) : 0.0f;
+        return e ? static_cast<float>(std::atof(e))
+                 : config::kPPOConfig.rnad_eta;
     }();
     return eta;
 }
