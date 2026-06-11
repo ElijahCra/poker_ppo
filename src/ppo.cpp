@@ -281,13 +281,32 @@ void PPOTrainer::train() {
     collector_->init_carry();
     opp_mgr_->reset_assignments(num_envs_);
 
-    const int total_updates = cfg_.num_updates();
+    // Experiment hygiene: POKER_PPO_MAX_STEPS caps the run so A/B arms
+    // exit cleanly (final league eval + model save still run) right after
+    // their data is collected, instead of training to total_timesteps or
+    // an external timeout. The LR/entropy schedules still anneal against
+    // the full total_timesteps, so a capped run is a prefix of a full
+    // run, not a compressed one.
+    int total_updates = cfg_.num_updates();
+    if (const char* e = std::getenv("POKER_PPO_MAX_STEPS")) {
+        const long long cap = std::atoll(e);
+        if (cap > 0) {
+            const int capped = static_cast<int>(
+                (cap + cfg_.batch_size() - 1) / cfg_.batch_size());
+            total_updates = std::min(total_updates, capped);
+            std::cout << "[override] max steps=" << cap
+                      << " -> " << total_updates << " updates\n";
+        }
+    }
 
     for (update_idx_ = 0; update_idx_ < total_updates; ++update_idx_) {
         // Linear LR anneal with min_lr_frac floor — without the floor the
-        // last quarter of training does ~no learning.
+        // last quarter of training does ~no learning. Annealed against the
+        // FULL run length (not a POKER_PPO_MAX_STEPS cap), matching the
+        // mirror in update() and keeping capped runs prefix-faithful.
         if constexpr (cfg_.anneal_lr) {
-            const float frac = 1.0f - static_cast<float>(update_idx_) / total_updates;
+            const float frac = 1.0f
+                - static_cast<float>(update_idx_) / cfg_.num_updates();
             constexpr float floor_frac = cfg_.min_lr_frac > 0.0f ? cfg_.min_lr_frac : 0.0f;
             const float lr = cfg_.learning_rate * std::max(frac, floor_frac);
             optimizer_->set_lr(lr);

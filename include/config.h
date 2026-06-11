@@ -254,18 +254,22 @@ static constexpr PPOConfig kPPOConfig{
     .num_layers       = 4,
     .hist             = BetHistoryConfig{
         .enabled         = true,    // build gate: features::ATTENTION_ENCODER
-        .max_history_len = 16,       // HUNL caps actions at ~16/hand; T² attn cost
-        // 96 assessed vs 128 (2026-06): +33% encoder width costs +7.5%
-        // wall-clock and capacity is not the binding constraint in this
-        // setup — the EV ceiling traced to imperfect info (fixed by the
-        // privileged critic), tokens are 8 low-entropy features over T≤16,
-        // and the round-summary block already offloads aggregates. If a
-        // capacity experiment is ever warranted, 128 (head_dim 32) is the
-        // step — decide via a BR-exploitability A/B at ≥50M steps.
+        // Conv adopted 2026-06-11 via paired 3-seed BR-exploitability A/B
+        // at 36.9M steps: conv max/mean 1.55/1.17 bb/hand vs attention's
+        // 2.10/1.83 — at least equal (directionally better), at 3.2×
+        // end-to-end training speed. Single-seed readings had pointed the
+        // other way (attn 0.884) — that was a weak-attacker fluke; trust
+        // only multi-seed bounds (POKER_PPO_BR_SEEDS).
+        .kind            = HistoryEncoderKind::Conv,
+        .max_history_len = 16,       // HUNL caps actions at ~16/hand
+        // For conv this is the channel count. (96-vs-128 width assessment,
+        // 2026-06: capacity is not the binding constraint in this setup —
+        // the EV ceiling traced to imperfect info, fixed by the privileged
+        // critic; tokens are 8 low-entropy features over T≤16.)
         .attn_dim        = 96,
-        .attn_heads      = 4,
-        .ffn_mult        = 3,        // FF hidden = 128, half the trunk width
-        .num_blocks      = 2,
+        .attn_heads      = 4,        // attn/pool kinds only
+        .ffn_mult        = 3,        // attn/pool kinds only
+        .num_blocks      = 2,        // attn kind only
     },
     .round_summary    = RoundSummaryConfig{
         .enabled = true,            // build gate: features::ROUND_SUMMARY
