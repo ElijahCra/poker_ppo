@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
+#include <iostream>
 #include <limits>
 
 namespace poker_ppo {
@@ -29,6 +31,21 @@ BestResponseEvaluator::BestResponseEvaluator(
       round_summary_(round_summary),
       device_(device),
       rng_(cfg.seed ? cfg.seed : std::random_device{}()) {
+
+    // POKER_PPO_BR_SEEDS=N: more independent exploiters per eval →
+    // max-over-seeds is a tighter, lower-variance bound. Routine training
+    // keeps the (cheap) config default; A/B experiments crank it up
+    // without a rebuild. With >1 seeds each exploiter re-inits from
+    // scratch, which also makes successive evals within a run comparable
+    // (warm_start is ignored).
+    if (const char* e = std::getenv("POKER_PPO_BR_SEEDS")) {
+        const int v = std::atoi(e);
+        if (v > 0) {
+            cfg_.num_exploiter_seeds = v;
+            std::cout << "[best-response] num_exploiter_seeds override: "
+                      << v << "\n";
+        }
+    }
 
     envs_.reserve(cfg_.num_envs);
     for (int i = 0; i < cfg_.num_envs; ++i)

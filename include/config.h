@@ -280,7 +280,11 @@ static constexpr PPOConfig kPPOConfig{
         .warmup_steps            = 4'915'200,
         .p_use_pool              = 0.05f,
         .max_unique_per_rollout  = 4,
-        .seed                    = 0,
+        // Fixed: pool-RNG turned out to be the dominant run-to-run noise
+        // in BR-exploitability readouts (same-config reruns differed by
+        // ±0.65 bb/hand with random_device seeding). Statistically
+        // identical for training; pairs A/B arms.
+        .seed                    = 0xA5C0FFEEull,
     },
 };
 

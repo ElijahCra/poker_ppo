@@ -81,6 +81,11 @@ int main(int argc, char** argv) {
     setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True",
            /*overwrite=*/0);
 
+    // Fixed global torch seed: with the env seed, pool seed and BR seed
+    // already pinned, this makes runs reproducible up to cuBLAS-atomics
+    // nondeterminism — and pairs A/B arms (network init, sampling stream).
+    torch::manual_seed(0x5EED);
+
     std::cout.setf(std::ios::unitbuf);  // unbuffered for PTY/log capture
 
     CliOptions opt;
