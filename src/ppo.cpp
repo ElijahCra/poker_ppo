@@ -33,6 +33,19 @@ inline void set_update_autocast(bool on) {
     if (!on) at::autocast::clear_cache();
 }
 
+// R-NaD reward-side regularisation (POKER_PPO_RNAD_ETA > 0). When active,
+// the magnet KL moves from the LOSS into the REWARDS (see
+// RolloutCollector::set_rnad), so the loss-side MMD term switches off —
+// running both would double-regularise.
+float rnad_eta() {
+    static const float eta = [] {
+        const char* e = std::getenv("POKER_PPO_RNAD_ETA");
+        return e ? static_cast<float>(std::atof(e)) : 0.0f;
+    }();
+    return eta;
+}
+bool rnad_active() { return rnad_eta() > 0.0f; }
+
 // Opt-in (POKER_PPO_PROFILE) phase profile for update(), mirroring the
 // rollout one: lap() syncs CUDA so async kernels are attributed to the
 // phase that launched them, which inflates the total vs. the clean path.
@@ -170,18 +183,22 @@ MBLossOut compute_mb_loss(ActorCritic&         network,
     // when cfg.kl_coef == 0 (vanilla PPO).
     torch::Tensor mmd_kl_loss;
     if constexpr (cfg.kl_coef > 0.0f) {
-        // KL(π || ρ) = Σ_a π(a) (log π(a) − log ρ(a)). exp(log π) for the
-        // weight keeps gradients flowing through log_probs_all itself.
-        const auto pi = er.log_probs_all.exp();
-        const auto kl = (pi * (er.log_probs_all - magnet_logp)).sum(-1);
-        mmd_kl_loss   = kl.mean();
+        if (!rnad_active()) {
+            // KL(π || ρ) = Σ_a π(a) (log π(a) − log ρ(a)). exp(log π) for
+            // the weight keeps gradients flowing through log_probs_all.
+            const auto pi = er.log_probs_all.exp();
+            const auto kl = (pi * (er.log_probs_all - magnet_logp)).sum(-1);
+            mmd_kl_loss   = kl.mean();
+        }
     }
 
     auto loss = pg_loss
               - ent_coef_now * entropy_loss
               + cfg.vf_coef * v_loss;
     if constexpr (cfg.kl_coef > 0.0f) {
-        loss = loss + cfg.kl_coef * mmd_kl_loss;
+        if (mmd_kl_loss.defined()) {
+            loss = loss + cfg.kl_coef * mmd_kl_loss;
+        }
     }
 
     torch::NoGradGuard ng;
@@ -266,6 +283,22 @@ PPOTrainer::PPOTrainer(IPokerEnvironmentFactory& env_factory,
             network_, obs_dim, action_count,
             cfg_.hidden_dim, cfg_.num_layers,
             cfg_.hist, cfg_.round_summary, device_);
+    }
+
+    // R-NaD: hand the magnet to the collector so the rollout can compute
+    // logρ(a|s) per step and perturb rewards. Needs the magnet to exist
+    // (kl_coef > 0 allocates it; the loss-side KL term is then disabled —
+    // see compute_mb_loss).
+    if (rnad_active()) {
+        if (magnet_.is_empty()) {
+            std::cerr << "[ppo] POKER_PPO_RNAD_ETA set but no magnet "
+                      << "(cfg.kl_coef == 0) — R-NaD disabled\n";
+        } else {
+            collector_->set_rnad(&magnet_, rnad_eta());
+            std::cout << "[ppo] R-NaD reward regularisation: eta="
+                      << rnad_eta() << " (magnet KL moved from loss into "
+                      << "rewards)\n";
+        }
     }
 }
 
@@ -498,10 +531,14 @@ PPOTrainer::UpdateStats PPOTrainer::update() {
     // fp32 (log_softmax stays fp32 under autocast).
     torch::Tensor magnet_logp_all;
     if constexpr (cfg_.kl_coef > 0.0f) {
-        torch::NoGradGuard ng;
-        if (use_amp) set_update_autocast(true);
-        magnet_logp_all = magnet_->masked_log_probs(b_obs, b_masks);
-        if (use_amp) set_update_autocast(false);
+        // Under R-NaD the magnet KL lives in the rewards instead; no
+        // loss-side table needed.
+        if (!rnad_active()) {
+            torch::NoGradGuard ng;
+            if (use_amp) set_update_autocast(true);
+            magnet_logp_all = magnet_->masked_log_probs(b_obs, b_masks);
+            if (use_amp) set_update_autocast(false);
+        }
     }
     ut.lap(g_update_profile.magnet_ms);
 
@@ -557,7 +594,10 @@ PPOTrainer::UpdateStats PPOTrainer::update() {
                 at::index_select_out(ug_val_,     b_val,     0, mb_idx);
                 at::index_select_out(ug_masks_,   b_masks,   0, mb_idx);
                 if constexpr (cfg_.kl_coef > 0.0f) {
-                    at::index_select_out(ug_mlogp_, magnet_logp_all, 0, mb_idx);
+                    if (magnet_logp_all.defined()) {  // off under R-NaD
+                        at::index_select_out(ug_mlogp_, magnet_logp_all,
+                                             0, mb_idx);
+                    }
                 }
                 mt.lap(g_update_profile.select_ms);
 
@@ -588,7 +628,9 @@ PPOTrainer::UpdateStats PPOTrainer::update() {
                 auto mb_masks   = b_masks.index_select(0, mb_idx);
                 torch::Tensor mb_mlogp;
                 if constexpr (cfg_.kl_coef > 0.0f) {
-                    mb_mlogp = magnet_logp_all.index_select(0, mb_idx);
+                    if (magnet_logp_all.defined()) {  // off under R-NaD
+                        mb_mlogp = magnet_logp_all.index_select(0, mb_idx);
+                    }
                 }
                 mt.lap(g_update_profile.select_ms);
 
@@ -712,7 +754,9 @@ bool PPOTrainer::ensure_update_graph(const torch::Tensor& b_obs,
         ug_val_     = torch::zeros({M},    f_dev);
         ug_masks_   = torch::zeros({M, A}, f_dev);
         if constexpr (cfg_.kl_coef > 0.0f) {
-            ug_mlogp_ = torch::zeros({M, magnet_logp_all.size(1)}, f_dev);
+            if (magnet_logp_all.defined()) {  // off under R-NaD
+                ug_mlogp_ = torch::zeros({M, magnet_logp_all.size(1)}, f_dev);
+            }
         }
 
         // Live minibatch data for warmup + capture (an all-zero legal mask
@@ -725,7 +769,9 @@ bool PPOTrainer::ensure_update_graph(const torch::Tensor& b_obs,
         at::index_select_out(ug_val_,     b_val,     0, mb_idx);
         at::index_select_out(ug_masks_,   b_masks,   0, mb_idx);
         if constexpr (cfg_.kl_coef > 0.0f) {
-            at::index_select_out(ug_mlogp_, magnet_logp_all, 0, mb_idx);
+            if (magnet_logp_all.defined()) {  // off under R-NaD
+                at::index_select_out(ug_mlogp_, magnet_logp_all, 0, mb_idx);
+            }
         }
 
         // Autocast cache must be OFF from warmup through capture: a cached

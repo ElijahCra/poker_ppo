@@ -344,6 +344,16 @@ public:
     // Reset envs + carry tensors. Call once before training.
     void init_carry();
 
+    // R-NaD reward-side regularisation (Perolat et al. 2022). When set,
+    // the rollout also computes the magnet's log-prob of each taken
+    // action (5th packed row; the magnet runs INSIDE the CUDA graph,
+    // which stays valid across refreshes because the magnet is refreshed
+    // in place), and each π-controlled action perturbs rewards zero-sum:
+    // actor −η(logπ−logρ), opponent +η(logπ−logρ). The critic then
+    // learns the regularised game's values. Pool-snapshot actions are
+    // not transformed. Call before the first collect().
+    void set_rnad(ActorCritic* magnet, float eta);
+
     // One rollout: fill buffer, bootstrap, compute returns, update carry,
     // advance global_step_. global_step_ is forwarded to opp_mgr for its
     // step-denominated warmup/snapshot cadences.
@@ -390,8 +400,13 @@ private:
     torch::Tensor g_obs_, g_mask_;  // static inputs
     // Static output: [4, N] fp32 {action, log_prob, value, v_bar} packed
     // in-graph so each step pays a single D2H copy (into packed_pin_).
+    // R-NaD adds a 5th row: magnet log-prob of the taken action.
     torch::Tensor g_packed_;
-    torch::Tensor packed_pin_;      // [4, N] pinned CPU staging
+    torch::Tensor packed_pin_;      // [4|5, N] pinned CPU staging
+
+    // R-NaD state (set_rnad). Non-owning; the magnet outlives collects.
+    ActorCritic* rnad_magnet_ = nullptr;
+    float        rnad_eta_    = 0.0f;
 
     // Opt-in phase profiling (POKER_PPO_PROFILE). Indexed by Strategy so a
     // serial/threadpool A/B keeps the two breakdowns separate.

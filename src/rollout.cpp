@@ -257,16 +257,23 @@ void print_profile(const char* name, const RolloutProfile& p) {
     std::cout.unsetf(std::ios::fixed);
 }
 
-// {action, log_prob, value, v_bar} as one [4, B] fp32 tensor — a single
-// D2H round trip per step instead of four. Action indices are < the action
-// count (≪ 2^24), so the float32 round trip is exact. The explicit fp32
-// casts are no-ops in eager fp32 but required under bf16 autocast capture
-// (critic outputs come back bf16 there).
-torch::Tensor pack_action_result(const ActorCriticImpl::ActionResult& ar) {
-    return torch::stack({ar.action.to(torch::kFloat32),
-                         ar.log_prob.to(torch::kFloat32),
-                         ar.value.to(torch::kFloat32),
-                         ar.v_bar.to(torch::kFloat32)}, 0);
+// {action, log_prob, value, v_bar[, magnet_logp]} as one [4|5, B] fp32
+// tensor — a single D2H round trip per step instead of several. Action
+// indices are < the action count (≪ 2^24), so the float32 round trip is
+// exact. The explicit fp32 casts are no-ops in eager fp32 but required
+// under bf16 autocast capture (critic outputs come back bf16 there).
+// magnet_logp (R-NaD) is the magnet's log-prob of the taken action; pass
+// an undefined tensor when the transform is off.
+torch::Tensor pack_action_result(const ActorCriticImpl::ActionResult& ar,
+                                 const torch::Tensor& magnet_logp = {}) {
+    std::vector<torch::Tensor> rows = {ar.action.to(torch::kFloat32),
+                                       ar.log_prob.to(torch::kFloat32),
+                                       ar.value.to(torch::kFloat32),
+                                       ar.v_bar.to(torch::kFloat32)};
+    if (magnet_logp.defined()) {
+        rows.push_back(magnet_logp.to(torch::kFloat32));
+    }
+    return torch::stack(rows, 0);
 }
 
 struct BootstrapTensors {
@@ -341,6 +348,27 @@ void RolloutCollector::ensure_step_pool() {
     step_pool_   = std::make_unique<StepThreadPool>(n);
 }
 
+void RolloutCollector::set_rnad(ActorCritic* magnet, float eta) {
+    TORCH_CHECK(graph_state_ == GraphState::Unset,
+                "set_rnad must be called before the first collect() — the "
+                "CUDA graph capture bakes in the magnet forward");
+    rnad_magnet_ = magnet;
+    rnad_eta_    = eta;
+}
+
+namespace {
+// Magnet log-prob of the taken action — the logρ side of R-NaD's
+// −η(logπ−logρ) reward perturbation. Runs under the caller's NoGrad.
+torch::Tensor magnet_logp_of(ActorCritic& magnet,
+                             const torch::Tensor& obs,
+                             const torch::Tensor& mask,
+                             const torch::Tensor& action) {
+    return magnet->masked_log_probs(obs, mask)
+        .gather(-1, action.unsqueeze(-1))
+        .squeeze(-1);
+}
+}  // namespace
+
 bool RolloutCollector::ensure_cuda_graph(ActorCritic& network) {
     if (!device_.is_cuda()) return false;
     if (std::getenv("POKER_PPO_NO_CUDA_GRAPH") != nullptr) return false;
@@ -379,12 +407,24 @@ bool RolloutCollector::ensure_cuda_graph(ActorCritic& network) {
         // Capture must run on a non-default stream; warmup on the same
         // stream first so cuBLAS handles + workspaces exist before the
         // capture window (allocating them inside capture is illegal).
+        // One inference pass: policy get_action, plus (R-NaD) the magnet's
+        // log-prob of the sampled action. The magnet's parameter storage is
+        // stable (in-place refresh), so capturing it is refresh-safe.
+        auto run_inference = [&] {
+            auto ar = network->get_action(g_obs_, g_mask_);
+            torch::Tensor mlp;
+            if (rnad_magnet_) {
+                mlp = magnet_logp_of(*rnad_magnet_, g_obs_, g_mask_, ar.action);
+            }
+            return pack_action_result(ar, mlp);
+        };
+
         auto stream = at::cuda::getStreamFromPool();
         {
             c10::cuda::CUDAStreamGuard guard(stream);
             if (graph_amp) set_amp(true);
             for (int i = 0; i < 3; ++i) {
-                (void)pack_action_result(network->get_action(g_obs_, g_mask_));
+                (void)run_inference();
             }
             at::cuda::getCurrentCUDAStream().synchronize();
 
@@ -392,7 +432,7 @@ bool RolloutCollector::ensure_cuda_graph(ActorCritic& network) {
             graph_->capture_begin();
             // Packed output storage lives in the graph's private pool;
             // each replay rewrites it in place.
-            g_packed_ = pack_action_result(network->get_action(g_obs_, g_mask_));
+            g_packed_ = run_inference();
             graph_->capture_end();
             if (graph_amp) set_amp(false);
         }
@@ -498,7 +538,7 @@ void RolloutCollector::collect(Strategy         strategy,
     // Pinned staging for the packed step outputs (reused across steps;
     // fully consumed before the next step overwrites it).
     if (!packed_pin_.defined()) {
-        packed_pin_ = torch::zeros({4, N}, f_pin);
+        packed_pin_ = torch::zeros({rnad_magnet_ ? 5 : 4, N}, f_pin);
     }
 
     for (int step = 0; step < num_steps_; ++step) {
@@ -526,7 +566,12 @@ void RolloutCollector::collect(Strategy         strategy,
             cur_mask = cur_mask_cpu.to(device_, /*non_blocking=*/true);
             pt.lap(prof.h2d_ms);
 
-            packed_dev = pack_action_result(network->get_action(cur_obs, cur_mask));
+            auto ar = network->get_action(cur_obs, cur_mask);
+            torch::Tensor mlp;
+            if (rnad_magnet_) {
+                mlp = magnet_logp_of(*rnad_magnet_, cur_obs, cur_mask, ar.action);
+            }
+            packed_dev = pack_action_result(ar, mlp);
             pt.lap(prof.infer_ms);
         }
 
@@ -571,6 +616,19 @@ void RolloutCollector::collect(Strategy         strategy,
                     acting, i, *buffer_,
                     cur_obs_cpu[i], cur_mask_cpu[i],
                     a_acc[i], pk_acc[1][i], pk_acc[2][i], pk_acc[3][i]);
+
+                // R-NaD: perturb rewards zero-sum for this π-controlled
+                // action — actor −η(logπ−logρ), opponent +η(logπ−logρ).
+                // Lands in the accumulator, i.e. in THIS transition's
+                // reward (closed at the actor's next action / terminal),
+                // and flows into returns so the critic learns the
+                // regularised game. Pool-snapshot actions (should_record
+                // false) are not transformed.
+                if (rnad_eta_ > 0.0f) {
+                    const float d = pk_acc[1][i] - pk_acc[4][i];
+                    player_state[i].step_reward(
+                        acting == 0 ? -rnad_eta_ * d : rnad_eta_ * d);
+                }
             }
 
             float* const obs_dst  = next_obs_p  + static_cast<size_t>(i) * D;
