@@ -1,0 +1,14 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "poker-table",
+      "runtimeExecutable": "wsl",
+      "runtimeArgs": [
+        "-e", "bash", "-lc",
+        "cd /mnt/c/Users/Elijah/CLionProjects/poker_ppo && python3 tools/play_web.py --model poker_ppo_model_nlhe_full_52.pt --no-browser --port 8777"
+      ],
+      "port": 8777
+    }
+  ]
+}
