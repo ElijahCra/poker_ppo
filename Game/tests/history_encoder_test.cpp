@@ -161,4 +161,28 @@ TEST(HistoryEncoderKinds, ActorCriticIntegrationAndClone) {
     }
 }
 
+// decomposed_entropy chain rule: at size_weight=1 it must equal the full
+// Shannon entropy exactly, including with masked (≈zero-prob) actions.
+TEST(DecomposedEntropy, ChainRuleEqualsFullEntropyAtWeight1) {
+    torch::manual_seed(3);
+    const int B = 64, A = 14;
+    auto logits = torch::randn({B, A}) * 3.0f;
+    // Random legal masks (≥2 legal incl. fold+call to mirror the game).
+    auto mask = (torch::rand({B, A}) > 0.4f).to(torch::kFloat32);
+    mask.narrow(1, 0, 2).fill_(1.0f);
+    auto masked  = logits + (1.0f - mask) * (-1e8f);
+    auto logp    = torch::log_softmax(masked, -1);
+    auto p       = logp.exp();
+    auto h_full  = -(p * logp.clamp_min(-30.0f)).sum(-1);
+
+    auto h_dec = poker_ppo::decomposed_entropy(logp, /*size_weight=*/1.0);
+    EXPECT_TRUE(torch::allclose(h_dec, h_full, /*rtol=*/1e-4, /*atol=*/1e-5))
+        << "max |Δ| = " << (h_dec - h_full).abs().max().item<float>();
+
+    // size_weight=0 keeps only the 3-way type entropy: bounded by ln 3.
+    auto h_type = poker_ppo::decomposed_entropy(logp, /*size_weight=*/0.0);
+    EXPECT_TRUE((h_type <= std::log(3.0f) + 1e-4).all().item<bool>());
+    EXPECT_TRUE((h_type >= -1e-6).all().item<bool>());
+}
+
 }  // namespace

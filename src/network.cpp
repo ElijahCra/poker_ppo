@@ -556,6 +556,22 @@ ActorCriticImpl::masked_log_probs(torch::Tensor obs, torch::Tensor legal_mask) {
     return torch::log_softmax(apply_mask(logits, legal_mask), -1);
 }
 
+torch::Tensor decomposed_entropy(const torch::Tensor& log_probs_all,
+                                 double size_weight) {
+    auto p       = log_probs_all.exp();                       // [B, A]
+    auto p_f     = p.narrow(-1, 0, 1);
+    auto p_c     = p.narrow(-1, 1, 1);
+    auto p_sizes = p.narrow(-1, 2, p.size(-1) - 2);
+    auto p_r     = p_sizes.sum(-1, /*keepdim=*/true);
+
+    // clamp_min keeps 0·log0 = 0 for masked-out (≈zero-prob) actions.
+    auto type_p = torch::cat({p_f, p_c, p_r}, -1);
+    auto h_type = -(type_p * type_p.clamp_min(1e-12f).log()).sum(-1);
+    auto h_size = -(p_sizes * (p_sizes.clamp_min(1e-12f).log()
+                               - p_r.clamp_min(1e-12f).log())).sum(-1);
+    return h_type + size_weight * h_size;
+}
+
 void copy_actor_critic_params(const ActorCritic& src, ActorCritic& dst) {
     torch::NoGradGuard ng;
     auto sp = src->parameters();

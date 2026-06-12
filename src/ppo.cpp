@@ -167,8 +167,20 @@ MBLossOut compute_mb_loss(ActorCritic&         network,
     // static branch, so it's baked consistently into the CUDA graph.
     static const bool norm_entropy =
         std::getenv("POKER_PPO_NORM_ENTROPY") != nullptr;
+    // POKER_PPO_ENTROPY_SIZE_WEIGHT < 1 removes the raise-multiplicity
+    // entropy subsidy (see decomposed_entropy): the bonus keeps rewarding
+    // fold/call/raise mixing but no longer pays ~ln(12) for spreading
+    // mass across raise sizes — the audited cause of weak-hand
+    // aggression. 1.0 (default) is exactly the plain entropy.
+    static const float ent_size_weight = [] {
+        const char* e = std::getenv("POKER_PPO_ENTROPY_SIZE_WEIGHT");
+        return e ? static_cast<float>(std::atof(e)) : 1.0f;
+    }();
     torch::Tensor entropy_loss;
-    if (norm_entropy) {
+    if (ent_size_weight != 1.0f) {
+        entropy_loss =
+            decomposed_entropy(er.log_probs_all, ent_size_weight).mean();
+    } else if (norm_entropy) {
         // clamp_min(2): single-legal-action states have zero entropy
         // anyway; this just keeps the denominator away from ln(1)=0.
         auto max_ent = torch::log(mb_masks.sum(-1).clamp_min(2.0f));

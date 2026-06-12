@@ -211,6 +211,18 @@ private:
 
 TORCH_MODULE(ActorCritic);
 
+// Chain-rule decomposition of policy entropy over the poker action space:
+//   H(π) = H(fold, call, Σraises) + P(raise)·H(sizes | raise)
+// At size_weight=1 this equals the full entropy exactly (unit-tested).
+// The second term is what makes a vanilla entropy bonus subsidise
+// aggression: 12 of 14 actions are raise sizes, so spreading mass over
+// them buys ~ln(12) extra entropy — the audited result is weak hands
+// carrying ~67% raise mass at ~5% per size (noise, not beliefs).
+// size_weight < 1 keeps fold/call/raise exploration while removing the
+// raise-multiplicity subsidy. log_probs_all: [B, A] masked log-softmax.
+torch::Tensor decomposed_entropy(const torch::Tensor& log_probs_all,
+                                 double size_weight);
+
 // In-place parameter+buffer copy between structurally identical networks.
 // Used for the magnet refresh: keeping the destination's storage stable
 // (no realloc) means captured CUDA graphs that reference it stay valid.

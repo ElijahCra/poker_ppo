@@ -285,6 +285,26 @@ int cmd_play(IPokerEnvironmentFactory& factory,
         std::cout << "OK" << std::endl;
     };
 
+    // Deployment-time sharpening (DeepNash-style): the training policy is
+    // an entropy-regularised QRE whose raise mass is thinly spread across
+    // the 12 size slots (audited: trash hands carry ~67% total raise mass
+    // at ~5% per size — noise, not beliefs). Dropping low-probability
+    // actions and renormalising removes that noise while leaving
+    // concentrated value-raises intact. Defaults: min_p=0.10, temp=1.0;
+    // POKER_PPO_PLAY_MIN_P=0 restores the raw training policy.
+    const float play_min_p = [] {
+        const char* e = std::getenv("POKER_PPO_PLAY_MIN_P");
+        return e ? static_cast<float>(std::atof(e)) : 0.10f;
+    }();
+    const float play_temp = [] {
+        const char* e = std::getenv("POKER_PPO_PLAY_TEMP");
+        const float t = e ? static_cast<float>(std::atof(e)) : 1.0f;
+        return t > 0.0f ? t : 1.0f;
+    }();
+    std::cerr << "[play] sampling: min_p=" << play_min_p
+              << " temp=" << play_temp
+              << " (POKER_PPO_PLAY_MIN_P / POKER_PPO_PLAY_TEMP)\n";
+
     auto emit_model = [&]() {
         torch::NoGradGuard ng;
         auto obs  = env->observation().unsqueeze(0).to(device);
@@ -292,12 +312,23 @@ int cmd_play(IPokerEnvironmentFactory& factory,
         auto [logits, critic_raw] = net->forward(obs);
         (void)critic_raw;  // VRPO: Q(s,·); report the masked expected value V̄
         const auto masked = logits + (1.0f - mask) * kIllegalActionLogit;
-        const auto probs  = torch::softmax(masked, -1).squeeze(0).to(torch::kCPU).contiguous();
-        // Stochastic sample (matches the training rollout).
-        const auto ar      = net->get_action(obs, mask);
-        const auto sampled = ar.action.to(torch::kCPU).item<int64_t>();
-        // Argmax for diagnostics.
-        const auto greedy  = std::get<1>(probs.max(0)).item<int64_t>();
+        auto probs = torch::softmax(masked / play_temp, -1)
+                         .squeeze(0).to(torch::kCPU).contiguous();
+        // Argmax for diagnostics (sharpening never changes it).
+        const auto greedy = std::get<1>(probs.max(0)).item<int64_t>();
+        if (play_min_p > 0.0f) {
+            auto kept = probs * (probs >= play_min_p).to(torch::kFloat32);
+            const float z = kept.sum().item<float>();
+            if (z > 0.0f) {
+                probs = kept / z;
+            } else {
+                probs = torch::zeros_like(probs);  // all filtered → argmax
+                probs[greedy] = 1.0f;
+            }
+        }
+        // Stochastic sample from the (possibly sharpened) distribution.
+        const auto sampled =
+            probs.multinomial(1).item<int64_t>();
         const float value  = net->get_state_value(obs, mask).item<float>();
         std::cout << "sampled "  << sampled << "\n";
         std::cout << "greedy "   << greedy  << "\n";
