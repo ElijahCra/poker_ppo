@@ -174,7 +174,8 @@ MBLossOut compute_mb_loss(ActorCritic&         network,
     // aggression. 1.0 (default) is exactly the plain entropy.
     static const float ent_size_weight = [] {
         const char* e = std::getenv("POKER_PPO_ENTROPY_SIZE_WEIGHT");
-        return e ? static_cast<float>(std::atof(e)) : 1.0f;
+        return e ? static_cast<float>(std::atof(e))
+                 : config::kPPOConfig.entropy_size_weight;
     }();
     torch::Tensor entropy_loss;
     if (ent_size_weight != 1.0f) {

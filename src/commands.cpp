@@ -200,10 +200,17 @@ int cmd_train(IPokerEnvironmentFactory& factory,
     metrics.log_league(/*update=*/-1, /*step=*/-1, final_results);
     league.print_results(final_results);
 
+    // Canonical copy lives in the run dir (immune to later runs — a fixed
+    // filename once cost us a 600M-step model overwritten by a 37M-step
+    // experiment arm); the legacy fixed name stays as a "latest" pointer
+    // for play tooling.
+    const std::string run_model_path = metrics.run_dir() + "/model.pt";
+    trainer.save(run_model_path);
     const std::string model_path =
         std::string("poker_ppo_model_") + std::string(poker_cfg.game.name) + ".pt";
     trainer.save(model_path);
-    std::cout << "\nModel saved to " << model_path << "\n";
+    std::cout << "\nModel saved to " << run_model_path
+              << " (and latest-pointer " << model_path << ")\n";
     return 0;
 }
 

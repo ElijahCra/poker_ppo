@@ -101,6 +101,16 @@ struct PPOConfig {
     bool  anneal_ent_coef  = false;
     float ent_coef_min     = 0.01f;
 
+    // Weight on the raise-size term of the chain-rule entropy
+    // decomposition H = H(fold,call,raise) + w·P(raise)·H(sizes|raise).
+    // 1.0 = plain entropy. 0.25 adopted 2026-06-12: with 12 of 14 actions
+    // being raise sizes, plain entropy pays ~ln(12) for spreading mass
+    // across raises — the audited cause of weak-hand over-aggression AND
+    // the dominant exploitability leak: paired 3-seed BR bound fell
+    // 0.958 → 0.228 bb/hand (mean 0.743 → −0.486; exploiters lose).
+    // POKER_PPO_ENTROPY_SIZE_WEIGHT overrides (1.0 restores plain).
+    float entropy_size_weight = 0.25f;
+
     int   num_envs         = 8;
     int   num_steps        = 128;
     int   update_epochs    = 4;
