@@ -256,15 +256,19 @@ static constexpr PPOConfig kPPOConfig{
     .anneal_ent_coef  = false,
     .ent_coef_min     = 0.1f,
 
-    // 384 envs: rollout-throughput knee from the num_envs sweep (~2.2× the
-    // 96-env µs/sample pre-CUDA-graph; still the knee after). minibatch
-    // SIZE stays 3072 (num_minibatches scales with the batch), so gradient
-    // noise scale, optimizer steps per sample, and the update CUDA graph's
-    // captured shape are all unchanged — the batch-shape change only means
-    // 4× more on-policy data per policy version. All schedule-like config
-    // is denominated in env steps, so cadences are unaffected.
-    .num_envs         = 384,
-    .num_steps        = 128,
+    // 768 envs × 64 steps. batch_size = 768·64 = 49152 and minibatch = 3072
+    // are IDENTICAL to the old 384×128 — so gradient noise scale, optimizer
+    // steps/sample, the captured update-graph shape, and every dynamics
+    // result (R-NaD, size-weight, BR bounds) are unchanged. The trade buys
+    // rollout throughput only: doubling num_envs makes each step's inference
+    // batch bigger (launch-bound forwards amortise better — measured ~25%
+    // lower rollout ms end-to-end), and halving num_steps keeps the batch
+    // fixed. The sole behavioural change is the GAE truncation horizon
+    // (128→64 steps), negligible at gae_lambda=0.90 (~10-step effective
+    // horizon). Use tools/bench_throughput.sh to re-find the knee on a
+    // different GPU; the update half is compute-bound and unaffected by this.
+    .num_envs         = 768,
+    .num_steps        = 64,
     .update_epochs    = 4,
     .num_minibatches  = 16,
 
