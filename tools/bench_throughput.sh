@@ -14,11 +14,55 @@
 # but must not be used to train). For the update half, see the block at the
 # bottom of this file.
 #
+# ── CPU thread sweep (NEW) ──────────────────────────────────────────────────
+# env_step (game engine + obs build) is the CPU-bound rollout phase; the step
+# thread pool parallelises it across envs. POKER_PPO_STEP_THREADS overrides
+# the worker count (default = all cores, capped at num_envs). Also runtime,
+# so this sweep needs no rebuild. More threads help only up to a knee — each
+# env step is tiny, so past it the per-step barrier sync dominates. Run this
+# to size the pool on a many-core box (the default of "all cores" can be past
+# the knee → oversubscription).
+#
 # Usage:
-#   tools/bench_throughput.sh [binary] [iters] [N1 N2 ...]
+#   tools/bench_throughput.sh [binary] [iters] [N1 N2 ...]          # num_envs sweep (GPU)
+#   tools/bench_throughput.sh threads [num_envs] [iters] [T1 T2 ...] # thread sweep (CPU)
 #   tools/bench_throughput.sh                       # defaults
 #   tools/bench_throughput.sh cmake-build-release/poker_ppo 40 512 1024 2048 4096
+#   tools/bench_throughput.sh threads 1024 30 4 8 16 24 32 48 64
 set -uo pipefail
+
+# Thread-sweep mode dispatches early; everything below is the num_envs sweep.
+if [ "${1:-}" = "threads" ]; then
+  BIN="cmake-build-release/poker_ppo"
+  NENVS="${2:-1024}"
+  ITERS="${3:-30}"
+  THREADS=("${@:4}")
+  if [ ${#THREADS[@]} -eq 0 ]; then THREADS=(2 4 8 16 24 32 48 64); fi
+  if [ ! -x "$BIN" ]; then echo "binary not found: $BIN" >&2; exit 1; fi
+  echo "CPU thread sweep at num_envs=$NENVS ($(nproc) logical cores available)"
+  printf '%9s  %14s  %12s\n' threads "us/sample" "rollout_ms"
+  printf '%9s  %14s  %12s\n' "-------" "---------" "----------"
+  bu=""; bt=""
+  for T in "${THREADS[@]}"; do
+    [ "$T" -gt "$NENVS" ] 2>/dev/null && continue   # capped at num_envs anyway
+    line=$(POKER_PPO_STEP_THREADS="$T" POKER_PPO_NUM_ENVS="$NENVS" \
+           "$BIN" --benchmark "$ITERS" 2>/dev/null \
+           | grep -E '^[[:space:]]+threadpool' | head -1 || true)
+    us=$(sed -n 's/.*us\/samp=\([0-9.][0-9.]*\).*/\1/p' <<<"$line")
+    ms=$(sed -n 's/.*med=\([0-9.][0-9.]*\)ms.*/\1/p' <<<"$line")
+    if [ -z "$us" ]; then printf '%9s  %14s\n' "$T" "ERR"; continue; fi
+    printf '%9s  %14s  %12s\n' "$T" "$us" "$ms"
+    if [ -z "$bu" ] || awk "BEGIN{exit !($us < $bu)}"; then bu="$us"; bt="$T"; fi
+  done
+  echo
+  echo "Best: POKER_PPO_STEP_THREADS=$bt at ${bu} us/sample."
+  echo "Adopt the smallest thread count within ~5% of best (lower = less"
+  echo "contention with the GPU/driver threads). Default (all cores) is good"
+  echo "if it's at/below the knee; if a smaller count is faster, the pool is"
+  echo "oversubscribed — set POKER_PPO_STEP_THREADS at runtime, or change the"
+  echo "default in RolloutCollector::ensure_step_pool (src/rollout.cpp)."
+  exit 0
+fi
 
 BIN="${1:-cmake-build-release/poker_ppo}"
 ITERS="${2:-30}"

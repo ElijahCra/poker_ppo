@@ -343,8 +343,22 @@ RolloutCollector::~RolloutCollector() {
 
 void RolloutCollector::ensure_step_pool() {
     if (step_pool_) return;
+    // Default: one worker per core (capped at num_envs). env_step is the
+    // CPU-bound rollout phase (game engine + obs build), parallelised
+    // across envs by this pool — so it scales with cores up to a knee,
+    // past which per-step sync overhead dominates (each env step is tiny).
+    // POKER_PPO_STEP_THREADS overrides the worker count to sweep that knee
+    // on a new CPU without a rebuild.
     const int hw = std::max(1, static_cast<int>(std::thread::hardware_concurrency()));
-    const int n  = std::min(num_envs_, hw);
+    int n = std::min(num_envs_, hw);
+    if (const char* e = std::getenv("POKER_PPO_STEP_THREADS")) {
+        const int v = std::atoi(e);
+        if (v > 0) {
+            n = std::min(num_envs_, v);
+            std::cout << "[rollout] step-pool workers=" << n
+                      << " (POKER_PPO_STEP_THREADS)\n";
+        }
+    }
     step_pool_   = std::make_unique<StepThreadPool>(n);
 }
 
