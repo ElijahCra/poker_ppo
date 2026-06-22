@@ -118,6 +118,12 @@ struct PPOConfig {
 
     int   total_timesteps  = 10'000'000;
 
+    // Periodic full-state checkpoint cadence, in env steps (0 disables).
+    // ~50 checkpoints over a 600M-step run; each is net+magnet+Adam moments
+    // (~50 MB). POKER_PPO_CHECKPOINT_STEPS overrides; POKER_PPO_RESUME=<dir>
+    // resumes. See PPOTrainer::save_checkpoint.
+    int64_t checkpoint_every_steps = 12'000'000;
+
     int   hidden_dim       = 512;
     int   num_layers       = 3;
     BetHistoryConfig    hist;

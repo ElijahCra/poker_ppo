@@ -48,6 +48,18 @@ public:
     // writes into static graph-pool tensors instead of param.grad().
     void step(const std::vector<torch::Tensor>& grads);
 
+    // Checkpoint state: first/second moment buffers (per param, same order
+    // as params()) and the bias-correction step count. Restoring these on
+    // resume avoids a cold-Adam LR transient.
+    [[nodiscard]] const std::vector<torch::Tensor>& exp_avg()    const noexcept { return exp_avg_; }
+    [[nodiscard]] const std::vector<torch::Tensor>& exp_avg_sq() const noexcept { return exp_avg_sq_; }
+    [[nodiscard]] int64_t step_count() const noexcept { return step_count_; }
+
+    // Copy moments + step in (shapes must match params()). NoGrad in-place.
+    void load_state(const std::vector<torch::Tensor>& m,
+                    const std::vector<torch::Tensor>& v,
+                    int64_t step);
+
 private:
     std::vector<torch::Tensor> params_;
     std::vector<torch::Tensor> exp_avg_;

@@ -6,6 +6,7 @@
 #include "poker_env.h"
 
 #include <chrono>
+#include <cstdlib>
 #include <iomanip>
 #include <iostream>
 #include <memory>
@@ -97,6 +98,25 @@ int cmd_train(IPokerEnvironmentFactory& factory,
     std::cout << "Metrics dir: " << metrics.run_dir() << "\n"
               << "  (live plots: `python tools/plot_live.py "
               << metrics.run_dir() << "`)\n";
+
+    // Resume a cut-off run: POKER_PPO_RESUME=<ckpt_dir> loads network +
+    // optimizer + counters before training (continues from the saved
+    // update; opponent pool refills from empty). Periodic checkpoints are
+    // written to this run's dir; cadence from config or
+    // POKER_PPO_CHECKPOINT_STEPS.
+    if (const char* r = std::getenv("POKER_PPO_RESUME")) {
+        trainer.load_checkpoint(r);
+    }
+    int64_t ckpt_steps = ppo_cfg.checkpoint_every_steps;
+    if (const char* e = std::getenv("POKER_PPO_CHECKPOINT_STEPS")) {
+        ckpt_steps = std::atoll(e);
+    }
+    trainer.set_checkpoint(metrics.run_dir() + "/ckpt", ckpt_steps);
+    if (ckpt_steps > 0) {
+        std::cout << "Checkpointing: every " << ckpt_steps << " steps → "
+                  << metrics.run_dir() << "/ckpt"
+                  << "  (resume: POKER_PPO_RESUME=<dir>)\n";
+    }
 
     trainer.set_log_callback([&](const PPOTrainer::UpdateStats& s) {
         metrics.log_update(s);

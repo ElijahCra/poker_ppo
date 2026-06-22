@@ -18,6 +18,19 @@ ForeachAdam::ForeachAdam(std::vector<torch::Tensor> params,
     }
 }
 
+void ForeachAdam::load_state(const std::vector<torch::Tensor>& m,
+                             const std::vector<torch::Tensor>& v,
+                             int64_t step) {
+    TORCH_CHECK(m.size() == exp_avg_.size() && v.size() == exp_avg_sq_.size(),
+                "ForeachAdam::load_state: moment count mismatch");
+    torch::NoGradGuard ng;
+    for (size_t i = 0; i < exp_avg_.size(); ++i) {
+        exp_avg_[i].copy_(m[i]);       // copy_ handles device/dtype
+        exp_avg_sq_[i].copy_(v[i]);
+    }
+    step_count_ = step;
+}
+
 void ForeachAdam::zero_grad() {
     for (auto& p : params_) p.mutable_grad().reset();
 }

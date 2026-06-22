@@ -11,6 +11,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <filesystem>
 #include <iomanip>
 #include <iostream>
 #include <numeric>
@@ -347,7 +348,7 @@ void PPOTrainer::train() {
         }
     }
 
-    for (update_idx_ = 0; update_idx_ < total_updates; ++update_idx_) {
+    for (update_idx_ = start_update_; update_idx_ < total_updates; ++update_idx_) {
         // Linear LR anneal with min_lr_frac floor — without the floor the
         // last quarter of training does ~no learning. Annealed against the
         // FULL run length (not a POKER_PPO_MAX_STEPS cap), matching the
@@ -407,6 +408,15 @@ void PPOTrainer::train() {
                 // stays valid across refreshes.
                 copy_actor_critic_params(network_, magnet_);
             }
+        }
+
+        // Periodic resume checkpoint (env-step cadence; interval-crossing).
+        if (ckpt_every_steps_ > 0 && !ckpt_dir_.empty() &&
+            global_step - last_ckpt_step_ >= ckpt_every_steps_) {
+            last_ckpt_step_ = global_step;
+            save_checkpoint(ckpt_dir_);
+            std::cout << "[checkpoint] @ update " << update_idx_
+                      << " step " << global_step << " → " << ckpt_dir_ << "\n";
         }
     }
 }
@@ -874,6 +884,86 @@ void PPOTrainer::save(const std::string& path) {
 
 void PPOTrainer::load(const std::string& path) {
     torch::load(network_, path);
+}
+
+void PPOTrainer::save_checkpoint(const std::string& dir) {
+    namespace fs = std::filesystem;
+    // Write to a sibling tmp dir, then rename over `dir` so a crash mid-
+    // write never leaves a half-written checkpoint that resume would load.
+    const fs::path final_dir = dir;
+    const fs::path tmp_dir   = final_dir.string() + ".tmp";
+    std::error_code ec;
+    fs::remove_all(tmp_dir, ec);
+    fs::create_directories(tmp_dir, ec);
+
+    torch::save(network_, (tmp_dir / "net.pt").string());
+    if (!magnet_.is_empty()) {
+        torch::save(magnet_, (tmp_dir / "magnet.pt").string());
+    }
+
+    // Optimizer moments + counters in one keyed archive.
+    torch::serialize::OutputArchive ar;
+    const auto& m = optimizer_->exp_avg();
+    const auto& v = optimizer_->exp_avg_sq();
+    ar.write("update_idx",  torch::tensor(static_cast<int64_t>(update_idx_)));
+    ar.write("global_step", torch::tensor(static_cast<int64_t>(collector_->global_step())));
+    ar.write("adam_step",   torch::tensor(static_cast<int64_t>(optimizer_->step_count())));
+    ar.write("magnet_refresh_step", torch::tensor(last_magnet_refresh_step_));
+    ar.write("n",           torch::tensor(static_cast<int64_t>(m.size())));
+    for (size_t i = 0; i < m.size(); ++i) {
+        ar.write("m" + std::to_string(i), m[i].to(torch::kCPU));
+        ar.write("v" + std::to_string(i), v[i].to(torch::kCPU));
+    }
+    ar.save_to((tmp_dir / "state.pt").string());
+
+    fs::remove_all(final_dir, ec);
+    fs::rename(tmp_dir, final_dir, ec);
+    if (ec) {  // cross-device or race: fall back to copy
+        fs::remove_all(final_dir, ec);
+        fs::copy(tmp_dir, final_dir, fs::copy_options::recursive, ec);
+        fs::remove_all(tmp_dir, ec);
+    }
+}
+
+bool PPOTrainer::load_checkpoint(const std::string& dir) {
+    namespace fs = std::filesystem;
+    const fs::path d = dir;
+    if (!fs::exists(d / "net.pt") || !fs::exists(d / "state.pt")) {
+        std::cerr << "[resume] no checkpoint at " << dir << "\n";
+        return false;
+    }
+
+    torch::load(network_, (d / "net.pt").string(), device_);
+    if (!magnet_.is_empty() && fs::exists(d / "magnet.pt")) {
+        torch::load(magnet_, (d / "magnet.pt").string(), device_);
+    }
+
+    torch::serialize::InputArchive ar;
+    ar.load_from((d / "state.pt").string(), device_);
+    auto read_i64 = [&](const char* key) {
+        torch::Tensor t;
+        ar.read(key, t);
+        return t.item<int64_t>();
+    };
+    start_update_ = static_cast<int>(read_i64("update_idx"));
+    collector_->set_global_step(static_cast<int>(read_i64("global_step")));
+    last_magnet_refresh_step_ = read_i64("magnet_refresh_step");
+    last_ckpt_step_ = collector_->global_step();
+    const int64_t adam_step = read_i64("adam_step");
+    const int64_t n = read_i64("n");
+
+    std::vector<torch::Tensor> m(n), v(n);
+    for (int64_t i = 0; i < n; ++i) {
+        ar.read("m" + std::to_string(i), m[i]);
+        ar.read("v" + std::to_string(i), v[i]);
+    }
+    optimizer_->load_state(m, v, adam_step);
+
+    std::cout << "[resume] loaded checkpoint @ update " << start_update_
+              << " (step " << collector_->global_step()
+              << "); optimizer + magnet restored, opponent pool refills "
+              << "from empty\n";
+    return true;
 }
 
 } // namespace poker_ppo

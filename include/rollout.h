@@ -366,6 +366,7 @@ public:
     [[nodiscard]] int                   obs_dim()      const noexcept { return vec_env_->obs_dim(); }
     [[nodiscard]] int                   action_count() const noexcept { return vec_env_->action_count(); }
     [[nodiscard]] int                   global_step()  const noexcept { return global_step_; }
+    void set_global_step(int s) noexcept { global_step_ = s; }  // resume
     [[nodiscard]] RolloutBuffer&        buffer()       noexcept       { return *buffer_; }
     [[nodiscard]] const RolloutBuffer&  buffer()       const noexcept { return *buffer_; }
 

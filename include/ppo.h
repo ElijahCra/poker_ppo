@@ -93,6 +93,23 @@ public:
     void save(const std::string& path);
     void load(const std::string& path);
 
+    // Full training-state checkpoint (network + magnet + Adam moments +
+    // update/step counters) for resuming a cut-off run. Written atomically
+    // to `dir` (a sibling .tmp dir is renamed into place). The opponent
+    // pool is NOT persisted — it refills from empty on resume (bounded
+    // self-play blip; p_use_pool is small). save_checkpoint is also called
+    // periodically from train() when set_checkpoint() armed a cadence.
+    void save_checkpoint(const std::string& dir);
+    // Returns true if a checkpoint was found and loaded; sets the resume
+    // point so train() continues from the saved update.
+    bool load_checkpoint(const std::string& dir);
+    // Arm periodic checkpointing inside train(): write to `dir` every
+    // `every_steps` env steps (0 disables).
+    void set_checkpoint(const std::string& dir, int64_t every_steps) {
+        ckpt_dir_ = dir;
+        ckpt_every_steps_ = every_steps;
+    }
+
 private:
     [[nodiscard]] UpdateStats update();
 
@@ -136,7 +153,13 @@ private:
     ActorCritic                          magnet_{nullptr};
 
     int     update_idx_              = 0;
+    int     start_update_            = 0;   // resume point (0 = fresh)
     int64_t last_magnet_refresh_step_ = 0;
+
+    // Periodic-checkpoint state (see set_checkpoint / save_checkpoint).
+    std::string ckpt_dir_;
+    int64_t     ckpt_every_steps_ = 0;
+    int64_t     last_ckpt_step_   = 0;
 
     // CUDA-graphed minibatch step (see ensure_update_graph).
     enum class UGraphState { Unset, Ready, Failed };
