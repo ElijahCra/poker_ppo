@@ -79,6 +79,15 @@ else
 fi
 ls -lh HandRanks.dat
 
+# ── 5. auto-tune the rollout shape for this GPU (TUNE=0 to skip) ─────────────
+# Dynamics-neutral: picks the num_envs knee at fixed batch_size and rebuilds.
+# Needs HandRanks.dat (just made) since --benchmark steps the real env.
+if [ "${TUNE:-1}" = "1" ]; then
+    echo "==> auto-tuning rollout shape (bench_throughput.sh apply)"
+    bash tools/bench_throughput.sh apply || \
+        echo "    tuning skipped/failed (non-fatal — default shape kept)"
+fi
+
 cat <<NOTE
 
 ==> bootstrap complete.

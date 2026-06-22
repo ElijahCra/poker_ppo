@@ -31,6 +31,67 @@
 #   tools/bench_throughput.sh threads 1024 30 4 8 16 24 32 48 64
 set -uo pipefail
 
+# ── apply mode: sweep the rollout knee and rewrite config.h, then rebuild ───
+# Dynamics-neutral: holds batch_size fixed (minibatch, gradient steps, and
+# every validated result unchanged) by trading num_steps for num_envs.
+# Floors num_steps (NSTEPS_FLOOR, default 32) so the GAE horizon stays sane —
+# going below that, or changing batch_size/minibatch, needs a BR A/B and is
+# left to tune_speed.sh + manual review. Usage: bench_throughput.sh apply [iters]
+if [ "${1:-}" = "apply" ]; then
+  BUILD_DIR="${BUILD_DIR:-cmake-build-release}"
+  BIN="$BUILD_DIR/poker_ppo"
+  CFG="include/config.h"
+  ITERS="${2:-30}"
+  TOL="${KNEE_TOL:-0.05}"
+  NSTEPS_FLOOR="${NSTEPS_FLOOR:-32}"
+  export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-max_split_size_mb:256}"
+  [ -x "$BIN" ] || { echo "binary not found: $BIN" >&2; exit 1; }
+  [ -f "$CFG" ] || { echo "config not found: $CFG (run from repo root)" >&2; exit 1; }
+
+  read_cfg() {  # value of a kPPOConfig field (kBRConfig protected by the range)
+    sed -n "/static constexpr PPOConfig kPPOConfig/,/^};/{s/.*\.$1[[:space:]]*=[[:space:]]*\([0-9][0-9]*\).*/\1/p;}" "$CFG" | head -1
+  }
+  cur_envs=$(read_cfg num_envs); cur_steps=$(read_cfg num_steps)
+  batch=$(( cur_envs * cur_steps ))
+  echo "current: num_envs=$cur_envs num_steps=$cur_steps batch=$batch (held fixed)"
+  echo "sweeping batch-invariant num_envs (num_steps=batch/num_envs >= $NSTEPS_FLOOR):"
+
+  best_us=""; declare -a CN CU
+  for E in 256 384 512 768 1024 1536 2048 3072 4096; do
+    (( batch % E == 0 )) || continue
+    S=$(( batch / E )); (( S >= NSTEPS_FLOOR )) || continue
+    line=$(POKER_PPO_NUM_ENVS="$E" "$BIN" --benchmark "$ITERS" 2>/dev/null \
+           | grep -E '^[[:space:]]+threadpool' | head -1 || true)
+    us=$(sed -n 's/.*us\/samp=\([0-9.][0-9.]*\).*/\1/p' <<<"$line")
+    if [ -z "$us" ]; then echo "  envs=$E steps=$S  ERR/OOM"; continue; fi
+    printf '  envs=%-5s steps=%-4s us/sample=%s\n' "$E" "$S" "$us"
+    CN+=("$E"); CU+=("$us")
+    if [ -z "$best_us" ] || awk "BEGIN{exit !($us<$best_us)}"; then best_us="$us"; fi
+  done
+  [ -n "$best_us" ] || { echo "no candidates measured (OOM?)" >&2; exit 1; }
+
+  # Knee = smallest num_envs within TOL of the best us/sample.
+  thresh=$(awk "BEGIN{print $best_us*(1+$TOL)}")
+  knee=""
+  for i in "${!CN[@]}"; do
+    if awk "BEGIN{exit !(${CU[$i]}<=$thresh)}"; then knee=${CN[$i]}; break; fi
+  done
+  S=$(( batch / knee ))
+  echo "knee (within $(awk "BEGIN{print $TOL*100}")% of best): num_envs=$knee num_steps=$S"
+  if [ "$knee" = "$cur_envs" ]; then echo "already at the knee — no change."; exit 0; fi
+
+  # Edit only num_envs/num_steps in kPPOConfig (batch & minibatch unchanged).
+  sed -i "/static constexpr PPOConfig kPPOConfig/,/^};/{
+    s/\(\.num_envs[[:space:]]*=[[:space:]]*\)[0-9][0-9]*/\1$knee/
+    s/\(\.num_steps[[:space:]]*=[[:space:]]*\)[0-9][0-9]*/\1$S/
+  }" "$CFG"
+  echo "applied → $CFG; rebuilding poker_ppo..."
+  cmake --build "$BUILD_DIR" -j --target poker_ppo
+  echo "done: num_envs=$knee num_steps=$S (batch $batch, minibatch unchanged)"
+  echo "tip: also sweep CPU workers — bench_throughput.sh threads $knee"
+  exit 0
+fi
+
 # Thread-sweep mode dispatches early; everything below is the num_envs sweep.
 if [ "${1:-}" = "threads" ]; then
   BIN="cmake-build-release/poker_ppo"
