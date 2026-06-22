@@ -24,11 +24,14 @@
 # the knee → oversubscription).
 #
 # Usage:
-#   tools/bench_throughput.sh [binary] [iters] [N1 N2 ...]          # num_envs sweep (GPU)
-#   tools/bench_throughput.sh threads [num_envs] [iters] [T1 T2 ...] # thread sweep (CPU)
+#   tools/bench_throughput.sh [binary] [iters] [N1 N2 ...]            # num_envs sweep (GPU)
+#   tools/bench_throughput.sh threads [num_envs] [iters] [T1 T2 ...]  # thread sweep (CPU)
+#   tools/bench_throughput.sh grid [iters] "<envs...>" "<threads...>" # joint num_envs×threads
+#   tools/bench_throughput.sh apply [iters]                          # pick knee → edit config → rebuild
 #   tools/bench_throughput.sh                       # defaults
 #   tools/bench_throughput.sh cmake-build-release/poker_ppo 40 512 1024 2048 4096
 #   tools/bench_throughput.sh threads 1024 30 4 8 16 24 32 48 64
+#   tools/bench_throughput.sh grid 20 "768 1024 1536" "16 32 48 64"
 set -uo pipefail
 
 # ── apply mode: sweep the rollout knee and rewrite config.h, then rebuild ───
@@ -122,6 +125,48 @@ if [ "${1:-}" = "threads" ]; then
   echo "if it's at/below the knee; if a smaller count is faster, the pool is"
   echo "oversubscribed — set POKER_PPO_STEP_THREADS at runtime, or change the"
   echo "default in RolloutCollector::ensure_step_pool (src/rollout.cpp)."
+  exit 0
+fi
+
+# ── grid mode: joint num_envs × threads sweep (no rebuild) ──────────────────
+# The CPU-worker knee shifts with num_envs (more envs = more parallel env
+# steps to fill cores), so the two interact — this sweeps both at once and
+# prints a us/sample matrix (rows = num_envs, cols = threads; lower = better).
+# Usage: bench_throughput.sh grid [iters] "<envs...>" "<threads...>"
+if [ "${1:-}" = "grid" ]; then
+  BUILD_DIR="${BUILD_DIR:-cmake-build-release}"
+  BIN="$BUILD_DIR/poker_ppo"
+  ITERS="${2:-20}"
+  read -r -a G_ENVS    <<<"${3:-384 768 1024 1536}"
+  read -r -a G_THREADS <<<"${4:-8 16 32 48}"
+  export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-max_split_size_mb:256}"
+  [ -x "$BIN" ] || { echo "binary not found: $BIN" >&2; exit 1; }
+  echo "joint sweep: us/sample (lower=better), $(nproc) cores, iters=$ITERS"
+
+  printf '%9s' 'envs\thr'
+  for T in "${G_THREADS[@]}"; do printf '%9s' "$T"; done; printf '\n'
+  best_us=""; best_cell=""
+  for E in "${G_ENVS[@]}"; do
+    printf '%9s' "$E"
+    for T in "${G_THREADS[@]}"; do
+      if [ "$T" -gt "$E" ] 2>/dev/null; then printf '%9s' '·'; continue; fi
+      line=$(POKER_PPO_NUM_ENVS="$E" POKER_PPO_STEP_THREADS="$T" \
+             "$BIN" --benchmark "$ITERS" 2>/dev/null \
+             | grep -E '^[[:space:]]+threadpool' | head -1 || true)
+      us=$(sed -n 's/.*us\/samp=\([0-9.][0-9.]*\).*/\1/p' <<<"$line")
+      if [ -z "$us" ]; then printf '%9s' 'ERR'; continue; fi
+      printf '%9s' "$us"
+      if [ -z "$best_us" ] || awk "BEGIN{exit !($us<$best_us)}"; then
+        best_us="$us"; best_cell="num_envs=$E threads=$T"
+      fi
+    done
+    printf '\n'
+  done
+  echo
+  echo "Best: $best_cell at ${best_us} us/sample"
+  echo "Rollout-only (the update is unaffected by these). Apply num_envs at the"
+  echo "dynamics-neutral knee with 'bench_throughput.sh apply'; set the threads"
+  echo "via POKER_PPO_STEP_THREADS=<best> at runtime."
   exit 0
 fi
 
