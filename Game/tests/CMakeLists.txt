@@ -29,6 +29,8 @@ target_link_libraries(showdown_test PRIVATE
     Game            # interface lib that exposes Game/ as include root
     Utility         # static lib with the TwoPlusTwo evaluator implementation
     GTest::gtest_main
+    GTest::gtest      # explicit: some toolchains (strict --as-needed / link
+                      # order) don't pull gtest_main's transitive gtest dep
 )
 
 # Attention-encoder tests. These exercise the network module so they need
@@ -37,6 +39,8 @@ add_executable(attention_test attention_test.cpp)
 target_link_libraries(attention_test PRIVATE
     poker_ppo_lib
     GTest::gtest_main
+    GTest::gtest      # explicit: some toolchains (strict --as-needed / link
+                      # order) don't pull gtest_main's transitive gtest dep
 )
 
 # BettingConfig tests. Header-only path (BettingConfig.hpp + GameConfig.hpp
@@ -48,6 +52,8 @@ target_link_libraries(betting_config_test PRIVATE
     Game
     Utility
     GTest::gtest_main
+    GTest::gtest      # explicit: some toolchains (strict --as-needed / link
+                      # order) don't pull gtest_main's transitive gtest dep
 )
 
 # PokerConfig tests. Pulls poker_env.h (transitively config.h + Game) so
@@ -56,6 +62,8 @@ add_executable(poker_config_test poker_config_test.cpp)
 target_link_libraries(poker_config_test PRIVATE
     poker_ppo_lib
     GTest::gtest_main
+    GTest::gtest      # explicit: some toolchains (strict --as-needed / link
+                      # order) don't pull gtest_main's transitive gtest dep
 )
 
 # HandStrength tests. Pure header-only helper — no dependencies beyond
@@ -64,6 +72,8 @@ add_executable(hand_strength_test hand_strength_test.cpp)
 target_link_libraries(hand_strength_test PRIVATE
     Game
     GTest::gtest_main
+    GTest::gtest      # explicit: some toolchains (strict --as-needed / link
+                      # order) don't pull gtest_main's transitive gtest dep
 )
 
 # MMD tests. Exercises ActorCritic::masked_log_probs and the KL math
@@ -72,6 +82,8 @@ add_executable(mmd_test mmd_test.cpp)
 target_link_libraries(mmd_test PRIVATE
     poker_ppo_lib
     GTest::gtest_main
+    GTest::gtest      # explicit: some toolchains (strict --as-needed / link
+                      # order) don't pull gtest_main's transitive gtest dep
 )
 
 # All-in equity tests. Header-only helper over the TwoPlusTwo evaluator, so
@@ -81,6 +93,8 @@ target_link_libraries(allin_equity_test PRIVATE
     Game
     Utility
     GTest::gtest_main
+    GTest::gtest      # explicit: some toolchains (strict --as-needed / link
+                      # order) don't pull gtest_main's transitive gtest dep
 )
 
 # VRPO advantage tests. Exercise RolloutBuffer::compute_returns (the unified
@@ -89,6 +103,8 @@ add_executable(vrpo_advantage_test vrpo_advantage_test.cpp)
 target_link_libraries(vrpo_advantage_test PRIVATE
     poker_ppo_lib
     GTest::gtest_main
+    GTest::gtest      # explicit: some toolchains (strict --as-needed / link
+                      # order) don't pull gtest_main's transitive gtest dep
 )
 
 # ForeachAdam / foreach_clip_grad_norm equivalence vs torch::optim::Adam +
@@ -97,6 +113,8 @@ add_executable(optim_test optim_test.cpp)
 target_link_libraries(optim_test PRIVATE
     poker_ppo_lib
     GTest::gtest_main
+    GTest::gtest      # explicit: some toolchains (strict --as-needed / link
+                      # order) don't pull gtest_main's transitive gtest dep
 )
 
 # History-encoder variants (attn/conv/pool/flatten): shapes, masking
@@ -105,6 +123,8 @@ add_executable(history_encoder_test history_encoder_test.cpp)
 target_link_libraries(history_encoder_test PRIVATE
     poker_ppo_lib
     GTest::gtest_main
+    GTest::gtest      # explicit: some toolchains (strict --as-needed / link
+                      # order) don't pull gtest_main's transitive gtest dep
 )
 
 # Register with CTest so `ctest` discovers the cases automatically.
