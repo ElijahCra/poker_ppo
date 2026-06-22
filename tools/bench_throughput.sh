@@ -60,7 +60,7 @@ if [ "${1:-}" = "apply" ]; then
   echo "sweeping batch-invariant num_envs (num_steps=batch/num_envs >= $NSTEPS_FLOOR):"
 
   best_us=""; declare -a CN CU
-  for E in 256 384 512 768 1024 1536 2048 3072 4096; do
+  for E in 256 512 1024 2048 4096 8192 16384; do
     (( batch % E == 0 )) || continue
     S=$(( batch / E )); (( S >= NSTEPS_FLOOR )) || continue
     line=$(POKER_PPO_NUM_ENVS="$E" "$BIN" --benchmark "$ITERS" 2>/dev/null \
@@ -101,7 +101,7 @@ if [ "${1:-}" = "threads" ]; then
   NENVS="${2:-1024}"
   ITERS="${3:-30}"
   THREADS=("${@:4}")
-  if [ ${#THREADS[@]} -eq 0 ]; then THREADS=(2 4 8 16 24 32 48 64); fi
+  if [ ${#THREADS[@]} -eq 0 ]; then THREADS=(8 16 32 64 128); fi
   if [ ! -x "$BIN" ]; then echo "binary not found: $BIN" >&2; exit 1; fi
   echo "CPU thread sweep at num_envs=$NENVS ($(nproc) logical cores available)"
   printf '%9s  %14s  %12s\n' threads "us/sample" "rollout_ms"
