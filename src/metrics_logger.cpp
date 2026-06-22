@@ -45,7 +45,7 @@ void MetricsLogger::log_update(const PPOTrainer::UpdateStats& s) {
     metrics_.flush();
 }
 
-void MetricsLogger::log_league(int update, int global_step,
+void MetricsLogger::log_league(int update, int64_t global_step,
                                const std::vector<League::MatchResult>& results) {
     std::lock_guard<std::mutex> lk(mu_);
     for (const auto& r : results) {

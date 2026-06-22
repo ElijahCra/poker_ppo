@@ -21,8 +21,8 @@ namespace poker_ppo {
 class BestResponseEvaluator {
 public:
     struct Result {
-        int    update;
-        int    global_step;
+        int     update;
+        int64_t global_step;
         int    br_updates_run;
 
         // Stats from the seed that achieved max bb/hand — the tightest
@@ -55,7 +55,7 @@ public:
     // Train an exploiter against a frozen copy of `target` for
     // cfg.updates_per_eval updates. update/global_step are stamped into
     // the result for logging.
-    Result evaluate(const ActorCritic& target, int update, int global_step);
+    Result evaluate(const ActorCritic& target, int update, int64_t global_step);
 
     const BestResponseConfig& config() const { return cfg_; }
 

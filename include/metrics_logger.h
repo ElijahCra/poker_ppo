@@ -26,7 +26,7 @@ public:
 
     // One row per (snapshot, anchor). Long format so adding an anchor
     // doesn't need a schema migration.
-    void log_league(int update, int global_step,
+    void log_league(int update, int64_t global_step,
                     const std::vector<League::MatchResult>& results);
 
     void log_best_response(const BestResponseEvaluator::Result& r);

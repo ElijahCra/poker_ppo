@@ -946,7 +946,7 @@ bool PPOTrainer::load_checkpoint(const std::string& dir) {
         return t.item<int64_t>();
     };
     start_update_ = static_cast<int>(read_i64("update_idx"));
-    collector_->set_global_step(static_cast<int>(read_i64("global_step")));
+    collector_->set_global_step(read_i64("global_step"));
     last_magnet_refresh_step_ = read_i64("magnet_refresh_step");
     last_ckpt_step_ = collector_->global_step();
     const int64_t adam_step = read_i64("adam_step");

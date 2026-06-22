@@ -26,8 +26,8 @@ class OpponentManager;
 class PPOTrainer {
 public:
     struct UpdateStats {
-        int    update;
-        int    global_step;
+        int     update;
+        int64_t global_step;
         float  policy_loss;
         float  value_loss;
         float  entropy;

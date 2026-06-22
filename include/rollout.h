@@ -365,8 +365,8 @@ public:
 
     [[nodiscard]] int                   obs_dim()      const noexcept { return vec_env_->obs_dim(); }
     [[nodiscard]] int                   action_count() const noexcept { return vec_env_->action_count(); }
-    [[nodiscard]] int                   global_step()  const noexcept { return global_step_; }
-    void set_global_step(int s) noexcept { global_step_ = s; }  // resume
+    [[nodiscard]] int64_t               global_step()  const noexcept { return global_step_; }
+    void set_global_step(int64_t s) noexcept { global_step_ = s; }  // resume
     [[nodiscard]] RolloutBuffer&        buffer()       noexcept       { return *buffer_; }
     [[nodiscard]] const RolloutBuffer&  buffer()       const noexcept { return *buffer_; }
 
@@ -386,7 +386,7 @@ private:
     torch::Device                   device_;
     int                             num_envs_;
     int                             num_steps_;
-    int                             global_step_ = 0;
+    int64_t                         global_step_ = 0;
 
     std::unique_ptr<VectorizedEnv>  vec_env_;
     std::unique_ptr<RolloutBuffer>  buffer_;

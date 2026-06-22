@@ -68,7 +68,7 @@ void BestResponseEvaluator::init_exploiter() {
 
 BestResponseEvaluator::Result
 BestResponseEvaluator::evaluate(const ActorCritic& target,
-                                int update, int global_step) {
+                                int update, int64_t global_step) {
     using clock = std::chrono::steady_clock;
     using ms    = std::chrono::duration<double, std::milli>;
     const auto t0 = clock::now();

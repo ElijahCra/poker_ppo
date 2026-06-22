@@ -116,7 +116,7 @@ struct PPOConfig {
     int   update_epochs    = 4;
     int   num_minibatches  = 4;
 
-    int   total_timesteps  = 10'000'000;
+    int64_t total_timesteps = 10'000'000;  // int64: H100-scale runs exceed 2^31
 
     // Periodic full-state checkpoint cadence, in env steps (0 disables).
     // ~50 checkpoints over a 600M-step run; each is net+magnet+Adam moments
@@ -160,7 +160,9 @@ struct PPOConfig {
 
     constexpr int batch_size()     const noexcept { return num_envs * num_steps; }
     constexpr int minibatch_size() const noexcept { return batch_size() / num_minibatches; }
-    constexpr int num_updates()    const noexcept { return total_timesteps / batch_size(); }
+    constexpr int num_updates()    const noexcept {
+        return static_cast<int>(total_timesteps / batch_size());  // fits int
+    }
 };
 
 // Wraps Game::DefaultGameConfig + PPO-side knobs. `hist`/`round_summary`
@@ -273,6 +275,17 @@ static constexpr PPOConfig kPPOConfig{
     // (128→64 steps), negligible at gae_lambda=0.90 (~10-step effective
     // horizon). Use tools/bench_throughput.sh to re-find the knee on a
     // different GPU; the update half is compute-bound and unaffected by this.
+    //
+    // Big GPU (H100/H200): a 3M-param net can't saturate the tensor cores
+    // (arithmetic intensity too low) — it just runs fast at low util. The
+    // stable way to spend the headroom is a LARGER BATCH, scaled coherently
+    // with tools/scale_config.sh <S> (num_envs, num_minibatches,
+    // total_timesteps ×S; learning_rate ×√S) which preserves the policy-
+    // iteration count and minibatch size, then BR-validated. Bigger
+    // minibatch (to fill SMs) and a bigger MODEL (hidden_dim/num_layers/
+    // attn_dim — the real way to USE the capacity, likely a stronger bot)
+    // are separate dynamics changes; sweep + BR-validate each. Step
+    // counters are int64, so multi-billion-step runs are safe.
     .num_envs         = 768,
     .num_steps        = 64,
     .update_epochs    = 4,

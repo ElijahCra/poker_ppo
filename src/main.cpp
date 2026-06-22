@@ -117,6 +117,16 @@ int main(int argc, char** argv) {
     //torch::Device device = torch::kCPU;
     std::cout << "Using device: " << device << "\n";
 
+    // TF32 tensor-core path for any fp32 matmul (cuBLAS default is off since
+    // torch 1.12). bf16 autocast already covers the hot update/rollout GEMMs,
+    // so this mainly speeds the eager / POKER_PPO_NO_AMP fallback paths on
+    // Ampere+ (incl. H100/H200) at negligible precision cost for RL.
+    // POKER_PPO_NO_TF32=1 to disable.
+    if (device.is_cuda() && std::getenv("POKER_PPO_NO_TF32") == nullptr) {
+        at::globalContext().setAllowTF32CuBLAS(true);
+        at::globalContext().setAllowTF32CuDNN(true);
+    }
+
     PokerEnvironmentFactory factory(poker_cfg);
 
     if (opt.play_mode) {
