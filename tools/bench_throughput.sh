@@ -103,6 +103,7 @@ if [ "${1:-}" = "threads" ]; then
   THREADS=("${@:4}")
   if [ ${#THREADS[@]} -eq 0 ]; then THREADS=(8 16 32 64 128); fi
   if [ ! -x "$BIN" ]; then echo "binary not found: $BIN" >&2; exit 1; fi
+  export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-max_split_size_mb:256}"
   echo "CPU thread sweep at num_envs=$NENVS ($(nproc) logical cores available)"
   printf '%9s  %14s  %12s\n' threads "us/sample" "rollout_ms"
   printf '%9s  %14s  %12s\n' "-------" "---------" "----------"
@@ -174,7 +175,7 @@ BIN="${1:-cmake-build-release/poker_ppo}"
 ITERS="${2:-30}"
 ENVS=("${@:3}")
 if [ ${#ENVS[@]} -eq 0 ]; then
-  ENVS=(192 384 512 768 1024 1536 2048 3072 4096)
+  ENVS=(256 512 1024 2048 4096 8192 16384)
 fi
 
 if [ ! -x "$BIN" ]; then echo "binary not found/executable: $BIN" >&2; exit 1; fi

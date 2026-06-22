@@ -79,13 +79,28 @@ else
 fi
 ls -lh HandRanks.dat
 
-# ── 5. auto-tune the rollout shape for this GPU (TUNE=0 to skip) ─────────────
-# Dynamics-neutral: picks the num_envs knee at fixed batch_size and rebuilds.
-# Needs HandRanks.dat (just made) since --benchmark steps the real env.
+# ── 5. auto-tune for this GPU (TUNE=0 to skip) ──────────────────────────────
+# Two dynamics-NEUTRAL knobs, both safe to auto-apply (no BR needed):
+#   • rollout shape (num_envs at fixed batch) → baked into config.h + rebuilt
+#   • CPU worker count → tune.env (runtime; the all-cores default is past the
+#     knee on many-core boxes). Batch scaling / bigger model are NOT here —
+#     they change dynamics and must be done deliberately + BR-validated
+#     (see tools/scale_config.sh and the notes below).
 if [ "${TUNE:-1}" = "1" ]; then
     echo "==> auto-tuning rollout shape (bench_throughput.sh apply)"
     bash tools/bench_throughput.sh apply || \
-        echo "    tuning skipped/failed (non-fatal — default shape kept)"
+        echo "    rollout tuning skipped/failed (non-fatal — default kept)"
+
+    NE=$(sed -n "/static constexpr PPOConfig kPPOConfig/,/^};/{s/.*\.num_envs[[:space:]]*=[[:space:]]*\([0-9][0-9]*\).*/\1/p;}" "$REPO_DIR/include/config.h" | head -1)
+    echo "==> auto-tuning CPU workers at num_envs=$NE"
+    T=$(bash tools/bench_throughput.sh threads "$NE" 20 8 16 32 48 64 96 128 2>/dev/null \
+        | sed -n 's/.*POKER_PPO_STEP_THREADS=\([0-9][0-9]*\).*/\1/p')
+    if [ -n "$T" ]; then
+        echo "export POKER_PPO_STEP_THREADS=$T" > tune.env
+        echo "    best workers=$T → wrote tune.env (source it before training)"
+    else
+        echo "    thread tuning skipped/failed (non-fatal — default all-cores)"
+    fi
 fi
 
 cat <<NOTE
@@ -95,7 +110,16 @@ cat <<NOTE
 Start training (native Linux survives SSH disconnect via tmux):
     cd $REPO_DIR
     tmux new -s train
+    [ -f tune.env ] && source tune.env      # POKER_PPO_STEP_THREADS from autotune
     ./$BUILD_DIR/poker_ppo 2>&1 | tee train.log
+
+Bigger GPU (H100/H200): the rollout shape + threads are auto-tuned above,
+but those are dynamics-NEUTRAL. To actually spend an H100's headroom, scale
+the BATCH (a dynamics change — validate it):
+    tools/scale_config.sh 4 --apply         # 4× batch, coherent + rebuild
+    POKER_PPO_BR_SEEDS=3 POKER_PPO_MAX_STEPS=37000000 ./$BUILD_DIR/poker_ppo  # BR check
+A bigger MODEL (hidden_dim/num_layers/attn_dim) is the other capacity lever
+— same: edit config, BR-validate. Neither is auto-applied on purpose.
 
 torch < 2.5 (e.g. 2.4.x) note: the expandable-segments allocator we set
 for WSL is NOT CUDA-graph-capture-safe before torch 2.5, and would crash
