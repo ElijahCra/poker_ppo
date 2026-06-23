@@ -330,13 +330,25 @@ void PPOTrainer::train() {
     collector_->init_carry();
     opp_mgr_->reset_assignments(num_envs_);
 
-    // Experiment hygiene: POKER_PPO_MAX_STEPS caps the run so A/B arms
-    // exit cleanly (final league eval + model save still run) right after
-    // their data is collected, instead of training to total_timesteps or
-    // an external timeout. The LR/entropy schedules still anneal against
-    // the full total_timesteps, so a capped run is a prefix of a full
-    // run, not a compressed one.
-    int total_updates = cfg_.num_updates();
+    // POKER_PPO_TOTAL_STEPS rescales the run length AND the LR/entropy
+    // schedule horizon (so e.g. a 1B-step run anneals over 1B, not the
+    // configured 600M). sched_updates_ is the schedule denominator used
+    // by both the anneal here and the mirror in update().
+    int64_t sched_total_steps = cfg_.total_timesteps;
+    if (const char* e = std::getenv("POKER_PPO_TOTAL_STEPS")) {
+        const long long v = std::atoll(e);
+        if (v > 0) {
+            sched_total_steps = v;
+            std::cout << "[override] total steps=" << v << "\n";
+        }
+    }
+    sched_updates_ = std::max(1,
+        static_cast<int>(sched_total_steps / cfg_.batch_size()));
+
+    // POKER_PPO_MAX_STEPS caps the LOOP below the schedule horizon (a
+    // prefix — schedules still target sched_updates_), e.g. for A/B arms
+    // that exit cleanly right after their data is collected.
+    int total_updates = sched_updates_;
     if (const char* e = std::getenv("POKER_PPO_MAX_STEPS")) {
         const long long cap = std::atoll(e);
         if (cap > 0) {
@@ -355,7 +367,7 @@ void PPOTrainer::train() {
         // mirror in update() and keeping capped runs prefix-faithful.
         if constexpr (cfg_.anneal_lr) {
             const float frac = 1.0f
-                - static_cast<float>(update_idx_) / cfg_.num_updates();
+                - static_cast<float>(update_idx_) / sched_updates_;
             constexpr float floor_frac = cfg_.min_lr_frac > 0.0f ? cfg_.min_lr_frac : 0.0f;
             const float lr = cfg_.learning_rate * std::max(frac, floor_frac);
             optimizer_->set_lr(lr);
@@ -582,7 +594,7 @@ PPOTrainer::UpdateStats PPOTrainer::update() {
         if constexpr (!cfg_.anneal_ent_coef) {
             return cfg_.ent_coef;
         } else {
-            const int total = std::max(1, cfg_.num_updates());
+            const int total = std::max(1, sched_updates_);
             const float progress = std::min(
                 1.0f, static_cast<float>(update_idx_) / static_cast<float>(total));
             const float cosine_factor = 0.5f * (1.0f + std::cos(M_PI * progress));
@@ -710,7 +722,7 @@ PPOTrainer::UpdateStats PPOTrainer::update() {
     if constexpr (cfg_.anneal_lr) {
         // Mirror train()'s floor logic so the reported lr matches what
         // the optimiser actually uses.
-        const float frac       = 1.0f - static_cast<float>(update_idx_) / cfg_.num_updates();
+        const float frac       = 1.0f - static_cast<float>(update_idx_) / sched_updates_;
         constexpr float floor_frac = cfg_.min_lr_frac > 0.0f ? cfg_.min_lr_frac : 0.0f;
         lr = cfg_.learning_rate * std::max(frac, floor_frac);
     }

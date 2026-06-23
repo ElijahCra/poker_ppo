@@ -154,6 +154,10 @@ private:
 
     int     update_idx_              = 0;
     int     start_update_            = 0;   // resume point (0 = fresh)
+    // LR/entropy schedule horizon in updates. Default = the configured run;
+    // POKER_PPO_TOTAL_STEPS rescales it (and the loop length) in train() so
+    // a longer/shorter run anneals over its own length, not a fixed 600M.
+    int     sched_updates_          = cfg_.num_updates();
     int64_t last_magnet_refresh_step_ = 0;
 
     // Periodic-checkpoint state (see set_checkpoint / save_checkpoint).

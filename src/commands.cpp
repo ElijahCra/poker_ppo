@@ -65,10 +65,16 @@ int cmd_train(IPokerEnvironmentFactory& factory,
     int64_t last_league_eval_step = 0;
     int64_t last_br_eval_step     = 0;
 
+    // Disable the periodic evals for a pure as-fast-as-possible training run.
+    // BR especially is a big stall (it trains a full multi-update exploiter);
+    // league is a frequent ~20s match. Neither affects the trained policy.
+    const bool no_br     = std::getenv("POKER_PPO_NO_BR")     != nullptr;
+    const bool no_league = std::getenv("POKER_PPO_NO_LEAGUE") != nullptr;
+
     const BestResponseConfig& br_cfg = config::kBRConfig;
 
     std::unique_ptr<BestResponseEvaluator> br_eval;
-    if (br_cfg.enabled) {
+    if (br_cfg.enabled && !no_br) {
         br_eval = std::make_unique<BestResponseEvaluator>(
             factory, bet_cfg,
             obs_dim, action_count,
@@ -136,7 +142,7 @@ int cmd_train(IPokerEnvironmentFactory& factory,
                       << std::defaultfloat << std::setprecision(6);
         }
 
-        if (s.update > 0 &&
+        if (!no_league && s.update > 0 &&
             s.global_step - last_league_eval_step >= league_eval_every_steps) {
             last_league_eval_step = s.global_step;
             using clock = std::chrono::steady_clock;
@@ -215,10 +221,12 @@ int cmd_train(IPokerEnvironmentFactory& factory,
 
     trainer.train();
 
-    std::cout << "\nFinal league evaluation...\n";
-    auto final_results = league.evaluate(trainer.network());
-    metrics.log_league(/*update=*/-1, /*step=*/-1, final_results);
-    league.print_results(final_results);
+    if (!no_league) {
+        std::cout << "\nFinal league evaluation...\n";
+        auto final_results = league.evaluate(trainer.network());
+        metrics.log_league(/*update=*/-1, /*step=*/-1, final_results);
+        league.print_results(final_results);
+    }
 
     // Canonical copy lives in the run dir (immune to later runs — a fixed
     // filename once cost us a 600M-step model overwritten by a 37M-step
