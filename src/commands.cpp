@@ -458,11 +458,16 @@ int cmd_br_eval(IPokerEnvironmentFactory& factory,
                              ppo_cfg.hist, ppo_cfg.round_summary,
                              br_cfg, device);
 
+    // Read the EFFECTIVE config from the evaluator, not the static br_cfg —
+    // the POKER_PPO_BR_* overrides are applied inside the ctor and only
+    // land in the evaluator's own copy, so printing br_cfg here reported
+    // pre-override defaults regardless of the env vars actually in force.
+    const BestResponseConfig& eff = br.config();
     std::cout << "[br-eval] training exploiter: "
-              << br_cfg.num_exploiter_seeds << " seed(s) × "
-              << br_cfg.updates_per_eval << " updates, "
-              << br_cfg.eval_hands << "-hand match"
-              << "  (POKER_PPO_BR_SEEDS overrides seeds)\n";
+              << eff.num_exploiter_seeds << " seed(s) × "
+              << eff.updates_per_eval << " updates, "
+              << eff.eval_hands << "-hand match"
+              << "  (overrides: POKER_PPO_BR_SEEDS/_UPDATES/_LR/_ENT)\n";
 
     auto r = br.evaluate(trainer.network(), /*update=*/0, /*global_step=*/0);
 
