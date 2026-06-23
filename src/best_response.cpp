@@ -47,6 +47,30 @@ BestResponseEvaluator::BestResponseEvaluator(
         }
     }
 
+    // Exploiter-STRENGTH overrides. An approximate-BR exploitability bound
+    // is only meaningful while the exploiter is a strong enough attacker;
+    // once the policy is sharp enough that a fixed-budget exploiter can't
+    // break even (bb/hand < 0), the bound saturates and stops resolving
+    // policy quality. These let us scale the attacker up — more chase
+    // updates, hotter LR, more exploration — without a rebuild, to push a
+    // saturated bound back above 0. They touch ONLY the exploiter, never
+    // the evaluated policy, so they can't flatter the result.
+    if (const char* e = std::getenv("POKER_PPO_BR_UPDATES")) {
+        const int v = std::atoi(e);
+        if (v > 0) { cfg_.updates_per_eval = v;
+            std::cout << "[best-response] updates_per_eval override: " << v << "\n"; }
+    }
+    if (const char* e = std::getenv("POKER_PPO_BR_LR")) {
+        const float v = static_cast<float>(std::atof(e));
+        if (v > 0) { cfg_.learning_rate = v;
+            std::cout << "[best-response] learning_rate override: " << v << "\n"; }
+    }
+    if (const char* e = std::getenv("POKER_PPO_BR_ENT")) {
+        const float v = static_cast<float>(std::atof(e));
+        if (v >= 0) { cfg_.ent_coef = v;
+            std::cout << "[best-response] ent_coef override: " << v << "\n"; }
+    }
+
     envs_.reserve(cfg_.num_envs);
     for (int i = 0; i < cfg_.num_envs; ++i)
         envs_.push_back(factory_.create(bet_cfg_));
