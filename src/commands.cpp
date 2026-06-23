@@ -424,4 +424,62 @@ int cmd_benchmark(IPokerEnvironmentFactory& factory,
     return 0;
 }
 
+int cmd_br_eval(IPokerEnvironmentFactory& factory,
+                const PokerConfig&        poker_cfg,
+                torch::Device             device,
+                const std::string&        model_path)
+{
+    if (model_path.empty()) {
+        std::cerr << "--br-eval requires a model path\n";
+        return 1;
+    }
+
+    const PPOConfig& ppo_cfg = config::kPPOConfig;
+    const BetConfig& bet_cfg = config::kBetConfig;
+
+    // Load the target net (architecture from current config — must match
+    // how the model was trained, incl. POKER_PPO_HISTORY_ENCODER).
+    PPOTrainer trainer(factory, device);
+    std::cerr << "[br-eval] loading " << model_path << "\n";
+    trainer.load(model_path);
+    trainer.network()->eval();
+
+    int obs_dim, action_count;
+    {
+        auto tmp     = factory.create(bet_cfg);
+        obs_dim      = tmp->obs_dim();
+        action_count = tmp->bet_config().action_count();
+    }
+
+    BestResponseConfig br_cfg = config::kBRConfig;
+    br_cfg.enabled = true;  // creation is unconditional here
+    BestResponseEvaluator br(factory, bet_cfg, obs_dim, action_count,
+                             ppo_cfg.hidden_dim, ppo_cfg.num_layers,
+                             ppo_cfg.hist, ppo_cfg.round_summary,
+                             br_cfg, device);
+
+    std::cout << "[br-eval] training exploiter: "
+              << br_cfg.num_exploiter_seeds << " seed(s) × "
+              << br_cfg.updates_per_eval << " updates, "
+              << br_cfg.eval_hands << "-hand match"
+              << "  (POKER_PPO_BR_SEEDS overrides seeds)\n";
+
+    auto r = br.evaluate(trainer.network(), /*update=*/0, /*global_step=*/0);
+
+    std::cout << std::fixed << std::setprecision(3)
+              << "\n══════════ best-response (exploitability) ══════════\n"
+              << "  bb/hand  max=" << r.bb_per_hand_a
+              << "  mean="  << r.bb_per_hand_mean
+              << "  min="   << r.bb_per_hand_min
+              << "  std="   << r.bb_per_hand_std << "\n"
+              << "  seeds=" << r.num_seeds
+              << "  best-win%=" << std::setprecision(1) << (100.0f * r.win_rate_a)
+              << "  hands="  << r.num_hands
+              << "  duration=" << std::setprecision(0) << r.wall_ms << "ms\n"
+              << "  lower bound on exploitability = max bb/hand "
+              << "(higher = more exploitable)\n"
+              << std::defaultfloat << std::setprecision(6);
+    return 0;
+}
+
 } // namespace poker_ppo
