@@ -216,6 +216,25 @@ StepLite PokerEnvironment::step_into(int action_idx,
     return { 0.0f, false };
 }
 
+int PokerEnvironment::amount_to_call() const {
+    // action_table_[1] is Check (amount 0) or Call (amount to match).
+    if (action_table_.size() > 1 && action_table_[1].has_value()) {
+        return std::visit([]<typename T>(const T& a) -> int {
+            if constexpr (std::is_same_v<std::decay_t<T>, ::Game::Call>) {
+                return static_cast<int>(a.amount);
+            }
+            return 0;  // Check / other
+        }, *action_table_[1]);
+    }
+    return 0;
+}
+
+void PokerEnvironment::observation_for_hole(int h0, int h1, float* dst) const {
+    const uint8_t hole[2] = {static_cast<uint8_t>(h0), static_cast<uint8_t>(h1)};
+    obs_builder_.build_into(dst, game_->getContext(), bet_history_,
+                            static_cast<int>(game_->getCurrentBet()), hole);
+}
+
 void PokerEnvironment::auto_advance_chance() {
     while (!game_->isTerminal() && game_->getType() == "chance") {
         game_->transition(::Game::Chance{});

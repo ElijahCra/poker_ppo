@@ -97,6 +97,23 @@ target_link_libraries(allin_equity_test PRIVATE
                       # order) don't pull gtest_main's transitive gtest dep
 )
 
+# RangeEquity tests (LBR showdown-equity primitive). Same header-only path.
+add_executable(range_equity_test range_equity_test.cpp)
+target_link_libraries(range_equity_test PRIVATE
+    Game
+    Utility
+    GTest::gtest_main
+    GTest::gtest
+)
+
+# LBR integration smoke. Needs the full lib (lbr.cpp + env + network).
+add_executable(lbr_test lbr_test.cpp)
+target_link_libraries(lbr_test PRIVATE
+    poker_ppo_lib
+    GTest::gtest_main
+    GTest::gtest
+)
+
 # VRPO advantage tests. Exercise RolloutBuffer::compute_returns (the unified
 # GAE / Expected-SARSA(λ) trace), so link poker_ppo_lib for the buffer.
 add_executable(vrpo_advantage_test vrpo_advantage_test.cpp)
@@ -136,6 +153,8 @@ gtest_discover_tests(poker_config_test)
 gtest_discover_tests(hand_strength_test)
 gtest_discover_tests(mmd_test)
 gtest_discover_tests(allin_equity_test)
+gtest_discover_tests(range_equity_test)
+gtest_discover_tests(lbr_test)
 gtest_discover_tests(vrpo_advantage_test)
 gtest_discover_tests(optim_test)
 gtest_discover_tests(history_encoder_test)

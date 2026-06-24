@@ -1,0 +1,167 @@
+─── Game variant: nlhe_full_52 ──────────────────
+  deck cards      : 52  (excluded 0/52)
+  initial stack   : 100000 mbb
+  blinds          : 500 / 1000 mbb
+  min bet / raise : 1000 / 1000 mbb
+  max raises/rnd  : 4
+  pot fractions   : {0.25, 0.33, 0.5, 0.66, 0.75, 1, 1.25, 1.5, 2, 2.5, 3}  all-in slot: yes
+Action space (14 actions):
+  [0] Fold
+  [1] Check/Call
+  [2] Raise 0.25× pot
+  [3] Raise 0.33× pot
+  [4] Raise 0.5× pot
+  [5] Raise 0.66× pot
+  [6] Raise 0.75× pot
+  [7] Raise 1× pot
+  [8] Raise 1.25× pot
+  [9] Raise 1.5× pot
+  [10] Raise 2× pot
+  [11] Raise 2.5× pot
+  [12] Raise 3× pot
+  [13] All-in
+Bet-history attention encoder: ON
+Round-summary block          : ON
+Opponent pool                : ON  (size=20, snapshot_every=2457600 steps, warmup=4915200 steps, p_use_pool=0.05, max_unique=4)
+Using device: cuda
+Rollout strategy: threadpool
+[ppo] R-NaD reward regularisation: eta=0.1 (magnet KL moved from loss into rewards)
+League anchors:  uniform  random_init  always_call  always_raise  pair_all_in
+[best-response] num_exploiter_seeds override: 3
+Best-response evaluator: ON  (every 36864000 env steps, 1 seeds × 3000 exploiter updates, 10000-hand eval match)
+Metrics dir: runs/20260615_142839
+  (live plots: `python tools/plot_live.py runs/20260615_142839`)
+
+Starting training for 600000000 steps...
+
+[override] max steps=37000000 -> 753 updates
+[rollout] CUDA-graphed inference forward (POKER_PPO_NO_CUDA_GRAPH=1 disables)
+Loading HandRanks.DAT file...
+Loading HandRanks.DAT file...
+Loading HandRanks.DAT file...
+Loading HandRanks.DAT file...
+Loading HandRanks.DAT file...
+Loading HandRanks.DAT file...
+Loading HandRanks.DAT file...
+Loading HandRanks.DAT file...
+Loading HandRanks.DAT file...
+Loading HandRanks.DAT file...
+Loading HandRanks.DAT file...
+Loading HandRanks.DAT file...
+Loading HandRanks.DAT file...
+Loading HandRanks.DAT file...
+Loading HandRanks.DAT file...
+Loading HandRanks.DAT file...
+Loading HandRanks.DAT file...
+Loading HandRanks.DAT file...
+Loading HandRanks.DAT file...
+Loading HandRanks.DAT file...
+Searching in: 
+Searching in: 
+Searching in: 
+Searching in: 
+Searching in: 
+Searching in: 
+Searching in: 
+Searching in: 
+/mnt/c/Users/Elijah/CLionProjects/poker_ppo/Game/Utility/HandRanks.dat
+/mnt/c/Users/Elijah/CLionProjects/poker_ppo/HandRanks.dat
+/mnt/c/Users/Elijah/CLionProjects/poker_ppo/Game/Utility/HandRanks.dat
+/mnt/c/Users/Elijah/CLionProjects/poker_ppo/HandRanks.dat
+Searching in: 
+/mnt/c/Users/Elijah/CLionProjects/poker_ppo/Game/Utility/HandRanks.dat
+/mnt/c/Users/Elijah/CLionProjects/poker_ppo/HandRanks.dat
+Searching in: 
+/mnt/c/Users/Elijah/CLionProjects/poker_ppo/Game/Utility/HandRanks.dat
+/mnt/c/Users/Elijah/CLionProjects/poker_ppo/HandRanks.dat
+/mnt/c/Users/Elijah/CLionProjects/poker_ppo/Game/Utility/HandRanks.dat
+/mnt/c/Users/Elijah/CLionProjects/poker_ppo/HandRanks.dat
+Searching in: 
+/mnt/c/Users/Elijah/CLionProjects/poker_ppo/Game/Utility/HandRanks.dat
+/mnt/c/Users/Elijah/CLionProjects/poker_ppo/HandRanks.dat
+Searching in: 
+/mnt/c/Users/Elijah/CLionProjects/poker_ppo/Game/Utility/HandRanks.dat
+/mnt/c/Users/Elijah/CLionProjects/poker_ppo/HandRanks.dat
+/mnt/c/Users/Elijah/CLionProjects/poker_ppo/Game/Utility/HandRanks.dat
+/mnt/c/Users/Elijah/CLionProjects/poker_ppo/HandRanks.datSearching in: 
+
+Searching in: 
+/mnt/c/Users/Elijah/CLionProjects/poker_ppo/Game/Utility/HandRanks.dat
+/mnt/c/Users/Elijah/CLionProjects/poker_ppo/HandRanks.dat
+/mnt/c/Users/Elijah/CLionProjects/poker_ppo/Game/Utility/HandRanks.dat
+/mnt/c/Users/Elijah/CLionProjects/poker_ppo/HandRanks.dat
+Searching in: 
+/mnt/c/Users/Elijah/CLionProjects/poker_ppo/Game/Utility/HandRanks.dat
+/mnt/c/Users/Elijah/CLionProjects/poker_ppo/HandRanks.dat
+/mnt/c/Users/Elijah/CLionProjects/poker_ppo/Game/Utility/HandRanks.dat
+Searching in: 
+/mnt/c/Users/Elijah/CLionProjects/poker_ppo/Game/Utility/HandRanks.dat/mnt/c/Users/Elijah/CLionProjects/poker_ppo/Game/Utility/HandRanks.dat
+/mnt/c/Users/Elijah/CLionProjects/poker_ppo/HandRanks.dat
+Searching in: 
+/mnt/c/Users/Elijah/CLionProjects/poker_ppo/Game/Utility/HandRanks.dat
+/mnt/c/Users/Elijah/CLionProjects/poker_ppo/HandRanks.datSearching in: 
+/mnt/c/Users/Elijah/CLionProjects/poker_ppo/HandRanks.dat
+Searching in: 
+/mnt/c/Users/Elijah/CLionProjects/poker_ppo/Game/Utility/HandRanks.datSearching in: 
+
+/mnt/c/Users/Elijah/CLionProjects/poker_ppo/HandRanks.dat
+
+/mnt/c/Users/Elijah/CLionProjects/poker_ppo/HandRanks.dat
+
+/mnt/c/Users/Elijah/CLionProjects/poker_ppo/Game/Utility/HandRanks.dat
+/mnt/c/Users/Elijah/CLionProjects/poker_ppo/HandRanks.dat
+/mnt/c/Users/Elijah/CLionProjects/poker_ppo/Game/Utility/HandRanks.dat
+/mnt/c/Users/Elijah/CLionProjects/poker_ppo/HandRanks.dat
+/mnt/c/Users/Elijah/CLionProjects/poker_ppo/Game/Utility/HandRanks.dat
+/mnt/c/Users/Elijah/CLionProjects/poker_ppo/HandRanks.dat
+/mnt/c/Users/Elijah/CLionProjects/poker_ppo/Game/Utility/HandRanks.dat
+/mnt/c/Users/Elijah/CLionProjects/poker_ppo/HandRanks.dat
+complete.
+
+complete.
+
+complete.
+
+complete.
+
+complete.
+
+complete.
+
+complete.
+
+complete.
+
+complete.
+
+complete.
+
+complete.
+
+complete.
+
+complete.
+
+complete.
+
+complete.
+
+complete.
+
+complete.
+
+complete.
+
+complete.
+
+complete.
+
+[update] CUDA-graphed minibatch fwd+bwd (POKER_PPO_NO_UPDATE_GRAPH=1 disables)
+update=0  step=49152  pg=-0.0093  vf=8.7145  H=0.9653  kl=0.0033  clip=0.1777  ev=-0.0183  lr=0.000300
+[update 0]  rollout=5122.3ms  update=1066.1ms  pool=0/20
+update=10  step=540672  pg=-0.0030  vf=6.7290  H=0.9832  kl=0.0025  clip=0.1297  ev=0.1258  lr=0.000300
+[update 10]  rollout=151.4ms  update=330.2ms  pool=0/20
+update=20  step=1032192  pg=-0.0021  vf=6.8336  H=1.0263  kl=0.0017  clip=0.0755  ev=0.1603  lr=0.000300
+[update 20]  rollout=137.3ms  update=332.7ms  pool=0/20
+update=30  step=1523712  pg=-0.0020  vf=6.8971  H=1.0086  kl=0.0015  clip=0.0689  ev=0.1692  lr=0.000299
+[update 30]  rollout=135.6ms  update=344.8ms  pool=0/20

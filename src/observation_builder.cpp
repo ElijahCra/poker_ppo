@@ -37,15 +37,22 @@ void ObservationBuilder::build_into(
     float*                               a,
     const Game::GameContext&             ctx,
     const std::vector<BetHistoryEntry>&  bet_history,
-    int                                  current_bet) const
+    int                                  current_bet,
+    const uint8_t*                       hole_override) const
 {
     std::memset(a, 0, sizeof(float) * static_cast<size_t>(layout_.total_dim));
 
     const int me  = ctx.getCurrentPlayer();
     const int opp = 1 - me;
 
-    // Acting player's hole cards only — never leak the opponent's.
-    const auto hole = ctx.getHoleCards(me);
+    // Acting player's hole cards. hole_override lets LBR synthesise the
+    // obs the acting player WOULD see holding a hypothetical hand — used to
+    // Bayes-update the belief over the target's range. Everything else in
+    // the obs is public, so only the hole one-hot + hand-strength features
+    // change with the holding. (Never leaks the real opponent's cards.)
+    const std::array<uint8_t, 2> hole =
+        hole_override ? std::array<uint8_t, 2>{hole_override[0], hole_override[1]}
+                      : ctx.getHoleCards(me);
     a[layout_.hole_off + hole[0]] = 1.0f;
     a[layout_.hole_off + hole[1]] = 1.0f;
 
@@ -75,7 +82,6 @@ void ObservationBuilder::build_into(
     //   3  alive_5-windows / 4          long-term straight progress (preflop too)
     //   4  overcards / 2                hole cards above max board rank
     if constexpr (features::HAND_STRENGTH) {
-        const auto hole       = ctx.getHoleCards(me);
         const int  round_now  = ctx.getRoundNumber();
 
         // Community cards visible at end of round r.

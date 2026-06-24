@@ -42,4 +42,13 @@ int cmd_br_eval(IPokerEnvironmentFactory& factory,
                 torch::Device             device,
                 const std::string&        model_path);
 
+// Standalone Local-Best-Response (exploitability lower bound) eval of a
+// SAVED model: training-free attacker (Bayesian range + equity), no PPO
+// exploiter. POKER_PPO_LBR_HANDS overrides the hand count. Same
+// architecture-match requirement as cmd_br_eval.
+int cmd_lbr_eval(IPokerEnvironmentFactory& factory,
+                 const PokerConfig&        poker_cfg,
+                 torch::Device             device,
+                 const std::string&        model_path);
+
 } // namespace poker_ppo

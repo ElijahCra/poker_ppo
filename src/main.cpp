@@ -2,6 +2,7 @@
 //   ./poker_ppo --benchmark [iters]              rollout A/B bench
 //   ./poker_ppo --play <model_path>              interactive REPL
 //   ./poker_ppo --br-eval <model_path>           exploitability of a saved model
+//   ./poker_ppo --lbr-eval <model_path>          LBR exploitability lower bound
 //   ./poker_ppo --strategy {serial|threadpool}   rollout strategy
 
 #include "commands.h"
@@ -45,8 +46,10 @@ struct CliOptions {
     bool        benchmark_mode  = false;
     bool        play_mode       = false;
     bool        br_eval_mode    = false;
+    bool        lbr_eval_mode   = false;
     std::string play_model_path;
     std::string br_model_path;
+    std::string lbr_model_path;
     int         benchmark_iters = 20;
     std::string strategy        = "threadpool";
 };
@@ -66,6 +69,9 @@ bool parse_cli(int argc, char** argv, CliOptions& out) {
         } else if (a == "--br-eval") {
             out.br_eval_mode = true;
             if (i + 1 < argc) { out.br_model_path = argv[i + 1]; ++i; }
+        } else if (a == "--lbr-eval") {
+            out.lbr_eval_mode = true;
+            if (i + 1 < argc) { out.lbr_model_path = argv[i + 1]; ++i; }
         } else if (a == "--strategy") {
             if (i + 1 < argc) { out.strategy = argv[i + 1]; ++i; }
         } else {
@@ -140,6 +146,9 @@ int main(int argc, char** argv) {
     }
     if (opt.br_eval_mode) {
         return cmd_br_eval(factory, poker_cfg, device, opt.br_model_path);
+    }
+    if (opt.lbr_eval_mode) {
+        return cmd_lbr_eval(factory, poker_cfg, device, opt.lbr_model_path);
     }
     if (opt.benchmark_mode) {
         return cmd_benchmark(factory, device, opt.benchmark_iters);

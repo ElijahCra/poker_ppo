@@ -102,11 +102,15 @@ public:
 
     // Alloc-free build: zeroes then fills dst (total_dim floats). The hot
     // rollout path writes straight into pinned staging rows through this.
+    // hole_override (2 deck-ids, or nullptr) substitutes the acting
+    // player's hole cards — LBR uses it to build the obs for a
+    // counterfactual holding when Bayes-updating the target's range.
     void build_into(
         float*                               dst,
         const Game::GameContext&             ctx,
         const std::vector<BetHistoryEntry>&  bet_history,
-        int                                  current_bet) const;
+        int                                  current_bet,
+        const uint8_t*                       hole_override = nullptr) const;
 
 private:
     void write_round_summary(float* a,

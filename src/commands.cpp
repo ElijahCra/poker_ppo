@@ -1,6 +1,7 @@
 #include "commands.h"
 
 #include "best_response.h"
+#include "lbr.h"
 #include "league.h"
 #include "metrics_logger.h"
 #include "poker_env.h"
@@ -483,6 +484,54 @@ int cmd_br_eval(IPokerEnvironmentFactory& factory,
               << "  duration=" << std::setprecision(0) << r.wall_ms << "ms\n"
               << "  lower bound on exploitability = max bb/hand "
               << "(higher = more exploitable)\n"
+              << std::defaultfloat << std::setprecision(6);
+    return 0;
+}
+
+int cmd_lbr_eval(IPokerEnvironmentFactory& factory,
+                 const PokerConfig&        poker_cfg,
+                 torch::Device             device,
+                 const std::string&        model_path)
+{
+    if (model_path.empty()) {
+        std::cerr << "--lbr-eval requires a model path\n";
+        return 1;
+    }
+    const BetConfig& bet_cfg = config::kBetConfig;
+
+    PPOTrainer trainer(factory, device);
+    std::cerr << "[lbr-eval] loading " << model_path << "\n";
+    trainer.load(model_path);
+    trainer.network()->eval();
+
+    LBRConfig cfg;
+    cfg.seed = 0x1B20BEEFull;  // fixed for reproducibility
+    if (const char* e = std::getenv("POKER_PPO_LBR_HANDS")) {
+        const int v = std::atoi(e);
+        if (v > 0) cfg.num_hands = v;
+    }
+    if (const char* e = std::getenv("POKER_PPO_LBR_MC")) {
+        const int v = std::atoi(e);
+        if (v > 0) cfg.equity_mc_samples = v;
+    }
+
+    std::cout << "[lbr-eval] Local Best Response (v1: action set {fold,call}), "
+              << cfg.num_hands << " hands, equity_mc=" << cfg.equity_mc_samples
+              << "\n";
+
+    LBREvaluator lbr(factory, bet_cfg, cfg, device);
+    auto r = lbr.evaluate(trainer.network());
+
+    std::cout << std::fixed << std::setprecision(3)
+              << "\n══════════ LBR (exploitability lower bound) ══════════\n"
+              << "  bb/hand  = " << r.bb_per_hand
+              << "   (mbb/hand=" << std::setprecision(1) << r.mbb_per_hand << ")\n"
+              << std::setprecision(3)
+              << "  lbr-win%=" << std::setprecision(1) << (100.0 * r.lbr_win_rate)
+              << "  hands="    << r.num_hands
+              << "  duration=" << std::setprecision(0) << r.wall_ms << "ms\n"
+              << "  exploitability ≥ bb/hand (≥0 for a true BR; v1 {f,c} is a\n"
+              << "  conservative attacker — a positive value is a hard exploit)\n"
               << std::defaultfloat << std::setprecision(6);
     return 0;
 }

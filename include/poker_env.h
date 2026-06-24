@@ -56,6 +56,14 @@ public:
     int terminal_utility(int player) const;
     const ::Game::DefaultGameConfig& game_config() const { return poker_cfg_.game; }
 
+    // ── LBR support ───────────────────────────────────────────────────────
+    // Chips the acting player must add to match (0 when checking is legal).
+    int amount_to_call() const;
+    // Build the obs the acting player WOULD see holding (h0,h1) instead of
+    // their real cards — for LBR's Bayesian range update. Writes obs_dim()
+    // floats into dst. h0,h1 are deck-ids.
+    void observation_for_hole(int h0, int h1, float* dst) const;
+
 private:
     void auto_advance_chance();
     void rebuild_action_table();
