@@ -124,6 +124,25 @@ void reInitialize() {
 
 [[nodiscard]] const GameContext& getContext() const noexcept { return m_context; }
 
+// ── State snapshot/restore (for LBR counterfactual lookahead) ──────────
+// Captures the full mutable game state. The rng is a reference and is NOT
+// snapshotted — safe because restore is only used around transitions that
+// draw no chance cards (a single bet/raise/call within a round).
+// m_game_config / m_betting_config are immutable after construction.
+struct StateSnapshot {
+    GameContext context;
+    GameState   state;
+    ActionSet   actions;
+};
+[[nodiscard]] StateSnapshot snapshotState() const {
+    return StateSnapshot{m_context, m_current_state, m_available_actions};
+}
+void restoreState(const StateSnapshot& s) {
+    m_context           = s.context;
+    m_current_state     = s.state;
+    m_available_actions = s.actions;
+}
+
 [[nodiscard]] std::vector<uint32_t> getAbstractedActionSizes() const {
     uint32_t pot = m_context.getPot();
     uint32_t currentBet = getCurrentBet();

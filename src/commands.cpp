@@ -514,10 +514,15 @@ int cmd_lbr_eval(IPokerEnvironmentFactory& factory,
         const int v = std::atoi(e);
         if (v > 0) cfg.equity_mc_samples = v;
     }
+    if (std::getenv("POKER_PPO_LBR_NO_RAISE") != nullptr) {
+        cfg.enable_raises = false;  // v1 {fold,call} only
+    }
 
-    std::cout << "[lbr-eval] Local Best Response (v1: action set {fold,call}), "
-              << cfg.num_hands << " hands, equity_mc=" << cfg.equity_mc_samples
-              << "\n";
+    std::cout << "[lbr-eval] Local Best Response ("
+              << (cfg.enable_raises ? "v2: {fold,call,river-raise}"
+                                    : "v1: {fold,call}")
+              << "), " << cfg.num_hands << " hands, equity_mc="
+              << cfg.equity_mc_samples << "\n";
 
     LBREvaluator lbr(factory, bet_cfg, cfg, device);
     auto r = lbr.evaluate(trainer.network());

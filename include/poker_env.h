@@ -64,6 +64,13 @@ public:
     // floats into dst. h0,h1 are deck-ids.
     void observation_for_hole(int h0, int h1, float* dst) const;
 
+    // Save/restore full mutable state (LIFO stack) — LBR applies a
+    // candidate raise, queries the target's response, then pops back to the
+    // real decision node. Only valid around within-round transitions (no
+    // chance draws), since the game rng is not snapshotted.
+    void push_state();
+    void pop_state();
+
 private:
     void auto_advance_chance();
     void rebuild_action_table();
@@ -96,6 +103,14 @@ private:
     std::vector<std::optional<::Game::Action>> action_table_;
 
     std::vector<BetHistoryEntry> bet_history_;
+
+    // LIFO snapshots for push_state/pop_state (LBR counterfactual lookahead).
+    struct Snapshot {
+        ::Game::DiscreteGame::StateSnapshot         game;
+        std::vector<BetHistoryEntry>                hist;
+        std::vector<std::optional<::Game::Action>>  table;
+    };
+    std::vector<Snapshot> state_stack_;
 };
 
 class PokerEnvironmentFactory : public IPokerEnvironmentFactory {

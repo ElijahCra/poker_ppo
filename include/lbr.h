@@ -35,6 +35,10 @@ class PokerEnvironment;
 struct LBRConfig {
     int      num_hands         = 20000;
     int      equity_mc_samples = 600;  // board-completion MC when ≥3 to come
+    // v2: also consider raising. For each candidate size, the target's
+    // fold/call response is read from its own policy at the post-raise node
+    // (snapshot → apply → query → restore). false → v1 {fold,call} only.
+    bool     enable_raises     = true;
     uint64_t seed              = 0;
 };
 

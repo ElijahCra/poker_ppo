@@ -235,6 +235,20 @@ void PokerEnvironment::observation_for_hole(int h0, int h1, float* dst) const {
                             static_cast<int>(game_->getCurrentBet()), hole);
 }
 
+void PokerEnvironment::push_state() {
+    state_stack_.push_back(Snapshot{
+        game_->snapshotState(), bet_history_, action_table_});
+}
+
+void PokerEnvironment::pop_state() {
+    TORCH_CHECK(!state_stack_.empty(), "pop_state with empty stack");
+    auto& s = state_stack_.back();
+    game_->restoreState(s.game);
+    bet_history_  = std::move(s.hist);
+    action_table_ = std::move(s.table);
+    state_stack_.pop_back();
+}
+
 void PokerEnvironment::auto_advance_chance() {
     while (!game_->isTerminal() && game_->getType() == "chance") {
         game_->transition(::Game::Chance{});
