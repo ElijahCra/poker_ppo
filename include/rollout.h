@@ -353,6 +353,10 @@ public:
     // learns the regularised game's values. Pool-snapshot actions are
     // not transformed. Call before the first collect().
     void set_rnad(ActorCritic* magnet, float eta);
+    // Update η between rollouts (annealing). Safe any time: η scales a CPU
+    // reward term in the step loop, it is not baked into the CUDA graph
+    // (which only computes the magnet log-probs).
+    void set_rnad_eta(float eta) noexcept { rnad_eta_ = eta; }
 
     // One rollout: fill buffer, bootstrap, compute returns, update carry,
     // advance global_step_. global_step_ is forwarded to opp_mgr for its

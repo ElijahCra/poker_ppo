@@ -154,6 +154,17 @@ struct PPOConfig {
     // POKER_PPO_RNAD_ETA overrides (0 disables → MMD loss form returns).
     // Requires kl_coef > 0 (that allocates the magnet).
     float rnad_eta            = 0.1f;
+    // Anneal η linearly from rnad_eta → rnad_eta_final over the run
+    // (NashPG / annealed-regularisation idea: strong magnet pull early for
+    // stable convergence, weaker late so the policy sharpens toward actual
+    // Nash instead of settling at the soft η-regularised equilibrium that a
+    // FIXED η plateaus at — the measured ~2 bb/hand LBR floor that more
+    // training does NOT lower). η_final stays > 0 to keep some last-iterate
+    // stabilisation. ent_coef is NOT annealed (Rudolph et al.: constant
+    // entropy is best; this anneals the magnet term only). Off by default.
+    // POKER_PPO_RNAD_ANNEAL=1, POKER_PPO_RNAD_ETA_FINAL override.
+    bool  rnad_anneal         = false;
+    float rnad_eta_final      = 0.02f;
     // Env steps between magnet refreshes. Sokota 2023's grid landed at
     // K ≈ 100 updates at the original 12,288-step batch ⇒ ≈1.23M steps.
     int64_t magnet_refresh_steps = 1'228'800;

@@ -49,6 +49,24 @@ float rnad_eta() {
 }
 bool rnad_active() { return rnad_eta() > 0.0f; }
 
+bool rnad_anneal() {
+    static const bool on = [] {
+        const char* e = std::getenv("POKER_PPO_RNAD_ANNEAL");
+        if (!e) return config::kPPOConfig.rnad_anneal;
+        const std::string v(e);
+        return v != "0" && v != "false";
+    }();
+    return on;
+}
+float rnad_eta_final() {
+    static const float v = [] {
+        const char* e = std::getenv("POKER_PPO_RNAD_ETA_FINAL");
+        return e ? static_cast<float>(std::atof(e))
+                 : config::kPPOConfig.rnad_eta_final;
+    }();
+    return v;
+}
+
 // Opt-in (POKER_PPO_PROFILE) phase profile for update(), mirroring the
 // rollout one: lap() syncs CUDA so async kernels are attributed to the
 // phase that launched them, which inflates the total vs. the clean path.
@@ -312,8 +330,10 @@ PPOTrainer::PPOTrainer(IPokerEnvironmentFactory& env_factory,
         } else {
             collector_->set_rnad(&magnet_, rnad_eta());
             std::cout << "[ppo] R-NaD reward regularisation: eta="
-                      << rnad_eta() << " (magnet KL moved from loss into "
-                      << "rewards)\n";
+                      << rnad_eta();
+            if (rnad_anneal())
+                std::cout << " → " << rnad_eta_final() << " (annealed)";
+            std::cout << " (magnet KL moved from loss into rewards)\n";
         }
     }
 }
@@ -371,6 +391,16 @@ void PPOTrainer::train() {
             constexpr float floor_frac = cfg_.min_lr_frac > 0.0f ? cfg_.min_lr_frac : 0.0f;
             const float lr = cfg_.learning_rate * std::max(frac, floor_frac);
             optimizer_->set_lr(lr);
+        }
+
+        // Anneal R-NaD η over the schedule horizon (NashPG-style). Cheap
+        // CPU-scalar update; not graph-captured. Held at η_final past the
+        // horizon (POKER_PPO_MAX_STEPS arms exit before then anyway).
+        if (rnad_active() && rnad_anneal() && !magnet_.is_empty()) {
+            const float p = std::min(1.0f,
+                static_cast<float>(update_idx_) / sched_updates_);
+            collector_->set_rnad_eta(
+                rnad_eta() * (1.0f - p) + rnad_eta_final() * p);
         }
 
         using clock = std::chrono::steady_clock;
