@@ -27,6 +27,7 @@
 #include <cstdint>
 #include <memory>
 #include <random>
+#include <string>
 
 namespace poker_ppo {
 
@@ -39,6 +40,15 @@ struct LBRConfig {
     // fold/call response is read from its own policy at the post-raise node
     // (snapshot → apply → query → restore). false → v1 {fold,call} only.
     bool     enable_raises     = true;
+    // Deployment filter applied to the target before attacking it: temper
+    // then drop actions below play_min_p and renormalise (matches play
+    // mode). 0/1.0 = attack the raw policy. Lets LBR measure the
+    // exploitability of the policy as actually DEPLOYED, not just raw.
+    float    play_min_p        = 0.0f;
+    float    play_temp         = 1.0f;
+    // Optional per-hand diagnostic JSONL (empty = off). The aggregate
+    // breakdown table is always printed.
+    std::string log_path;
     uint64_t seed              = 0;
 };
 

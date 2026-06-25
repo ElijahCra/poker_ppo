@@ -7,6 +7,11 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <map>
+#include <string>
 #include <vector>
 
 namespace poker_ppo {
@@ -115,9 +120,32 @@ LBREvaluator::Result LBREvaluator::evaluate(ActorCritic& target) {
     const int A = bet_cfg_.action_count();
     auto f_cpu = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
 
-    // Target policy probs at the CURRENT node for each active combo, holding
-    // it counterfactually: [n_active, A] on CPU. mask is the public legal
-    // mask (card-independent). Used for the Bayes update and for reading the
+    // Deployment filter (temper → drop <min_p → renormalise), matching play
+    // mode. When off (min_p 0, temp 1) it's the raw policy. Applied to every
+    // target query so LBR attacks the policy AS DEPLOYED.
+    const float min_p = cfg_.play_min_p;
+    const float temp  = cfg_.play_temp > 0.0f ? cfg_.play_temp : 1.0f;
+    const bool  filtering = (min_p > 0.0f) || (temp != 1.0f);
+    auto apply_filter = [&](const torch::Tensor& logp) -> torch::Tensor {
+        if (!filtering) return logp.exp();
+        auto p = torch::softmax(logp / temp, -1);
+        if (min_p <= 0.0f) return p;
+        auto kept = p * (p >= min_p).to(torch::kFloat32);
+        auto z    = kept.sum(-1, /*keepdim=*/true);
+        auto safe = torch::where(z > 0, kept / z, torch::zeros_like(kept));
+        auto allzero = (z.squeeze(-1) <= 0);
+        if (allzero.any().item<bool>()) {  // all filtered → keep argmax
+            auto am   = std::get<1>(p.max(-1));
+            auto oneh = torch::zeros_like(p).scatter_(
+                -1, am.unsqueeze(-1), 1.0);
+            safe = torch::where(allzero.unsqueeze(-1), oneh, safe);
+        }
+        return safe;
+    };
+
+    // Filtered target policy probs at the CURRENT node for each active combo,
+    // holding it counterfactually: [n_active, A] on CPU. mask is the public
+    // legal mask (card-independent). Used for the Bayes update and the
     // villain's fold/call response to a candidate LBR raise.
     auto active_probs = [&](const Belief& b, const std::vector<int>& active,
                             const torch::Tensor& mask) -> torch::Tensor {
@@ -131,7 +159,7 @@ LBREvaluator::Result LBREvaluator::evaluate(ActorCritic& target) {
         auto obs_dev = obs.to(device_);
         auto mb_dev  = mask.unsqueeze(0).expand({n, A}).to(device_);
         auto logp    = target->masked_log_probs(obs_dev, mb_dev);
-        return logp.exp().to(torch::kCPU).contiguous();  // [n, A]
+        return apply_filter(logp).to(torch::kCPU).contiguous();  // [n, A]
     };
 
     auto active_of = [](const Belief& b) {
@@ -145,6 +173,17 @@ LBREvaluator::Result LBREvaluator::evaluate(ActorCritic& target) {
     double total_mbb = 0.0;
     int    wins = 0, ties = 0;
     const int big_blind = env_->game_config().big_blind;
+
+    // Diagnostics: where LBR's profit comes from. Category = how the hand
+    // ended from LBR's side; also a per-street breakdown by ending round.
+    struct Bucket { long n = 0; double mbb = 0.0; };
+    std::map<std::string, Bucket> by_cat;
+    std::array<Bucket, 4>         by_street{};
+    std::ofstream log;
+    if (!cfg_.log_path.empty()) {
+        log.open(cfg_.log_path);
+        log << "hand,lbr_seat,end_round,was_fold,lbr_folded,lbr_raised,mbb\n";
+    }
 
     Belief belief;
     bool dead[52];
@@ -160,6 +199,7 @@ LBREvaluator::Result LBREvaluator::evaluate(ActorCritic& target) {
         // re-optimising each street can fold the pot the raise inflated,
         // realising far less than the modelled value (raises overvalued).
         bool committed = false;
+        bool lbr_folded = false, lbr_raised = false;
 
         while (!env_->is_terminal()) {
             const int cur = env_->current_player();
@@ -171,8 +211,12 @@ LBREvaluator::Result LBREvaluator::evaluate(ActorCritic& target) {
                 auto mask     = env_->legal_action_mask();
                 auto real_obs = env_->observation().unsqueeze(0).to(device_);
                 auto mask_dev = mask.unsqueeze(0).to(device_);
+                // Sample from the (possibly filtered) target policy so the
+                // villain plays exactly the policy LBR is attacking.
+                auto p_real = apply_filter(
+                    target->masked_log_probs(real_obs, mask_dev));
                 const int a = static_cast<int>(
-                    target->get_action(real_obs, mask_dev).action.item<int64_t>());
+                    p_real.multinomial(1).item<int64_t>());
 
                 auto active = active_of(belief);
                 if (!active.empty()) {
@@ -266,7 +310,8 @@ LBREvaluator::Result LBREvaluator::evaluate(ActorCritic& target) {
                 }
             }
 
-            if (best_action >= 2) committed = true;  // raised → call down after
+            if (best_action >= 2) { committed = true; lbr_raised = true; }
+            if (best_action == 0) lbr_folded = true;
             env_->step(best_action);
         }
 
@@ -274,7 +319,56 @@ LBREvaluator::Result LBREvaluator::evaluate(ActorCritic& target) {
         total_mbb += u;
         if      (u > 0.0)  ++wins;
         else if (u == 0.0) ++ties;
+
+        // Attribute the hand. Category tells the leak type: bot_fold = the
+        // target gave up (LBR's aggression/equity-correct continues won the
+        // pot); lbr_fold = LBR folded (saved chips vs the target's betting);
+        // showdown_{win,loss} = LBR went to showdown.
+        const int  end_round = env_->round();
+        const bool was_fold  = env_->terminal_was_fold();
+        std::string cat;
+        if (was_fold) cat = lbr_folded ? "lbr_fold" : "bot_fold";
+        else          cat = (u > 0.0) ? "showdown_win"
+                          : (u < 0.0) ? "showdown_loss" : "showdown_tie";
+        auto& bc = by_cat[cat]; bc.n++; bc.mbb += u;
+        if (end_round >= 0 && end_round < 4) {
+            by_street[end_round].n++; by_street[end_round].mbb += u;
+        }
+        if (log.is_open()) {
+            log << hand << ',' << lbr_seat << ',' << end_round << ','
+                << (was_fold ? 1 : 0) << ',' << (lbr_folded ? 1 : 0) << ','
+                << (lbr_raised ? 1 : 0) << ',' << u << '\n';
+        }
     }
+
+    if (log.is_open()) log.close();
+
+    // ── Diagnostic breakdown: where the bb/hand comes from ────────────────
+    const double N  = static_cast<double>(std::max(1, cfg_.num_hands));
+    const double bb = static_cast<double>(std::max(1, big_blind));
+    auto row = [&](const std::string& name, const Bucket& b) {
+        std::cout << "  " << std::setw(14) << std::left << name << std::right
+                  << std::setw(8)  << b.n
+                  << std::setw(8)  << std::fixed << std::setprecision(1)
+                  << (100.0 * b.n / N) << "%"
+                  << std::setw(12) << std::setprecision(3)
+                  << (b.mbb / N / bb) << " bb/hand"
+                  << std::setw(11) << std::setprecision(3)
+                  << (b.n > 0 ? b.mbb / b.n / bb : 0.0) << " bb/when\n";
+    };
+    std::cout << "\n────────── LBR profit attribution ──────────\n"
+              << "  (bb/hand = contribution to the bound; "
+              << "bb/when = avg when it occurs)\n"
+              << "  " << std::setw(14) << std::left << "category" << std::right
+              << std::setw(8) << "hands" << std::setw(9) << "freq"
+              << std::setw(12+8) << "share" << std::setw(11) << "avg\n";
+    for (const char* k : {"bot_fold", "lbr_fold", "showdown_win",
+                          "showdown_loss", "showdown_tie"})
+        if (by_cat.count(k)) row(k, by_cat[k]);
+    std::cout << "  ── by ending street ──\n";
+    static const char* sname[4] = {"preflop", "flop", "turn", "river"};
+    for (int s = 0; s < 4; ++s) row(sname[s], by_street[s]);
+    std::cout.unsetf(std::ios::fixed);
 
     using ms = std::chrono::duration<double, std::milli>;
     Result r;

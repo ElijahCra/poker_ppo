@@ -517,12 +517,25 @@ int cmd_lbr_eval(IPokerEnvironmentFactory& factory,
     if (std::getenv("POKER_PPO_LBR_NO_RAISE") != nullptr) {
         cfg.enable_raises = false;  // v1 {fold,call} only
     }
+    // Attack the policy AS DEPLOYED: same filter knobs as play mode.
+    if (const char* e = std::getenv("POKER_PPO_LBR_MIN_P"))
+        cfg.play_min_p = static_cast<float>(std::atof(e));
+    if (const char* e = std::getenv("POKER_PPO_LBR_TEMP")) {
+        const float t = static_cast<float>(std::atof(e));
+        if (t > 0.0f) cfg.play_temp = t;
+    }
+    if (const char* e = std::getenv("POKER_PPO_LBR_LOG")) cfg.log_path = e;
 
     std::cout << "[lbr-eval] Local Best Response ("
               << (cfg.enable_raises ? "v2: {fold,call,river-raise}"
                                     : "v1: {fold,call}")
               << "), " << cfg.num_hands << " hands, equity_mc="
-              << cfg.equity_mc_samples << "\n";
+              << cfg.equity_mc_samples
+              << ", target=" << ((cfg.play_min_p > 0.0f || cfg.play_temp != 1.0f)
+                                  ? "FILTERED" : "raw");
+    if (cfg.play_min_p > 0.0f || cfg.play_temp != 1.0f)
+        std::cout << " (min_p=" << cfg.play_min_p << " temp=" << cfg.play_temp << ")";
+    std::cout << "\n";
 
     LBREvaluator lbr(factory, bet_cfg, cfg, device);
     auto r = lbr.evaluate(trainer.network());

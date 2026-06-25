@@ -54,6 +54,9 @@ public:
     int raise_num() const;
     // Undefined if !is_terminal().
     int terminal_utility(int player) const;
+    // True when the hand ended by a fold (vs showdown/all-in). For LBR
+    // diagnostics — attributes a hand to "someone folded" vs "showdown".
+    bool terminal_was_fold() const;
     const ::Game::DefaultGameConfig& game_config() const { return poker_cfg_.game; }
 
     // ── LBR support ───────────────────────────────────────────────────────

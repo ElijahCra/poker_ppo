@@ -95,6 +95,11 @@ bool PokerEnvironment::is_terminal() const {
     return game_->isTerminal();
 }
 
+bool PokerEnvironment::terminal_was_fold() const {
+    return game_->isTerminal() &&
+           game_->getTerminalReason() == ::Game::TerminalState::FOLD;
+}
+
 int PokerEnvironment::obs_dim() const {
     return obs_builder_.obs_dim();
 }
