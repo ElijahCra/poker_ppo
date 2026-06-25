@@ -55,6 +55,23 @@ struct LBRConfig {
     // raises, so this probe is what exposes flop/turn fold-weakness). Adds
     // one extra target query per LBR node; off by default.
     bool     fold_probe        = false;
+    // Raise pricing for streets before the river.
+    //   0 = analytic checkdown, river raises only — EXACT, the default and
+    //       the trustworthy bound.
+    //   1 = MC rollout, river-only — a VALIDATION mode: converges to the
+    //       analytic bound as K grows (confirmed: K24→1.43, K120→1.79 vs
+    //       analytic 2.22 on the test model), proving the rollout machinery
+    //       (belief-sampled holding + consistent-board injection, no
+    //       hidden-info leak) is sound.
+    //   2 = MC rollout, ALL streets — EXPERIMENTAL, NOT a trustworthy bound.
+    //       LBR's rollout policy (commit to call-down after raising) is too
+    //       passive on flop/turn: it pays off the target's later value bets,
+    //       so the realised value of early raises is negative regardless of
+    //       K. A meaningful all-street bound needs recursive optimal
+    //       future-street play inside the rollout (large build). The
+    //       calibration line flags the resulting EV as OPTIMISTIC.
+    int      rollout_mode      = 0;
+    int      rollout_samples   = 24;   // K rollouts per candidate raise
     uint64_t seed              = 0;
 };
 

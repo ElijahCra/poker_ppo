@@ -254,6 +254,33 @@ void PokerEnvironment::pop_state() {
     state_stack_.pop_back();
 }
 
+void PokerEnvironment::inject_rollout_cards(int villain_seat, int h0, int h1,
+                                            std::mt19937& rng) {
+    auto& raw = game_->contextMut().cards.rawCards;  // [p0(2)|p1(2)|board(5)]
+    const int lbr_seat = 1 - villain_seat;
+    const int nb = game_->getContext().getCommunityCount();  // 0/3/4/5 revealed
+
+    bool dead[52] = {};
+    dead[raw[lbr_seat * 2]]     = true;
+    dead[raw[lbr_seat * 2 + 1]] = true;
+    for (int i = 0; i < nb; ++i) dead[raw[4 + i]] = true;  // revealed board
+    dead[static_cast<uint8_t>(h0)] = true;
+    dead[static_cast<uint8_t>(h1)] = true;
+
+    raw[villain_seat * 2]     = static_cast<uint8_t>(h0);
+    raw[villain_seat * 2 + 1] = static_cast<uint8_t>(h1);
+
+    // Resample unrevealed board slots [4+nb .. 8] from the live deck.
+    int rem[52], nr = 0;
+    for (int c = 0; c < 52; ++c) if (!dead[c]) rem[nr++] = c;
+    for (int slot = 4 + nb; slot < 9; ++slot) {
+        std::uniform_int_distribution<int> d(0, nr - 1);
+        const int j = d(rng);
+        raw[slot] = static_cast<uint8_t>(rem[j]);
+        rem[j] = rem[--nr];  // draw without replacement
+    }
+}
+
 void PokerEnvironment::auto_advance_chance() {
     while (!game_->isTerminal() && game_->getType() == "chance") {
         game_->transition(::Game::Chance{});

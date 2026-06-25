@@ -74,6 +74,14 @@ public:
     void push_state();
     void pop_state();
 
+    // LBR rollout: overwrite the villain's hole with (h0,h1) and resample
+    // the UNREVEALED board consistently (excluding LBR's cards, the
+    // revealed board, and h) so the counterfactual hand has no card
+    // conflicts. Must be called inside a push_state/pop_state bracket.
+    // villain_seat is the seat whose cards are being injected.
+    void inject_rollout_cards(int villain_seat, int h0, int h1,
+                              std::mt19937& rng);
+
 private:
     void auto_advance_chance();
     void rebuild_action_table();

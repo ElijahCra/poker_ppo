@@ -186,6 +186,49 @@ LBREvaluator::Result LBREvaluator::evaluate(ActorCritic& target) {
         return active;
     };
 
+    // Sample the villain's action at the current node from the (filtered)
+    // target policy, reading whatever cards are currently in the state
+    // (real, or injected during a rollout).
+    auto sample_villain_action = [&](const torch::Tensor& mask) -> int {
+        auto obs = env_->observation().unsqueeze(0).to(device_);
+        auto md  = mask.unsqueeze(0).to(device_);
+        auto p   = apply_filter(target->masked_log_probs(obs, md));
+        return static_cast<int>(p.multinomial(1).item<int64_t>());
+    };
+
+    // Monte-Carlo EV (absolute terminal utility, LBR seat) of LBR raising
+    // a_r and then committing to call down — SOUND on any street. Each
+    // sample draws a villain holding from the belief and a consistent
+    // board (no hidden-info leak), applies the raise, and plays the hand
+    // out (villain by its policy, LBR call/check). Marginalises over the
+    // villain's range, the unseen board, and the villain's action noise.
+    auto rollout_raise_ev = [&](int a_r, int lbr_seat, const Belief& b,
+                                const std::vector<int>& active) -> double {
+        std::vector<double> w(active.size());
+        for (size_t r = 0; r < active.size(); ++r) w[r] = b.weights[active[r]];
+        std::discrete_distribution<int> pick(w.begin(), w.end());
+        const int villain = 1 - lbr_seat;
+        const int K = std::max(1, cfg_.rollout_samples);
+        double sum = 0.0;
+        for (int k = 0; k < K; ++k) {
+            const auto& h = b.combos[active[pick(rng_)]];
+            env_->push_state();
+            env_->inject_rollout_cards(villain, h[0], h[1], rng_);
+            env_->step(a_r);  // LBR raises
+            while (!env_->is_terminal()) {
+                if (env_->current_player() == lbr_seat) {
+                    env_->step(1);  // committed: call/check to showdown
+                } else {
+                    auto m = env_->legal_action_mask();
+                    env_->step(sample_villain_action(m));
+                }
+            }
+            sum += static_cast<double>(env_->terminal_utility(lbr_seat));
+            env_->pop_state();
+        }
+        return sum / K;
+    };
+
     double total_mbb = 0.0;
     int    wins = 0, ties = 0;
     const int big_blind = env_->game_config().big_blind;
@@ -198,6 +241,9 @@ LBREvaluator::Result LBREvaluator::evaluate(ActorCritic& target) {
     // Fold-probe: per street, n = LBR nodes where a raise was legal, mbb =
     // Σ belief-weighted P(target folds to a pot raise). avg = over-fold rate.
     std::array<Bucket, 4>         fold_probe{};
+    // Rollout calibration: mean predicted vs realised util on raise-hands
+    // (validates the EV estimate is meaningful, not just non-crashing).
+    double cal_pred = 0.0, cal_real = 0.0; long cal_n = 0;
     std::ofstream log;
     if (!cfg_.log_path.empty()) {
         log.open(cfg_.log_path);
@@ -219,6 +265,9 @@ LBREvaluator::Result LBREvaluator::evaluate(ActorCritic& target) {
         // realising far less than the modelled value (raises overvalued).
         bool committed = false;
         bool lbr_folded = false, lbr_raised = false;
+        // Calibration: predicted util of LBR's first rollout-raise vs the
+        // hand's realised util (rollout modes only).
+        double pred_util = 0.0; bool have_pred = false;
 
         while (!env_->is_terminal()) {
             const int cur = env_->current_player();
@@ -227,15 +276,10 @@ LBREvaluator::Result LBREvaluator::evaluate(ActorCritic& target) {
 
             if (cur != lbr_seat) {
                 // ── Target acts; observe its action, Bayes-update belief ──
-                auto mask     = env_->legal_action_mask();
-                auto real_obs = env_->observation().unsqueeze(0).to(device_);
-                auto mask_dev = mask.unsqueeze(0).to(device_);
+                auto mask = env_->legal_action_mask();
                 // Sample from the (possibly filtered) target policy so the
                 // villain plays exactly the policy LBR is attacking.
-                auto p_real = apply_filter(
-                    target->masked_log_probs(real_obs, mask_dev));
-                const int a = static_cast<int>(
-                    p_real.multinomial(1).item<int64_t>());
+                const int a = sample_villain_action(mask);
 
                 auto active = active_of(belief);
                 if (!active.empty()) {
@@ -297,61 +341,72 @@ LBREvaluator::Result LBREvaluator::evaluate(ActorCritic& target) {
                 }
             }
 
-            int    best_action = (c <= 0) ? 1 : (ev_call > 0.0 ? 1 : 0);
-            double best_ev     = (c <= 0) ? ev_call : std::max(0.0, ev_call);
-
-            // Raises are priced with a single-street checkdown model, which
-            // is EXACT only on the river (no further cards or betting rounds
-            // to mis-model). Earlier-street raises would need recursive
-            // multi-street lookahead; approximating them produced badly
-            // biased (too-low) bounds, so v2 raises only on the river — a
-            // sound strict improvement over v1 (exact river value/bluff
-            // raises), never a regression.
-            if (cfg_.enable_raises && nb == 5) {
-                auto active = active_of(belief);
-                for (int a_r : candidate_raises(*env_, mask)) {
-                    env_->push_state();
-                    env_->step(a_r);
-                    // Now at the villain's node facing the raise.
-                    const double pot1 = static_cast<double>(env_->pot());
-                    const double add_r = pot1 - pot0;          // LBR's chips in
-                    const double vc    = static_cast<double>(env_->amount_to_call());
-                    auto vmask = env_->legal_action_mask();
-
-                    double p_fold = 0.0;
-                    std::vector<double> call_w(active.size(), 0.0);
-                    if (!active.empty()) {
-                        auto P  = active_probs(belief, active, vmask);  // [n, A]
-                        auto pf_t = P.select(1, 0).contiguous();
-                        auto pf = pf_t.accessor<float, 1>();
-                        for (size_t r = 0; r < active.size(); ++r) {
-                            const double w  = belief.weights[active[r]];
-                            const double pf_i = static_cast<double>(
-                                pf[static_cast<long>(r)]);
-                            p_fold   += w * pf_i;
-                            call_w[r] = w * (1.0 - pf_i);  // reraise folded into call
+            int best_action;
+            if (cfg_.rollout_mode == 0) {
+                // Analytic: single-street checkdown EV, EXACT only on the
+                // river (river-only raises). ΔEV-vs-fold scale.
+                best_action = (c <= 0) ? 1 : (ev_call > 0.0 ? 1 : 0);
+                double best_ev = (c <= 0) ? ev_call : std::max(0.0, ev_call);
+                if (cfg_.enable_raises && nb == 5) {
+                    auto active = active_of(belief);
+                    for (int a_r : candidate_raises(*env_, mask)) {
+                        env_->push_state();
+                        env_->step(a_r);
+                        const double pot1 = static_cast<double>(env_->pot());
+                        const double add_r = pot1 - pot0;
+                        const double vc    = static_cast<double>(env_->amount_to_call());
+                        auto vmask = env_->legal_action_mask();
+                        double p_fold = 0.0;
+                        std::vector<double> call_w(active.size(), 0.0);
+                        if (!active.empty()) {
+                            auto P  = active_probs(belief, active, vmask);
+                            auto pf_t = P.select(1, 0).contiguous();
+                            auto pf = pf_t.accessor<float, 1>();
+                            for (size_t r = 0; r < active.size(); ++r) {
+                                const double w = belief.weights[active[r]];
+                                const double pf_i = static_cast<double>(
+                                    pf[static_cast<long>(r)]);
+                                p_fold   += w * pf_i;
+                                call_w[r] = w * (1.0 - pf_i);
+                            }
                         }
+                        env_->pop_state();
+                        std::vector<std::array<uint8_t, 2>> cc(active.size());
+                        for (size_t r = 0; r < active.size(); ++r)
+                            cc[r] = belief.combos[active[r]];
+                        const double e_raise = Game::hand_vs_range_equity(
+                            static_cast<uint8_t>(h[0]), static_cast<uint8_t>(h[1]),
+                            board, nb, cc, call_w, rng_, cfg_.equity_mc_samples);
+                        const double ev_raise =
+                            p_fold * pot0
+                            + (1.0 - p_fold) * (e_raise * (pot1 + vc) - add_r);
+                        if (ev_raise > best_ev) { best_ev = ev_raise; best_action = a_r; }
                     }
-                    env_->pop_state();
-
-                    // Equity vs the call-range (combos reweighted by P(call)).
-                    std::vector<std::array<uint8_t, 2>> cc(active.size());
-                    for (size_t r = 0; r < active.size(); ++r)
-                        cc[r] = belief.combos[active[r]];
-                    const double e_raise = Game::hand_vs_range_equity(
-                        static_cast<uint8_t>(h[0]), static_cast<uint8_t>(h[1]),
-                        board, nb, cc, call_w, rng_, cfg_.equity_mc_samples);
-
-                    // ΔEV vs fold: villain folds → win pot0; villain calls →
-                    // equity on the final pot, minus LBR's raise outlay.
-                    const double ev_raise =
-                        p_fold * pot0
-                        + (1.0 - p_fold) * (e_raise * (pot1 + vc) - add_r);
-
-                    if (ev_raise > best_ev) {
-                        best_ev = ev_raise;
-                        best_action = a_r;
-                    }
+                }
+            } else {
+                // Rollout: absolute terminal-utility scale. fold = −invested;
+                // call = fold + ev_call (analytic, validated); raise = MC
+                // rollout. Mode 1 = river-only (validation vs analytic),
+                // mode 2 = all streets.
+                double best_util = 0.0;
+                const double invested =
+                    env_->game_config().initial_stack - env_->stack(lbr_seat);
+                const double fold_util = -invested;
+                const double call_util = fold_util + ev_call;
+                if (c <= 0 || call_util >= fold_util) { best_util = call_util; best_action = 1; }
+                else                                  { best_util = fold_util; best_action = 0; }
+                const bool allow_raise = (cfg_.rollout_mode == 2) || (nb == 5);
+                if (allow_raise) {
+                    auto active = active_of(belief);
+                    if (!active.empty())
+                        for (int a_r : candidate_raises(*env_, mask)) {
+                            const double u = rollout_raise_ev(a_r, lbr_seat,
+                                                              belief, active);
+                            if (u > best_util) { best_util = u; best_action = a_r; }
+                        }
+                }
+                if (best_action >= 2 && !have_pred) {  // calibration: 1st raise
+                    pred_util = best_util; have_pred = true;
                 }
             }
 
@@ -376,6 +431,7 @@ LBREvaluator::Result LBREvaluator::evaluate(ActorCritic& target) {
         else          cat = (u > 0.0) ? "showdown_win"
                           : (u < 0.0) ? "showdown_loss" : "showdown_tie";
         auto& bc = by_cat[cat]; bc.n++; bc.mbb += u;
+        if (have_pred) { cal_pred += pred_util; cal_real += u; ++cal_n; }
         if (end_round >= 0 && end_round < 4) {
             by_street[end_round].n++; by_street[end_round].mbb += u;
         }
@@ -425,6 +481,20 @@ LBREvaluator::Result LBREvaluator::evaluate(ActorCritic& target) {
                       << (b.n > 0 ? 100.0 * b.mbb / b.n : 0.0)
                       << "% fold-to-raise\n";
         }
+    }
+    if (cfg_.rollout_mode != 0 && cal_n > 0) {
+        const double pp = cal_pred / cal_n / bb, rr = cal_real / cal_n / bb;
+        // Maximization bias: argmax over K-sample MC estimates inflates the
+        // chosen raise's predicted EV. A large predicted≫realised gap means
+        // the raise selection is overfitting MC noise → the bound is
+        // pessimistic (bad raises chosen). Shrinks as K grows.
+        const bool ok = (rr >= 0.7 * pp) && (pp > 0);
+        std::cout << "  ── rollout calibration (raise-hands) ──\n"
+                  << std::fixed << std::setprecision(3)
+                  << "  predicted " << pp << " bb/hand   realised " << rr
+                  << " bb/hand   over " << cal_n << " hands  → "
+                  << (ok ? "OK" : "OPTIMISTIC (raise EV overfit to MC noise; "
+                                  "raise K or use analytic river)") << "\n";
     }
     std::cout.unsetf(std::ios::fixed);
 

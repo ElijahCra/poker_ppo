@@ -124,6 +124,13 @@ void reInitialize() {
 
 [[nodiscard]] const GameContext& getContext() const noexcept { return m_context; }
 
+// Mutable context for LBR rollout card-injection ONLY. Overwriting cards
+// leaves handHashes stale, which is fine because the network policy reads
+// cards from the observation (rawCards), not the infoset hash, and the
+// showdown evaluator (Transitioner) reads rawCards live. Always used
+// inside a snapshotState/restoreState bracket so the mutation is undone.
+[[nodiscard]] GameContext& contextMut() noexcept { return m_context; }
+
 // ── State snapshot/restore (for LBR counterfactual lookahead) ──────────
 // Captures the full mutable game state. The rng is a reference and is NOT
 // snapshotted — safe because restore is only used around transitions that

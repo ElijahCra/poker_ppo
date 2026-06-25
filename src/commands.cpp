@@ -526,11 +526,27 @@ int cmd_lbr_eval(IPokerEnvironmentFactory& factory,
     }
     if (const char* e = std::getenv("POKER_PPO_LBR_LOG")) cfg.log_path = e;
     if (std::getenv("POKER_PPO_LBR_FOLD_PROBE") != nullptr) cfg.fold_probe = true;
+    // Rollout raise pricing: off (analytic river-only) | river (rollout,
+    // river-only — validates vs analytic) | all (rollout, all streets).
+    if (const char* e = std::getenv("POKER_PPO_LBR_ROLLOUT")) {
+        const std::string v(e);
+        if      (v == "river") cfg.rollout_mode = 1;
+        else if (v == "all")   cfg.rollout_mode = 2;
+        else if (v == "off")   cfg.rollout_mode = 0;
+    }
+    if (const char* e = std::getenv("POKER_PPO_LBR_ROLLOUT_K")) {
+        const int v = std::atoi(e);
+        if (v > 0) cfg.rollout_samples = v;
+    }
 
-    std::cout << "[lbr-eval] Local Best Response ("
-              << (cfg.enable_raises ? "v2: {fold,call,river-raise}"
-                                    : "v1: {fold,call}")
-              << "), " << cfg.num_hands << " hands, equity_mc="
+    const char* raise_desc =
+        cfg.rollout_mode == 2 ? "rollout all-street raises"
+      : cfg.rollout_mode == 1 ? "rollout river-only raises (validation)"
+      : cfg.enable_raises     ? "v2: {fold,call,river-raise}"
+                              : "v1: {fold,call}";
+    std::cout << "[lbr-eval] Local Best Response (" << raise_desc;
+    if (cfg.rollout_mode != 0) std::cout << ", K=" << cfg.rollout_samples;
+    std::cout << "), " << cfg.num_hands << " hands, equity_mc="
               << cfg.equity_mc_samples
               << ", target=" << ((cfg.play_min_p > 0.0f || cfg.play_temp != 1.0f)
                                   ? "FILTERED" : "raw");
