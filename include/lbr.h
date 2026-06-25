@@ -49,6 +49,12 @@ struct LBRConfig {
     // Optional per-hand diagnostic JSONL (empty = off). The aggregate
     // breakdown table is always printed.
     std::string log_path;
+    // Measure the target's fold-rate to a hypothetical pot-sized raise at
+    // every LBR decision, bucketed by street — a direct read on whether the
+    // bot over-folds to pressure on ALL streets (LBR only realises river
+    // raises, so this probe is what exposes flop/turn fold-weakness). Adds
+    // one extra target query per LBR node; off by default.
+    bool     fold_probe        = false;
     uint64_t seed              = 0;
 };
 

@@ -525,6 +525,7 @@ int cmd_lbr_eval(IPokerEnvironmentFactory& factory,
         if (t > 0.0f) cfg.play_temp = t;
     }
     if (const char* e = std::getenv("POKER_PPO_LBR_LOG")) cfg.log_path = e;
+    if (std::getenv("POKER_PPO_LBR_FOLD_PROBE") != nullptr) cfg.fold_probe = true;
 
     std::cout << "[lbr-eval] Local Best Response ("
               << (cfg.enable_raises ? "v2: {fold,call,river-raise}"

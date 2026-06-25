@@ -107,6 +107,22 @@ std::vector<int> candidate_raises(const PokerEnvironment& env,
     return out;
 }
 
+// The single legal raise nearest to a pot-sized bet (for the fold probe);
+// -1 if no raise is legal here.
+int pot_raise_index(const PokerEnvironment& env, const torch::Tensor& mask) {
+    const auto& fr = env.game_config().pot_fractions;
+    auto m = mask.accessor<float, 1>();
+    int best = -1; double bd = 1e18;
+    for (size_t j = 0; j < fr.size(); ++j) {
+        const int idx = 2 + static_cast<int>(j);
+        if (idx < mask.size(0) && m[idx] > 0.5f) {
+            const double d = std::abs(fr[j] - 1.0);
+            if (d < bd) { bd = d; best = idx; }
+        }
+    }
+    return best;
+}
+
 }  // namespace
 
 LBREvaluator::Result LBREvaluator::evaluate(ActorCritic& target) {
@@ -179,6 +195,9 @@ LBREvaluator::Result LBREvaluator::evaluate(ActorCritic& target) {
     struct Bucket { long n = 0; double mbb = 0.0; };
     std::map<std::string, Bucket> by_cat;
     std::array<Bucket, 4>         by_street{};
+    // Fold-probe: per street, n = LBR nodes where a raise was legal, mbb =
+    // Σ belief-weighted P(target folds to a pot raise). avg = over-fold rate.
+    std::array<Bucket, 4>         fold_probe{};
     std::ofstream log;
     if (!cfg_.log_path.empty()) {
         log.open(cfg_.log_path);
@@ -251,6 +270,32 @@ LBREvaluator::Result LBREvaluator::evaluate(ActorCritic& target) {
                 board, nb, belief.combos, belief.weights,
                 rng_, cfg_.equity_mc_samples);
             const double ev_call = e_call * (pot0 + c) - static_cast<double>(c);
+
+            // Fold-probe (measurement only): what fraction of the target's
+            // range folds to a pot-sized raise HERE? Measured on every
+            // street, so it sees flop/turn fold-weakness that LBR's
+            // river-only realised raises cannot.
+            if (cfg_.fold_probe) {
+                const int pr = pot_raise_index(*env_, mask);
+                if (pr >= 0) {
+                    auto active = active_of(belief);
+                    env_->push_state();
+                    env_->step(pr);
+                    auto vmask = env_->legal_action_mask();
+                    double pf = 0.0;
+                    if (!active.empty()) {
+                        auto P  = active_probs(belief, active, vmask);
+                        auto ft = P.select(1, 0).contiguous();
+                        auto fa = ft.accessor<float, 1>();
+                        for (size_t r = 0; r < active.size(); ++r)
+                            pf += belief.weights[active[r]] *
+                                  static_cast<double>(fa[static_cast<long>(r)]);
+                    }
+                    env_->pop_state();
+                    const int s = env_->round();
+                    if (s >= 0 && s < 4) { fold_probe[s].n++; fold_probe[s].mbb += pf; }
+                }
+            }
 
             int    best_action = (c <= 0) ? 1 : (ev_call > 0.0 ? 1 : 0);
             double best_ev     = (c <= 0) ? ev_call : std::max(0.0, ev_call);
@@ -368,6 +413,19 @@ LBREvaluator::Result LBREvaluator::evaluate(ActorCritic& target) {
     std::cout << "  ── by ending street ──\n";
     static const char* sname[4] = {"preflop", "flop", "turn", "river"};
     for (int s = 0; s < 4; ++s) row(sname[s], by_street[s]);
+
+    if (cfg_.fold_probe) {
+        std::cout << "  ── target fold-rate to a pot raise, by street "
+                  << "(measures over-fold to pressure on ALL streets) ──\n";
+        for (int s = 0; s < 4; ++s) {
+            const auto& b = fold_probe[s];
+            std::cout << "  " << std::setw(14) << std::left << sname[s]
+                      << std::right << std::setw(8) << b.n << " nodes"
+                      << std::setw(10) << std::fixed << std::setprecision(1)
+                      << (b.n > 0 ? 100.0 * b.mbb / b.n : 0.0)
+                      << "% fold-to-raise\n";
+        }
+    }
     std::cout.unsetf(std::ios::fixed);
 
     using ms = std::chrono::duration<double, std::milli>;
