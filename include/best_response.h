@@ -59,6 +59,11 @@ public:
 
     const BestResponseConfig& config() const { return cfg_; }
 
+    // The exploiter network from the most recent evaluate() — its trained
+    // best-response policy. Used by exploiter-augmented self-play (A1) to
+    // feed real best-response pressure into the learner's opponent pool.
+    const ActorCritic& exploiter() const { return exploiter_; }
+
 private:
     void init_exploiter();
 

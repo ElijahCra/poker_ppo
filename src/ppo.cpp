@@ -1,5 +1,6 @@
 #include "ppo.h"
 
+#include "best_response.h"
 #include "opponent_manager.h"
 
 #include <ATen/autocast_mode.h>
@@ -275,7 +276,8 @@ torch::Tensor VectorizedEnv::reset_all() {
 
 PPOTrainer::PPOTrainer(IPokerEnvironmentFactory& env_factory,
                        torch::Device device)
-    : device_(device),
+    : factory_(env_factory),
+      device_(device),
       network_(nullptr)
 {
     num_envs_ = cfg_.num_envs;
@@ -335,6 +337,31 @@ PPOTrainer::PPOTrainer(IPokerEnvironmentFactory& env_factory,
                 std::cout << " → " << rnad_eta_final() << " (annealed)";
             std::cout << " (magnet KL moved from loss into rewards)\n";
         }
+    }
+
+    // A1 exploiter-augmented self-play: build a best-response trainer whose
+    // exploiter we periodically inject into the opponent pool. Short,
+    // warm-started budget (it tracks the live policy across injections);
+    // eval_hands=0 so evaluate() only TRAINS (no eval match). The pool
+    // (with A1 env overrides) then serves these best-responses to the
+    // learner. POKER_PPO_A1_UPDATES / _EVERY_STEPS tune cost.
+    if (std::getenv("POKER_PPO_A1") != nullptr) {
+        BestResponseConfig a1 = config::kBRConfig;
+        a1.enabled            = true;
+        a1.eval_hands         = 0;       // train only, no match
+        a1.num_exploiter_seeds = 1;
+        a1.warm_start         = true;    // continue the same exploiter
+        a1.updates_per_eval   = 500;
+        if (const char* e = std::getenv("POKER_PPO_A1_UPDATES")) {
+            const int v = std::atoi(e);
+            if (v > 0) a1.updates_per_eval = v;
+        }
+        a1_exploiter_ = std::make_unique<BestResponseEvaluator>(
+            factory_, bet_cfg_, obs_dim, action_count,
+            cfg_.hidden_dim, cfg_.num_layers,
+            cfg_.hist, cfg_.round_summary, a1, device_);
+        std::cout << "[ppo] A1 exploiter-augmented self-play ON: "
+                  << a1.updates_per_eval << " warm exploiter updates/inject\n";
     }
 }
 
@@ -433,7 +460,28 @@ void PPOTrainer::train() {
         }
 
         const int64_t global_step = collector_->global_step();
-        opp_mgr_->maybe_snapshot(global_step, network_);
+
+        if (a1_exploiter_) {
+            // A1: the pool serves trained best-responses, not learner
+            // snapshots — so skip maybe_snapshot and instead train+inject an
+            // exploiter on cadence. The exploiter is warm (tracks the live
+            // policy); each inject costs ~a1.updates_per_eval exploiter
+            // updates, so cadence trades pressure freshness vs compute.
+            int64_t a1_every = 6'000'000;
+            if (const char* e = std::getenv("POKER_PPO_A1_EVERY_STEPS")) {
+                const long long v = std::atoll(e);
+                if (v > 0) a1_every = v;
+            }
+            if (global_step - last_a1_inject_step_ >= a1_every) {
+                last_a1_inject_step_ = global_step;
+                a1_exploiter_->evaluate(network_, update_idx_, global_step);
+                opp_mgr_->inject_opponent(a1_exploiter_->exploiter());
+                std::cout << "[a1] injected exploiter @ step " << global_step
+                          << "  pool=" << opp_mgr_->size() << "\n";
+            }
+        } else {
+            opp_mgr_->maybe_snapshot(global_step, network_);
+        }
 
         // Refresh the MMD magnet on cadence (env steps — invariant to
         // batch shape). Slow refresh = strong anchoring (drives π_θ

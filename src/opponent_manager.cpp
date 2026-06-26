@@ -1,6 +1,7 @@
 #include "opponent_manager.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <numeric>
 #include <random>
 #include <unordered_map>
@@ -110,6 +111,18 @@ OpponentManager::OpponentManager(OpponentPoolConfig  cfg,
       episode_rng_(cfg.seed ? cfg.seed
                             : std::random_device{}())
 {
+    // A1 (exploiter-augmented self-play): the pool is fed real
+    // best-responses instead of (only) learner snapshots. Use them as soon
+    // as injected (zero warmup) and face them often (p_use_pool override).
+    if (std::getenv("POKER_PPO_A1") != nullptr) {
+        cfg_.enabled      = true;
+        cfg_.warmup_steps = 0;
+        if (const char* e = std::getenv("POKER_PPO_P_USE_POOL"))
+            cfg_.p_use_pool = static_cast<float>(std::atof(e));
+        std::cout << "[opp] A1 exploiter-augmented self-play: p_use_pool="
+                  << cfg_.p_use_pool << " (pool = injected best-responses)\n";
+    }
+
     if (!cfg_.enabled) return;
 
     const uint64_t pool_seed = cfg_.seed
@@ -212,6 +225,15 @@ void OpponentManager::apply_action_overrides(
             a_acc_w[idxs[k]] = pa[k];
         }
     }
+}
+
+void OpponentManager::inject_opponent(const ActorCritic& network) {
+    if (!pool_) return;
+    [[maybe_unused]] const auto _ = pool_->add_snapshot(network);
+}
+
+bool OpponentManager::has_opponents() const noexcept {
+    return pool_ && !pool_->empty();
 }
 
 void OpponentManager::maybe_snapshot(int64_t global_step,

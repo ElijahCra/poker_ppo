@@ -22,6 +22,7 @@
 namespace poker_ppo {
 
 class OpponentManager;
+class BestResponseEvaluator;
 
 class PPOTrainer {
 public:
@@ -134,6 +135,7 @@ private:
 
     static inline constexpr const PPOConfig& cfg_      = config::kPPOConfig;
     static inline constexpr const BetConfig& bet_cfg_  = config::kBetConfig;
+    IPokerEnvironmentFactory& factory_;   // for the A1 exploiter's own envs
     torch::Device device_;
 
     // Usually cfg_.num_envs; overridable at construction via the
@@ -151,6 +153,12 @@ private:
     // `cfg_.magnet_update_every` updates. Null when `cfg_.kl_coef == 0`
     // (vanilla self-play PPO; the regulariser is bypassed entirely).
     ActorCritic                          magnet_{nullptr};
+
+    // A1 exploiter-augmented self-play (POKER_PPO_A1): a best-response is
+    // trained against the live policy and injected into the opponent pool
+    // on a step cadence, so the learner faces real best-response pressure.
+    std::unique_ptr<BestResponseEvaluator> a1_exploiter_;
+    int64_t last_a1_inject_step_ = 0;
 
     int     update_idx_              = 0;
     int     start_update_            = 0;   // resume point (0 = fresh)

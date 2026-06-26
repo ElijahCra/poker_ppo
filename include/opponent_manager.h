@@ -108,6 +108,16 @@ public:
     // snapshot_every_steps env steps since the last snapshot.
     void maybe_snapshot(int64_t global_step, const ActorCritic& network);
 
+    // Exploiter-augmented self-play (A1): inject an EXTERNAL policy (a
+    // trained best-response) into the pool unconditionally — the learner
+    // then faces real best-response pressure, not just its own past selves.
+    void inject_opponent(const ActorCritic& network);
+
+    // True once at least one opponent (snapshot or injected exploiter) is
+    // in the pool — lets A1 zero the warmup gate so exploiters are used as
+    // soon as they exist.
+    [[nodiscard]] bool has_opponents() const noexcept;
+
     [[nodiscard]] int  size()     const noexcept;
     [[nodiscard]] int  capacity() const noexcept;
     [[nodiscard]] bool enabled()  const noexcept { return pool_ != nullptr; }
