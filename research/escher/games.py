@@ -224,4 +224,26 @@ class Leduc:
         return contrib[1] if winner == 0 else -contrib[0]
 
 
+# ─── N-card Kuhn ────────────────────────────────────────────────────────────
+# Same single-round check/bet tree as Kuhn but with N>3 ranks (one card each),
+# higher card wins. More infosets (N · histories) so a NN must generalise over
+# card value — a clean, trivially-CORRECT scaling testbed for Stage-2 NN ESCHER
+# (Leduc, multi-round, is deferred pending a value-bug fix). Built by a factory
+# so `name`/`deals` carry N.
+
+def make_kuhn_n(n_cards: int):
+    class KuhnN(Kuhn):
+        name = f"kuhn{n_cards}"
+        N = n_cards
+
+        @staticmethod
+        def deals():
+            from itertools import permutations as _perm
+            cs = list(_perm(range(n_cards), 2))
+            p = 1.0 / len(cs)
+            return [(c, p) for c in cs]
+
+    return KuhnN
+
+
 GAMES = {"kuhn": Kuhn, "leduc": Leduc}
