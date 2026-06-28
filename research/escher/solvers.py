@@ -211,3 +211,51 @@ class VanillaCFR:
             else:
                 avg[I] = {a: 1.0 / len(legal) for a in legal}
         return avg
+
+
+class CFRPlus(VanillaCFR):
+    """CFR+ : regret-matching⁺ (floor cumulative regret at 0 each step) +
+    linear averaging (weight the strategy sum by iteration). Converges far
+    faster than vanilla CFR — used as the fast diagnostic / reference solver
+    on larger games like Leduc."""
+
+    def __init__(self, game):
+        super().__init__(game)
+        self._t = 0
+
+    def _cfr(self, history, cards, p0, p1):
+        g = self.game
+        if g.is_terminal(history):
+            return g.terminal_util_p0(history, cards)
+        player = g.current_player(history)
+        legal = g.legal_actions(history)
+        I = g.infoset_key(history, cards)
+        self.infoset_actions[I] = legal
+        sigma = self._strategy(I, legal)
+
+        util_a = {}
+        node_util = 0.0
+        for a in legal:
+            nxt = g.step_history(history, a)
+            if player == 0:
+                util_a[a] = self._cfr(nxt, cards, p0 * sigma[a], p1)
+            else:
+                util_a[a] = self._cfr(nxt, cards, p0, p1 * sigma[a])
+            node_util += sigma[a] * util_a[a]
+
+        cf_reach = p1 if player == 0 else p0
+        own_reach = p0 if player == 0 else p1
+        sign = 1.0 if player == 0 else -1.0
+        for a in legal:
+            r = sign * (util_a[a] - node_util) * cf_reach
+            # RM+: floor the CUMULATIVE regret at 0 (not just at read time).
+            self.regret[I][a] = max(self.regret[I][a] + r, 0.0)
+            # linear averaging: recent strategies weighted by iteration.
+            self.strat_sum[I][a] += self._t * own_reach * sigma[a]
+        return node_util
+
+    def iterate(self, n_iters):
+        for _ in range(n_iters):
+            self._t += 1
+            for cards, _ in self.game.deals():
+                self._cfr("", cards, 1.0, 1.0)
