@@ -154,6 +154,11 @@ class NeuralESCHER:
             self.value_opt = torch.optim.Adam(self.value_net.parameters(), 1e-3)
         self.reg_buf = Reservoir(buf_cap, seed + 1)
         self.strat_buf = Reservoir(buf_cap, seed + 2)
+        # exact tabular linear-average accumulator — DIAGNOSTIC only, to tell
+        # whether the avg-NET readout or the core regret dynamics is the limit.
+        self.tab_ss = defaultdict(lambda: [0.0] * self.A)
+        self.tab_w = defaultdict(float)
+        self.tab_legal = {}
 
     # current strategy at an infoset via regret-matching⁺ on the regret net
     @torch.no_grad()
@@ -277,9 +282,44 @@ class NeuralESCHER:
             history, cards, player, legal = key_meta[I]
             tot = sum(svec)
             if tot > 0:
+                probs = [x / tot for x in svec]
                 f = self.feat.infoset(history, cards, player)
-                self.strat_buf.add(
-                    (f, torch.tensor([x / tot for x in svec]), float(t)))
+                self.strat_buf.add((f, torch.tensor(probs), float(t)))
+                # mirror the buffer target into the exact tabular average
+                for a in range(self.A):
+                    self.tab_ss[I][a] += t * probs[a]
+                self.tab_w[I] += t
+                self.tab_legal[I] = legal
+
+    def tabular_average(self):
+        """The exact linear-weighted average of the same σ targets the avg-net
+        is trained on — the ceiling the net could reach with a perfect fit.
+        Enumerates the whole tree (BR needs every infoset); unvisited infosets
+        (zeroed-out by RM⁺ reach) fall back to uniform."""
+        out = {}
+        seen = set()
+        g = self.g
+
+        def rec(h, cards):
+            if g.is_terminal(h):
+                return
+            I = g.infoset_key(h, cards)
+            legal = g.legal_actions(h)
+            if I not in out:
+                if self.tab_w.get(I, 0.0) > 0:
+                    w = self.tab_w[I]
+                    out[I] = {a: self.tab_ss[I][a] / w for a in legal}
+                else:
+                    out[I] = {a: 1.0 / len(legal) for a in legal}
+            for a in legal:
+                rec(g.step_history(h, a), cards)
+
+        for cards, _ in g.deals():
+            if cards in seen:
+                continue
+            seen.add(cards)
+            rec("", cards)
+        return out
 
     def _train_net(self, net, buf, steps, lr, mb=512):
         opt = torch.optim.Adam(net.parameters(), lr)
@@ -371,7 +411,9 @@ class NeuralESCHER:
             if t % eval_every == 0 or t == iters:
                 self.fit_avg()
                 expl = exploitability(self.g, self.avg_strategy())
-                print(f"  iter {t:4d}   exploitability={expl:.5f}", flush=True)
+                tab = exploitability(self.g, self.tabular_average())
+                print(f"  iter {t:4d}   expl(avg-net)={expl:.5f}   "
+                      f"expl(tabular-avg)={tab:.5f}", flush=True)
         return expl
 
 
