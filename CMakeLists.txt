@@ -99,6 +99,30 @@ endif()
 add_executable(poker_ppo src/main.cpp)
 target_link_libraries(poker_ppo PRIVATE poker_ppo_lib)
 
+# ── ESCHER research binary (self-contained: small games + libtorch nets) ──────
+# Validated on Kuhn/Leduc with exact recursive BR; NOT linked to the HUNL
+# poker_env. Inherits libtorch + the force-include workaround.
+add_executable(escher
+    research/escher_cpp/escher.cpp
+    research/escher_cpp/escher_main.cpp
+)
+target_include_directories(escher PRIVATE research/escher_cpp)
+target_link_libraries(escher PRIVATE "${TORCH_LIBRARIES}")
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+    target_compile_options(escher PRIVATE
+        "SHELL:-include ${GLIBC_FEATURES_H}/features.h"
+        "SHELL:-include cstring"
+        "SHELL:-include cstdlib"
+        "SHELL:-include limits"
+        "SHELL:-include mutex"
+    )
+endif()
+
+# Torch-FREE Phase-1 validator: games + exact BR + CFR+ reproduce the Python
+# reference numbers (Kuhn 0.004164, Leduc 0.049151, value -0.0836).
+add_executable(escher_validate research/escher_cpp/validate_main.cpp)
+target_include_directories(escher_validate PRIVATE research/escher_cpp)
+
 # ── Tests ─────────────────────────────────────────────────────────────────────
 # Opt-in via -DBUILD_TESTS=ON (default ON). Pulls GoogleTest via
 # FetchContent inside Game/tests/.
