@@ -395,6 +395,8 @@ class NeuralESCHER:
         for cards, p in g.deals():
             rec("", cards, 1.0, 1.0, p)
 
+        self._inst = inst          # for the neural-cumulative fitter
+        self._key_meta = key_meta
         for I, rvec in inst.items():
             history, cards, player, legal = key_meta[I]
             f = self.feat.infoset(history, cards, player)
@@ -474,6 +476,12 @@ class NeuralESCHER:
             opt.step()
 
     def fit_regret(self, lr=3e-3):
+        # neural-cumulative (SCALABLE): the regret NET itself stores the running
+        # RM⁺ cumulative regret — no per-infoset table, smooth σ. Must NOT
+        # fresh-init (the net IS the accumulator).
+        if getattr(self, "neural_cum", False):
+            self._fit_regret_neural_cum(lr)
+            return
         # Deep CFR fresh-inits each iter (unbiased), but that injects random
         # reinit jitter into σ_t every iteration → the average can't tighten.
         # warm-start keeps the net and nudges it toward the updated buffer →
@@ -486,6 +494,32 @@ class NeuralESCHER:
         else:
             self._train_net(self.regret_net, self.reg_buf, self.reg_steps, lr,
                             normalize=True)
+
+    def _fit_regret_neural_cum(self, lr):
+        """SCALABLE analog of exact-cum: store the RM⁺ cumulative regret IN THE
+        NET (warm-trained toward max(0, γ·prev_net(I) + inst(I))) instead of a
+        per-infoset table. γ<1 discounts (bounds magnitude, recency-weights —
+        DCFR-style). One stable target per infoset → smooth σ → value tracks."""
+        items = list(self._key_meta.items())
+        if not items:
+            return
+        feats = [self.feat.infoset(h, c, p) for _, (h, c, p, lg) in items]
+        X = torch.stack(feats).to(DEV)
+        prev = copy.deepcopy(self.regret_net)
+        with torch.no_grad():
+            prevR = prev(X)
+        Y = torch.zeros_like(prevR)
+        g = getattr(self, "ncum_gamma", 0.99)
+        for idx, (I, (h, c, p, legal)) in enumerate(items):
+            inst = self._inst[I]
+            for a in legal:
+                Y[idx, a] = max(0.0, g * prevR[idx, a].item() + inst[a])
+        opt = torch.optim.Adam(self.regret_net.parameters(), lr)
+        for _ in range(self.reg_steps):
+            opt.zero_grad()
+            loss = F.mse_loss(self.regret_net(X), Y)
+            loss.backward()
+            opt.step()
 
     def _fit_regret_cum(self, lr):
         """Regress the regret net to the EXACT RM⁺ cumulative regret table
@@ -651,6 +685,11 @@ def main():
     ap.add_argument("--exact-cum", action="store_true",
                     help="regress regret net to EXACT RM+ cumulative regret "
                          "(FA-adequacy probe; no sampled buffer)")
+    ap.add_argument("--neural-cum", action="store_true",
+                    help="SCALABLE: store RM+ cumulative regret in the net "
+                         "(warm incremental targets; no per-infoset table)")
+    ap.add_argument("--ncum-gamma", type=float, default=0.99,
+                    help="discount on the neural cumulative regret (DCFR-style)")
     ap.add_argument("--eval-every", type=int, default=10)
     ap.add_argument("--ckpt", default=None,
                     help="checkpoint path; resumes if it exists (run more "
@@ -670,6 +709,8 @@ def main():
         esc.val_sweeps = a.val_sweeps
     esc.warm = a.warm
     esc.exact_cum = a.exact_cum
+    esc.neural_cum = a.neural_cum
+    esc.ncum_gamma = a.ncum_gamma
     if a.ckpt and os.path.exists(a.ckpt):
         esc.load(a.ckpt)
         print(f"[resume] {a.game} (values={a.mode}) from iter {esc.t}, "
