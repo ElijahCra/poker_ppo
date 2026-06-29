@@ -22,6 +22,7 @@ Run in WSL: python3 escher_nn.py [kuhn6|kuhn|leduc] [exact|net]
 
 from __future__ import annotations
 
+import copy
 import random
 import sys
 from collections import defaultdict
@@ -54,8 +55,13 @@ class Featurizer:
         #  if public else 0) + hist_onehot(H) + player(1)
         self.pub_dim = (n_ranks + 1) if self.has_public else 0
         self.inf_dim = 1 + n_ranks + self.pub_dim + self.n_hist + 1
-        # full history feat (value net): both cards + public + hist
-        self.full_dim = 2 * n_ranks + self.pub_dim + self.n_hist
+        # full history feat (value net): both cards + public + hist + showdown
+        # interaction features (pair flags + win/tie/lose) — additive one-hots
+        # express the card0×card1×public showdown conjunction poorly, and under
+        # a sharp σ the value IS ~ the showdown outcome. Mirrors the
+        # hand-strength features a real (HUNL) value net is given.
+        self.extra_dim = 3 + (2 if self.has_public else 0)
+        self.full_dim = 2 * n_ranks + self.pub_dim + self.n_hist + self.extra_dim
 
     def _all_infoset_keys(self):
         keys = set()
@@ -98,13 +104,28 @@ class Featurizer:
         return v
 
     def full(self, history, cards):
+        # PRIVILEGED full-state value features: the value net conditions on the
+        # whole deal, so it ALWAYS sees the public card (even in round 1, where
+        # players don't). Hiding it aliases round-1 states with different public
+        # cards — fine under near-uniform σ, but ruinous under a sharp σ where
+        # the round-1 value depends critically on the showdown-determining card.
         v = torch.zeros(self.full_dim)
         i = 0
         v[i + cards[0]] = 1.0; i += self.n_ranks
         v[i + cards[1]] = 1.0; i += self.n_ranks
         if self.has_public:
-            v[i + self._public_idx(history, cards)] = 1.0; i += self.pub_dim
-        v[i + self.hidx[history]] = 1.0
+            v[i + 1 + cards[2]] = 1.0; i += self.pub_dim  # always revealed
+        v[i + self.hidx[history]] = 1.0; i += self.n_hist
+        # showdown interaction features
+        if self.has_public:
+            pub = cards[2]
+            p0p, p1p = (cards[0] == pub), (cards[1] == pub)
+            v[i] = float(p0p); v[i + 1] = float(p1p); i += 2
+            r0 = (self.n_ranks + cards[0]) if p0p else cards[0]
+            r1 = (self.n_ranks + cards[1]) if p1p else cards[1]
+        else:
+            r0, r1 = cards[0], cards[1]
+        v[i + (0 if r0 > r1 else 1 if r0 == r1 else 2)] = 1.0  # win/tie/lose
         return v
 
 
@@ -140,12 +161,14 @@ class Reservoir:
 # ─── Neural ESCHER ──────────────────────────────────────────────────────────
 class NeuralESCHER:
     def __init__(self, game, n_ranks, values="exact",
-                 hidden=64, reg_steps=400, buf_cap=200_000, seed=0):
+                 hidden=64, reg_steps=400, buf_cap=200_000, seed=0,
+                 val_hidden=256):
         self.g = game
         self.feat = Featurizer(game, n_ranks)
         self.values_mode = values
         self.A = game.n_actions
         self.hidden = hidden
+        self.val_hidden = val_hidden
         self.reg_steps = reg_steps
         self.t = 0  # CFR iteration counter (survives checkpoint/resume)
         torch.manual_seed(seed)
@@ -153,8 +176,12 @@ class NeuralESCHER:
         self.regret_net = MLP(self.feat.inf_dim, self.A, hidden).to(DEV)
         self.avg_net = MLP(self.feat.inf_dim, self.A, hidden).to(DEV)
         if values == "net":
-            self.value_net = MLP(self.feat.full_dim, 1, hidden).to(DEV)
+            self.value_net = MLP(self.feat.full_dim, 1, val_hidden).to(DEV)
             self.value_opt = torch.optim.Adam(self.value_net.parameters(), 1e-3)
+            self.val_buf = Reservoir(buf_cap, seed + 3)
+            self.v_scale = self._compute_v_scale()  # net predicts value/v_scale
+            self.v_expl = 0.6  # sampling = expl·uniform + (1-expl)·σ (coverage)
+            self.val_sweeps = 4  # fitted-value sweeps per CFR iter (track σ)
         self.reg_buf = Reservoir(buf_cap, seed + 1)
         self.strat_buf = Reservoir(buf_cap, seed + 2)
         # exact tabular linear-average accumulator — DIAGNOSTIC only, to tell
@@ -199,41 +226,121 @@ class NeuralESCHER:
         return sum(sig[a] * self.exact_value(g.step_history(history, a), cards)
                    for a in legal)
 
+    def _compute_v_scale(self):
+        g = self.g
+        mx = [1.0]
+
+        def rec(h, cards):
+            if g.is_terminal(h):
+                mx[0] = max(mx[0], abs(g.terminal_util_p0(h, cards)))
+                return
+            for a in g.legal_actions(h):
+                rec(g.step_history(h, a), cards)
+
+        seen = set()
+        for cards, _ in g.deals():
+            if cards in seen:
+                continue
+            seen.add(cards)
+            rec("", cards)
+        return mx[0]
+
     @torch.no_grad()
     def net_value(self, history, cards):
         if self.g.is_terminal(history):
             return self.g.terminal_util_p0(history, cards)
         f = self.feat.full(history, cards).to(DEV)
-        return self.value_net(f.unsqueeze(0)).item()
+        return self.value_net(f.unsqueeze(0)).item() * self.v_scale
+
+    def _choose_sigma(self, legal, sig):
+        r = self.rng.random()
+        acc = 0.0
+        for a in legal:
+            acc += sig[a]
+            if r <= acc:
+                return a
+        return legal[-1]
+
+    @torch.no_grad()
+    def value_diag(self):
+        """Reach-weighted RMSE (and max) of net_value vs the EXACT on-σ history
+        value — the value net's actual job. One post-order pass; the direct
+        signal for tuning the IS-free value learning without full convergence."""
+        g = self.g
+        acc = {"se": 0.0, "w": 0.0, "mx": 0.0}
+
+        def rec(h, cards, reach):
+            if g.is_terminal(h):
+                return g.terminal_util_p0(h, cards)
+            player = g.current_player(h)
+            legal = g.legal_actions(h)
+            sig = self.sigma(h, cards, player, legal)
+            ev = 0.0
+            for a in legal:
+                ev += sig[a] * rec(g.step_history(h, a), cards, reach * sig[a])
+            nv = self.net_value(h, cards)
+            acc["se"] += reach * (nv - ev) ** 2
+            acc["w"] += reach
+            acc["mx"] = max(acc["mx"], abs(nv - ev))
+            return ev
+
+        for cards, p in g.deals():
+            rec("", cards, p)
+        return (acc["se"] / max(acc["w"], 1e-9)) ** 0.5, acc["mx"]
 
     def value_of(self, history, cards):
         return (self.net_value if self.values_mode == "net"
                 else self.exact_value)(history, cards)
 
-    # ── train the value net IS-free: bootstrap visited histories toward the
-    #    on-σ expected child value, sampling trajectories with a fixed policy ──
-    def train_value(self, n_traj=64, steps=8):
+    # ── train the value net IS-free: bootstrap visited states toward the on-σ
+    #    expected child value. A REPLAY BUFFER of (history, cards) states
+    #    visited under the fixed (uniform) sampling policy accumulates coverage
+    #    across iterations; each step samples a minibatch and recomputes the
+    #    bootstrap target Σσ(a)V(child) with the CURRENT net+σ (off-policy
+    #    samples, on-σ targets, NO importance weight — the ESCHER trick). Far
+    #    more stable than re-fitting fresh trajectories each iteration. ──
+    def train_value(self, n_traj=64, steps=120, n_states=2048):
         g = self.g
-        feats, targets = [], []
+        # grow coverage with an expl-mixed (uniform/σ) sampling policy — pure
+        # uniform under-visits the on-path states the regret actually needs.
         for _ in range(n_traj):
             cards = self._sample_deal()
-            path = []
             h = ""
             while not g.is_terminal(h):
-                path.append((h, cards))
+                self.val_buf.add((h, cards))
                 legal = g.legal_actions(h)
-                # fixed uniform sampling policy (the IS-free coverage policy)
-                h = g.step_history(h, self.rng.choice(legal))
-            for hist, c in path:
-                legal = g.legal_actions(hist)
-                player = g.current_player(hist)
-                sig = self.sigma(hist, c, player, legal)
-                tgt = 0.0
-                for a in legal:
-                    nxt = g.step_history(hist, a)
-                    tgt += sig[a] * self.net_value(nxt, c)
-                feats.append(self.feat.full(hist, c))
-                targets.append(tgt)
+                if self.rng.random() < self.v_expl:
+                    a = self.rng.choice(legal)
+                else:
+                    p = g.current_player(h)
+                    a = self._choose_sigma(legal, self.sigma(h, cards, p, legal))
+                h = g.step_history(h, a)
+        data = self.val_buf.data
+        if not data:
+            return
+        # frozen-target fitted value iteration: σ and the bootstrap targets are
+        # FIXED for this iteration (snapshot net), so build (feat, target) ONCE
+        # then take many cheap full-batch steps — stable AND fast.
+        target_net = copy.deepcopy(self.value_net)
+
+        @torch.no_grad()
+        def tval(h, c):
+            if g.is_terminal(h):
+                return g.terminal_util_p0(h, c)
+            f = self.feat.full(h, c).to(DEV)
+            return target_net(f.unsqueeze(0)).item() * self.v_scale
+
+        idx = [self.rng.randrange(len(data))
+               for _ in range(min(n_states, len(data)))]
+        feats, targets = [], []
+        for i in idx:
+            hist, c = data[i]
+            legal = g.legal_actions(hist)
+            p = g.current_player(hist)
+            sig = self.sigma(hist, c, p, legal)
+            tgt = sum(sig[a] * tval(g.step_history(hist, a), c) for a in legal)
+            feats.append(self.feat.full(hist, c))
+            targets.append(tgt / self.v_scale)  # net predicts normalised value
         X = torch.stack(feats).to(DEV)
         y = torch.tensor(targets, dtype=torch.float32).to(DEV).unsqueeze(1)
         for _ in range(steps):
@@ -472,13 +579,22 @@ class NeuralESCHER:
         target = self.t + iters
         while self.t < target:
             self.t += 1
+            eval_now = (self.t % eval_every == 0 or self.t == target)
+            extra = ""
             if self.values_mode == "net":
-                self.train_value(n_traj=64, steps=8)
+                # several fitted-value sweeps so the value net CATCHES UP to the
+                # current σ before the regret pass reads it (1 backup/iter lags a
+                # moving σ; with fixed σ value learning hits ~0.04).
+                for _ in range(self.val_sweeps):
+                    self.train_value(n_traj=32, steps=80)
+                if eval_now:  # measure for the σ collect_regret will USE
+                    rmse, mx = self.value_diag()
+                    extra = f"   V-rmse={rmse:.4f} (max {mx:.3f})"
             self.collect_regret(self.t)
             self.fit_regret()
-            if self.t % eval_every == 0 or self.t == target:
+            if eval_now:
                 tab = exploitability(self.g, self.tabular_average())
-                print(f"  iter {self.t:4d}   expl(tabular-avg)={tab:.5f}",
+                print(f"  iter {self.t:4d}   expl(tabular-avg)={tab:.5f}{extra}",
                       flush=True)
                 if ckpt:
                     self.save(ckpt)
@@ -495,6 +611,8 @@ class NeuralESCHER:
             "tab_legal": self.tab_legal,
             "value_net": (self.value_net.state_dict()
                           if self.values_mode == "net" else None),
+            "val_buf": (self.val_buf.data if self.values_mode == "net" else None),
+            "val_n": (self.val_buf.n if self.values_mode == "net" else 0),
         }, path)
 
     def load(self, path):
@@ -508,6 +626,7 @@ class NeuralESCHER:
         self.tab_legal = d["tab_legal"]
         if self.values_mode == "net" and d["value_net"]:
             self.value_net.load_state_dict(d["value_net"])
+            self.val_buf.data = d["val_buf"]; self.val_buf.n = d["val_n"]
 
 
 def main():
@@ -519,6 +638,8 @@ def main():
     ap.add_argument("--iters", type=int, default=120)
     ap.add_argument("--hidden", type=int, default=64)
     ap.add_argument("--reg-steps", type=int, default=400)
+    ap.add_argument("--val-hidden", type=int, default=256)
+    ap.add_argument("--val-sweeps", type=int, default=4)
     ap.add_argument("--warm", action="store_true",
                     help="warm-start the regret net (skip fresh-init each iter)")
     ap.add_argument("--exact-cum", action="store_true",
@@ -538,7 +659,9 @@ def main():
     else:
         raise SystemExit("game must be kuhn|kuhn6|leduc")
     esc = NeuralESCHER(g, n, values=a.mode, hidden=a.hidden,
-                       reg_steps=a.reg_steps, seed=0)
+                       reg_steps=a.reg_steps, val_hidden=a.val_hidden, seed=0)
+    if a.mode == "net":
+        esc.val_sweeps = a.val_sweeps
     esc.warm = a.warm
     esc.exact_cum = a.exact_cum
     if a.ckpt and os.path.exists(a.ckpt):
