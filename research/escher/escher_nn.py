@@ -419,6 +419,59 @@ class NeuralESCHER:
                 self.tab_w[I] += t
                 self.tab_legal[I] = legal
 
+    # ── HUNL-shaped SAMPLED regret pass: external-sampling MCCFR with the
+    #    value function. Sample the deal + the opponent's actions under σ,
+    #    branch the traverser's actions, read action values from value_of().
+    #    Because opponent+chance are sampled under σ, the per-trajectory regret
+    #    is an UNBIASED estimate of the full-tree counterfactual regret (no
+    #    importance weight), averaged over n_traj — drop-in for collect_regret.
+    #    Strategy samples are collected at the SAMPLED (opponent) nodes, the
+    #    scalable analog of the full-tree strat sum. ──
+    def collect_regret_sampled(self, t, n_traj):
+        g = self.g
+        inst = defaultdict(lambda: [0.0] * self.A)
+        key_meta = {}
+
+        def ext(cards, i):
+            sign = 1.0 if i == 0 else -1.0
+
+            def rec(h):
+                if g.is_terminal(h):
+                    return
+                p = g.current_player(h)
+                legal = g.legal_actions(h)
+                I = g.infoset_key(h, cards)
+                sig = self.sigma(h, cards, p, legal)
+                if p == i:  # traverser: branch all actions, regret from value net
+                    vh = self.value_of(h, cards)
+                    for a in legal:
+                        va = self.value_of(g.step_history(h, a), cards)
+                        inst[I][a] += sign * (va - vh)
+                    key_meta[I] = (h, cards, p, legal)
+                    for a in legal:
+                        rec(g.step_history(h, a))
+                else:  # opponent: sample one action, accumulate the average
+                    probs = [sig.get(a, 0.0) for a in range(self.A)]
+                    f = self.feat.infoset(h, cards, p)
+                    self.strat_buf.add((f, torch.tensor(probs), float(t)))
+                    for a in legal:
+                        self.tab_ss[I][a] += t * sig[a]
+                    self.tab_w[I] += t
+                    self.tab_legal[I] = legal
+                    rec(g.step_history(h, self._choose_sigma(legal, sig)))
+
+            rec("")
+
+        for _ in range(n_traj):
+            cards = self._sample_deal()
+            ext(cards, 0)
+            ext(cards, 1)
+        for I in inst:  # per-deal average = unbiased estimate of full-tree regret
+            for a in range(self.A):
+                inst[I][a] /= n_traj
+        self._inst = inst
+        self._key_meta = key_meta
+
     def tabular_average(self):
         """The exact linear-weighted average of the same σ targets the avg-net
         is trained on — the ceiling the net could reach with a perfect fit.
@@ -624,7 +677,10 @@ class NeuralESCHER:
                 if eval_now:  # measure for the σ collect_regret will USE
                     rmse, mx = self.value_diag()
                     extra = f"   V-rmse={rmse:.4f} (max {mx:.3f})"
-            self.collect_regret(self.t)
+            if getattr(self, "sampled", False):
+                self.collect_regret_sampled(self.t, getattr(self, "n_traj", 200))
+            else:
+                self.collect_regret(self.t)
             self.fit_regret()
             if eval_now:
                 tab = exploitability(self.g, self.tabular_average())
@@ -690,6 +746,11 @@ def main():
                          "(warm incremental targets; no per-infoset table)")
     ap.add_argument("--ncum-gamma", type=float, default=0.99,
                     help="discount on the neural cumulative regret (DCFR-style)")
+    ap.add_argument("--sampled", action="store_true",
+                    help="HUNL-shaped external-sampling regret pass (needs "
+                         "--neural-cum); no full-tree traversal")
+    ap.add_argument("--n-traj", type=int, default=200,
+                    help="trajectories per iteration for --sampled")
     ap.add_argument("--eval-every", type=int, default=10)
     ap.add_argument("--ckpt", default=None,
                     help="checkpoint path; resumes if it exists (run more "
@@ -711,6 +772,8 @@ def main():
     esc.exact_cum = a.exact_cum
     esc.neural_cum = a.neural_cum
     esc.ncum_gamma = a.ncum_gamma
+    esc.sampled = a.sampled
+    esc.n_traj = a.n_traj
     if a.ckpt and os.path.exists(a.ckpt):
         esc.load(a.ckpt)
         print(f"[resume] {a.game} (values={a.mode}) from iter {esc.t}, "
