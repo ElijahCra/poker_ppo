@@ -166,7 +166,7 @@ class VanillaCFR:
             return {a: pos[a] / s for a in legal}
         return {a: 1.0 / len(legal) for a in legal}
 
-    def _cfr(self, history, cards, p0, p1):
+    def _cfr(self, history, cards, p0, p1, q):
         g = self.game
         if g.is_terminal(history):
             return g.terminal_util_p0(history, cards)
@@ -181,14 +181,18 @@ class VanillaCFR:
         for a in legal:
             nxt = g.step_history(history, a)
             if player == 0:
-                util_a[a] = self._cfr(nxt, cards, p0 * sigma[a], p1)
+                util_a[a] = self._cfr(nxt, cards, p0 * sigma[a], p1, q)
             else:
-                util_a[a] = self._cfr(nxt, cards, p0, p1 * sigma[a])
+                util_a[a] = self._cfr(nxt, cards, p0, p1 * sigma[a], q)
             node_util += sigma[a] * util_a[a]
 
-        # regret update for the acting player (P0-perspective utils → sign flip)
-        cf_reach = p1 if player == 0 else p0
-        own_reach = p0 if player == 0 else p1
+        # regret update for the acting player (P0-perspective utils → sign flip).
+        # q = chance reach (the DEAL probability): π_{-i} and the average-
+        # strategy weight both include chance, so every contribution under this
+        # deal is scaled by q. Omitting it solves the uniform-deal game — wrong
+        # whenever deals are non-uniform (e.g. Leduc's 2-of-each-rank deck).
+        cf_reach = q * (p1 if player == 0 else p0)
+        own_reach = q * (p0 if player == 0 else p1)
         sign = 1.0 if player == 0 else -1.0
         for a in legal:
             regret = sign * (util_a[a] - node_util) * cf_reach
@@ -198,8 +202,8 @@ class VanillaCFR:
 
     def iterate(self, n_iters):
         for _ in range(n_iters):
-            for cards, _ in self.game.deals():
-                self._cfr("", cards, 1.0, 1.0)
+            for cards, p in self.game.deals():
+                self._cfr("", cards, 1.0, 1.0, p)
 
     def average_strategy(self):
         avg = {}
@@ -223,7 +227,7 @@ class CFRPlus(VanillaCFR):
         super().__init__(game)
         self._t = 0
 
-    def _cfr(self, history, cards, p0, p1):
+    def _cfr(self, history, cards, p0, p1, q):
         g = self.game
         if g.is_terminal(history):
             return g.terminal_util_p0(history, cards)
@@ -238,13 +242,14 @@ class CFRPlus(VanillaCFR):
         for a in legal:
             nxt = g.step_history(history, a)
             if player == 0:
-                util_a[a] = self._cfr(nxt, cards, p0 * sigma[a], p1)
+                util_a[a] = self._cfr(nxt, cards, p0 * sigma[a], p1, q)
             else:
-                util_a[a] = self._cfr(nxt, cards, p0, p1 * sigma[a])
+                util_a[a] = self._cfr(nxt, cards, p0, p1 * sigma[a], q)
             node_util += sigma[a] * util_a[a]
 
-        cf_reach = p1 if player == 0 else p0
-        own_reach = p0 if player == 0 else p1
+        # q = chance/deal reach (see VanillaCFR) — folded into both weights.
+        cf_reach = q * (p1 if player == 0 else p0)
+        own_reach = q * (p0 if player == 0 else p1)
         sign = 1.0 if player == 0 else -1.0
         for a in legal:
             r = sign * (util_a[a] - node_util) * cf_reach
@@ -257,5 +262,5 @@ class CFRPlus(VanillaCFR):
     def iterate(self, n_iters):
         for _ in range(n_iters):
             self._t += 1
-            for cards, _ in self.game.deals():
-                self._cfr("", cards, 1.0, 1.0)
+            for cards, p in self.game.deals():
+                self._cfr("", cards, 1.0, 1.0, p)

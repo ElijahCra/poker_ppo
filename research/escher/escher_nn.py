@@ -140,11 +140,14 @@ class Reservoir:
 # ─── Neural ESCHER ──────────────────────────────────────────────────────────
 class NeuralESCHER:
     def __init__(self, game, n_ranks, values="exact",
-                 hidden=64, buf_cap=200_000, seed=0):
+                 hidden=64, reg_steps=400, buf_cap=200_000, seed=0):
         self.g = game
         self.feat = Featurizer(game, n_ranks)
         self.values_mode = values
         self.A = game.n_actions
+        self.hidden = hidden
+        self.reg_steps = reg_steps
+        self.t = 0  # CFR iteration counter (survives checkpoint/resume)
         torch.manual_seed(seed)
         self.rng = random.Random(seed)
         self.regret_net = MLP(self.feat.inf_dim, self.A, hidden).to(DEV)
@@ -159,6 +162,14 @@ class NeuralESCHER:
         self.tab_ss = defaultdict(lambda: [0.0] * self.A)
         self.tab_w = defaultdict(float)
         self.tab_legal = {}
+        # exact-cumulative mode: maintain the EXACT RM⁺ cumulative regret per
+        # infoset (full-tree gives it directly), regress the net to THAT instead
+        # of a noisy sampled buffer — isolates FA representational adequacy
+        # (σ still comes from the net, so FA stays in the CFR loop).
+        self.exact_cum = False
+        self.cum = defaultdict(lambda: [0.0] * self.A)
+        self.cum_legal = {}
+        self._cum_meta = {}
 
     # current strategy at an infoset via regret-matching⁺ on the regret net
     @torch.no_grad()
@@ -239,7 +250,7 @@ class NeuralESCHER:
         strat = {}
         key_meta = {}
 
-        def rec(history, cards, p0, p1):
+        def rec(history, cards, p0, p1, q):
             if g.is_terminal(history):
                 return g.terminal_util_p0(history, cards)
             player = g.current_player(history)
@@ -251,10 +262,13 @@ class NeuralESCHER:
             for a in legal:
                 util_a[a] = rec(g.step_history(history, a), cards,
                                 p0 * (sig[a] if player == 0 else 1.0),
-                                p1 * (sig[a] if player == 1 else 1.0))
+                                p1 * (sig[a] if player == 1 else 1.0), q)
                 node += sig[a] * util_a[a]
-            cf = p1 if player == 0 else p0
-            own = p0 if player == 0 else p1
+            # q = chance/deal reach: π_{-i} and the average weight both include
+            # chance, so scale by the deal probability (silent on uniform-deal
+            # Kuhn; essential on Leduc's non-uniform deck).
+            cf = q * (p1 if player == 0 else p0)
+            own = q * (p0 if player == 0 else p1)
             sign = 1.0 if player == 0 else -1.0
             # value-function action values for the regret (ESCHER): replace
             # the recursion utils with value_of(child) so 'net' mode is IS-free.
@@ -271,13 +285,18 @@ class NeuralESCHER:
             key_meta[I] = (history, cards, player, legal)
             return node
 
-        for cards, _ in g.deals():
-            rec("", cards, 1.0, 1.0)
+        for cards, p in g.deals():
+            rec("", cards, 1.0, 1.0, p)
 
         for I, rvec in inst.items():
             history, cards, player, legal = key_meta[I]
             f = self.feat.infoset(history, cards, player)
             self.reg_buf.add((f, torch.tensor(rvec), float(t)))
+            if self.exact_cum:  # RM⁺: floor the cumulative regret at 0
+                for a in legal:
+                    self.cum[I][a] = max(0.0, self.cum[I][a] + rvec[a])
+                self.cum_legal[I] = legal
+                self._cum_meta[I] = (history, cards, player)
         for I, svec in strat.items():
             history, cards, player, legal = key_meta[I]
             tot = sum(svec)
@@ -321,15 +340,25 @@ class NeuralESCHER:
             rec("", cards)
         return out
 
-    def _train_net(self, net, buf, steps, lr, mb=512):
+    def _train_net(self, net, buf, steps, lr, mb=512, normalize=False):
         opt = torch.optim.Adam(net.parameters(), lr)
         data = buf.data
         if not data:
             return
+        # global target scale: RM is scale-invariant per infoset, so dividing
+        # ALL regret targets by one positive constant leaves σ unchanged but
+        # turns the ±13-magnitude Leduc regrets into O(1) targets the MSE fits
+        # far more accurately — directly lowers the FA noise floor.
+        scale = 1.0
+        if normalize:
+            ss = torch.stack([data[i][1] for i in
+                              self.rng.sample(range(len(data)),
+                                              min(4096, len(data)))])
+            scale = max(1e-6, ss.pow(2).mean().sqrt().item())
         for _ in range(steps):
             idx = [self.rng.randrange(len(data)) for _ in range(min(mb, len(data)))]
             X = torch.stack([data[i][0] for i in idx]).to(DEV)
-            Y = torch.stack([data[i][1] for i in idx]).to(DEV)
+            Y = torch.stack([data[i][1] for i in idx]).to(DEV) / scale
             W = torch.tensor([data[i][2] for i in idx]).to(DEV).unsqueeze(1)
             opt.zero_grad()
             pred = net(X)
@@ -337,13 +366,47 @@ class NeuralESCHER:
             loss.backward()
             opt.step()
 
-    def fit_regret(self, steps=400, lr=3e-3):
-        # fresh init each CFR iteration (Deep CFR): avoids stale-target drift.
-        self.regret_net = MLP(self.feat.inf_dim, self.A).to(DEV)
-        self._train_net(self.regret_net, self.reg_buf, steps, lr)
+    def fit_regret(self, lr=3e-3):
+        # Deep CFR fresh-inits each iter (unbiased), but that injects random
+        # reinit jitter into σ_t every iteration → the average can't tighten.
+        # warm-start keeps the net and nudges it toward the updated buffer →
+        # SMOOTH σ trajectory → lower averaging floor (empirically better on
+        # small setups, the trade-off being a little stale-target bias).
+        if not getattr(self, "warm", False):
+            self.regret_net = MLP(self.feat.inf_dim, self.A, self.hidden).to(DEV)
+        if self.exact_cum:
+            self._fit_regret_cum(lr)
+        else:
+            self._train_net(self.regret_net, self.reg_buf, self.reg_steps, lr,
+                            normalize=True)
+
+    def _fit_regret_cum(self, lr):
+        """Regress the regret net to the EXACT RM⁺ cumulative regret table
+        (one stable target per infoset) — the FA-adequacy probe."""
+        feats, tgts = [], []
+        for I, legal in self.cum_legal.items():
+            history, cards, player = self._cum_meta[I]
+            feats.append(self.feat.infoset(history, cards, player))
+            tgts.append(torch.tensor(self.cum[I]))
+        X = torch.stack(feats).to(DEV)
+        Y = torch.stack(tgts).to(DEV)
+        # PER-INFOSET normalisation: RM(I) is invariant to positive scaling of
+        # R(I), so rescale each infoset's regret vector to unit norm. This
+        # weights every infoset equally in the MSE (a global scale lets large-
+        # regret infosets dominate, under-fitting the close-regret / finely-
+        # mixed ones where RM is most error-sensitive) while preserving the
+        # within-infoset ratios RM actually consumes.
+        row = Y.norm(dim=1, keepdim=True).clamp_min(1e-6)
+        Y = Y / row
+        opt = torch.optim.Adam(self.regret_net.parameters(), lr)
+        for _ in range(self.reg_steps):
+            opt.zero_grad()
+            loss = F.mse_loss(self.regret_net(X), Y)
+            loss.backward()
+            opt.step()
 
     def fit_avg(self, steps=600, lr=2e-3):
-        self.avg_net = MLP(self.feat.inf_dim, self.A).to(DEV)
+        self.avg_net = MLP(self.feat.inf_dim, self.A, self.hidden).to(DEV)
         # avg net regresses to the iteration-weighted average σ (target probs);
         # softmax at read time. Train logits via MSE on probs is crude but ok
         # for small games; use KL via log-softmax instead.
@@ -402,35 +465,90 @@ class NeuralESCHER:
                 return cards
         return deals[-1][0]
 
-    def run(self, iters, eval_every=10):
-        for t in range(1, iters + 1):
+    def run(self, iters, eval_every=10, ckpt=None):
+        # tabular-avg is the HEADLINE: it's the exact linear-CFR average of the
+        # σ sequence (≡ a perfectly-fit avg net, per the diagnostic), so it
+        # measures how well the DYNAMICS converge — the floor being attacked.
+        target = self.t + iters
+        while self.t < target:
+            self.t += 1
             if self.values_mode == "net":
                 self.train_value(n_traj=64, steps=8)
-            self.collect_regret(t)
+            self.collect_regret(self.t)
             self.fit_regret()
-            if t % eval_every == 0 or t == iters:
-                self.fit_avg()
-                expl = exploitability(self.g, self.avg_strategy())
+            if self.t % eval_every == 0 or self.t == target:
                 tab = exploitability(self.g, self.tabular_average())
-                print(f"  iter {t:4d}   expl(avg-net)={expl:.5f}   "
-                      f"expl(tabular-avg)={tab:.5f}", flush=True)
-        return expl
+                print(f"  iter {self.t:4d}   expl(tabular-avg)={tab:.5f}",
+                      flush=True)
+                if ckpt:
+                    self.save(ckpt)
+        return tab
+
+    # ── checkpoint/resume: accumulate iterations across the 600s-per-call cap ──
+    def save(self, path):
+        torch.save({
+            "t": self.t,
+            "regret_net": self.regret_net.state_dict(),
+            "reg_buf": self.reg_buf.data, "reg_n": self.reg_buf.n,
+            "strat_buf": self.strat_buf.data, "strat_n": self.strat_buf.n,
+            "tab_ss": dict(self.tab_ss), "tab_w": dict(self.tab_w),
+            "tab_legal": self.tab_legal,
+            "value_net": (self.value_net.state_dict()
+                          if self.values_mode == "net" else None),
+        }, path)
+
+    def load(self, path):
+        d = torch.load(path, weights_only=False)
+        self.t = d["t"]
+        self.regret_net.load_state_dict(d["regret_net"])
+        self.reg_buf.data = d["reg_buf"]; self.reg_buf.n = d["reg_n"]
+        self.strat_buf.data = d["strat_buf"]; self.strat_buf.n = d["strat_n"]
+        self.tab_ss = defaultdict(lambda: [0.0] * self.A, d["tab_ss"])
+        self.tab_w = defaultdict(float, d["tab_w"])
+        self.tab_legal = d["tab_legal"]
+        if self.values_mode == "net" and d["value_net"]:
+            self.value_net.load_state_dict(d["value_net"])
 
 
 def main():
-    which = sys.argv[1] if len(sys.argv) > 1 else "kuhn6"
-    mode = sys.argv[2] if len(sys.argv) > 2 else "exact"
-    if which == "kuhn":
+    import argparse
+    import os
+    ap = argparse.ArgumentParser()
+    ap.add_argument("game", nargs="?", default="kuhn6")
+    ap.add_argument("mode", nargs="?", default="exact")
+    ap.add_argument("--iters", type=int, default=120)
+    ap.add_argument("--hidden", type=int, default=64)
+    ap.add_argument("--reg-steps", type=int, default=400)
+    ap.add_argument("--warm", action="store_true",
+                    help="warm-start the regret net (skip fresh-init each iter)")
+    ap.add_argument("--exact-cum", action="store_true",
+                    help="regress regret net to EXACT RM+ cumulative regret "
+                         "(FA-adequacy probe; no sampled buffer)")
+    ap.add_argument("--eval-every", type=int, default=10)
+    ap.add_argument("--ckpt", default=None,
+                    help="checkpoint path; resumes if it exists (run more "
+                         "iters across the per-call time cap)")
+    a = ap.parse_args()
+    if a.game == "kuhn":
         g, n = Kuhn, 3
-    elif which == "kuhn6":
+    elif a.game == "kuhn6":
         g, n = make_kuhn_n(6), 6
-    elif which == "leduc":
+    elif a.game == "leduc":
         g, n = Leduc, 3
     else:
         raise SystemExit("game must be kuhn|kuhn6|leduc")
-    print(f"Neural ESCHER on {which} (values={mode}):")
-    esc = NeuralESCHER(g, n, values=mode, seed=0)
-    esc.run(iters=120, eval_every=10)
+    esc = NeuralESCHER(g, n, values=a.mode, hidden=a.hidden,
+                       reg_steps=a.reg_steps, seed=0)
+    esc.warm = a.warm
+    esc.exact_cum = a.exact_cum
+    if a.ckpt and os.path.exists(a.ckpt):
+        esc.load(a.ckpt)
+        print(f"[resume] {a.game} (values={a.mode}) from iter {esc.t}, "
+              f"+{a.iters} more:", flush=True)
+    else:
+        print(f"Neural ESCHER on {a.game} (values={a.mode}, hidden={a.hidden}, "
+              f"reg_steps={a.reg_steps}):", flush=True)
+    esc.run(iters=a.iters, eval_every=a.eval_every, ckpt=a.ckpt)
 
 
 if __name__ == "__main__":
