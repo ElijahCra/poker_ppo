@@ -177,6 +177,12 @@ void NeuralESCHER::collect_regret(long t) {
 
     for (const auto& d : g_.deals()) rec("", d.cards, 1.0, 1.0, d.prob);
 
+    inst_.clear(); key_meta_.clear();
+    for (auto& kv : meta)
+        key_meta_[kv.first] = {kv.second.h, kv.second.c, kv.second.player,
+                               kv.second.legal};
+    inst_ = inst;  // consumed by fit_regret_neural_cum
+
     for (auto& kv : inst) {
         const auto& m = meta[kv.first];
         auto f = feat_.infoset(m.h, m.c, m.player);
@@ -202,6 +208,7 @@ void NeuralESCHER::collect_regret(long t) {
 
 // fresh-init regret net + global-normalised weighted-MSE fit (Deep CFR)
 void NeuralESCHER::fit_regret() {
+    if (cfg_.neural_cum) { fit_regret_neural_cum(); return; }
     regret_net_ = MLP(feat_.inf_dim(), A_, cfg_.hidden);
     auto& data = reg_buf_.data();
     if (data.empty()) return;
@@ -231,6 +238,95 @@ void NeuralESCHER::fit_regret() {
         loss.backward();
         opt.step();
     }
+}
+
+// SCALABLE: store the RM⁺ cumulative regret IN THE NET (warm-train toward
+// max(0, γ·prev_net(I) + inst(I)) — no per-infoset table, smooth σ).
+void NeuralESCHER::fit_regret_neural_cum() {
+    if (key_meta_.empty()) return;
+    std::vector<std::string> keys;
+    keys.reserve(key_meta_.size());
+    for (auto& kv : key_meta_) keys.push_back(kv.first);
+    int N = static_cast<int>(keys.size()), D = feat_.inf_dim();
+    std::vector<float> xb(N * D);
+    for (int i = 0; i < N; ++i) {
+        const auto& m = key_meta_[keys[i]];
+        auto f = feat_.infoset(m.h, m.c, m.player);
+        std::copy(f.begin(), f.end(), xb.begin() + i * D);
+    }
+    auto X = torch::from_blob(xb.data(), {N, D}, torch::kFloat).clone();
+    // snapshot the previous net (the running cumulative)
+    MLP prev(feat_.inf_dim(), A_, cfg_.hidden);
+    { torch::NoGradGuard ng;
+      auto src = regret_net_->parameters(); auto dst = prev->parameters();
+      for (size_t i = 0; i < src.size(); ++i) dst[i].copy_(src[i]); }
+    torch::Tensor prevR;
+    { torch::NoGradGuard ng; prevR = prev->forward(X); }
+    auto Y = torch::zeros({N, A_}, torch::kFloat);
+    auto* yp = Y.data_ptr<float>();
+    auto prevA = prevR.accessor<float, 2>();
+    for (int i = 0; i < N; ++i) {
+        const auto& m = key_meta_[keys[i]];
+        const auto& inst = inst_[keys[i]];
+        for (int a : m.legal)
+            yp[i * A_ + a] = static_cast<float>(std::max(
+                0.0, cfg_.ncum_gamma * prevA[i][a] + inst[a]));
+    }
+    // warm-train (NOT fresh-init): the net IS the accumulator
+    torch::optim::Adam opt(regret_net_->parameters(), torch::optim::AdamOptions(3e-3));
+    for (int step = 0; step < cfg_.reg_steps; ++step) {
+        opt.zero_grad();
+        auto loss = torch::mse_loss(regret_net_->forward(X), Y);
+        loss.backward();
+        opt.step();
+    }
+}
+
+// HUNL-shaped SAMPLED regret pass: external-sampling MCCFR with the value
+// function. Opponent+chance sampled under σ ⇒ unbiased full-tree regret with
+// no importance weight; averaged over n_traj → drop-in for the neural-cum fit.
+void NeuralESCHER::collect_regret_sampled(long t, int n_traj) {
+    std::unordered_map<std::string, std::vector<double>> inst;
+    inst_.clear(); key_meta_.clear();
+
+    std::function<void(const Cards&, int)> ext = [&](const Cards& cards, int i) {
+        double sign = (i == 0) ? 1.0 : -1.0;
+        std::function<void(const std::string&)> rec = [&](const std::string& h) {
+            if (g_.is_terminal(h)) return;
+            int p = g_.current_player(h);
+            auto legal = g_.legal_actions(h);
+            std::string I = g_.infoset_key(h, cards);
+            auto sig = sigma(h, cards, p, legal);
+            if (p == i) {  // traverser: branch all actions, regret from value net
+                if (!inst.count(I)) inst[I] = std::vector<double>(A_, 0.0);
+                double vh = value_of(h, cards);
+                for (int a : legal)
+                    inst[I][a] += sign * (value_of(g_.step(h, a), cards) - vh);
+                key_meta_[I] = {h, cards, p, legal};
+                for (int a : legal) rec(g_.step(h, a));
+            } else {  // opponent: sample one action, accumulate the average
+                auto f = feat_.infoset(h, cards, p);
+                std::vector<float> probs(A_, 0.0f);
+                for (int a : legal) probs[a] = static_cast<float>(sig[a]);
+                strat_buf_.add({f, probs, static_cast<float>(t)});
+                if (!tab_ss_.count(I)) tab_ss_[I] = std::vector<double>(A_, 0.0);
+                for (int a : legal) tab_ss_[I][a] += t * sig[a];
+                tab_w_[I] += t;
+                tab_legal_[I] = legal;
+                rec(g_.step(h, choose_sigma(legal, sig)));
+            }
+        };
+        rec("");
+    };
+
+    for (int k = 0; k < n_traj; ++k) {
+        Cards cards = sample_deal();
+        ext(cards, 0);
+        ext(cards, 1);
+    }
+    for (auto& kv : inst)  // per-deal average = unbiased full-tree estimate
+        for (int a = 0; a < A_; ++a) kv.second[a] /= n_traj;
+    inst_ = std::move(inst);
 }
 
 // fresh-init avg net + iteration-weighted cross-entropy to the avg σ
@@ -392,7 +488,8 @@ void NeuralESCHER::run(int iters, int eval_every) {
             for (int s = 0; s < cfg_.val_sweeps; ++s) train_value();
             if (eval_now) vd = value_diag();
         }
-        collect_regret(t_);
+        if (cfg_.sampled) collect_regret_sampled(t_, cfg_.n_traj);
+        else collect_regret(t_);
         fit_regret();
         if (eval_now) {
             double expl = exploitability(g_, tabular_average());

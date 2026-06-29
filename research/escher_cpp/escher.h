@@ -119,6 +119,10 @@ public:
         int reg_steps = 400;
         int val_sweeps = 4;
         int seed = 0;
+        bool neural_cum = false;   // store RM⁺ cumulative regret in the net
+        double ncum_gamma = 1.0;   // discount on the neural cumulative (DCFR)
+        bool sampled = false;      // external-sampling regret pass (needs ncum)
+        int n_traj = 200;          // trajectories/iter for --sampled
     };
 
     NeuralESCHER(const Game& g, int n_ranks, Config cfg);
@@ -135,7 +139,9 @@ private:
         return cfg_.mode == Mode::Net ? net_value(h, c) : exact_value(h, c);
     }
     void collect_regret(long t);
+    void collect_regret_sampled(long t, int n_traj);
     void fit_regret();
+    void fit_regret_neural_cum();
     void fit_avg();
     void train_value();
     Strategy tabular_average();
@@ -168,6 +174,12 @@ private:
     std::unordered_map<std::string, std::vector<double>> tab_ss_;
     std::unordered_map<std::string, double> tab_w_;
     std::unordered_map<std::string, std::vector<int>> tab_legal_;
+
+    // per-iteration instantaneous regret + meta, consumed by the
+    // neural-cumulative fit (set by collect_regret / collect_regret_sampled)
+    struct InfoMeta { std::string h; Cards c; int player; std::vector<int> legal; };
+    std::unordered_map<std::string, std::vector<double>> inst_;
+    std::unordered_map<std::string, InfoMeta> key_meta_;
 };
 
 }  // namespace escher
