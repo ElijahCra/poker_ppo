@@ -613,6 +613,8 @@ class NeuralESCHER:
                           if self.values_mode == "net" else None),
             "val_buf": (self.val_buf.data if self.values_mode == "net" else None),
             "val_n": (self.val_buf.n if self.values_mode == "net" else 0),
+            "cum": dict(self.cum), "cum_legal": self.cum_legal,
+            "cum_meta": self._cum_meta,
         }, path)
 
     def load(self, path):
@@ -627,6 +629,10 @@ class NeuralESCHER:
         if self.values_mode == "net" and d["value_net"]:
             self.value_net.load_state_dict(d["value_net"])
             self.val_buf.data = d["val_buf"]; self.val_buf.n = d["val_n"]
+        if d.get("cum"):
+            self.cum = defaultdict(lambda: [0.0] * self.A, d["cum"])
+            self.cum_legal = d["cum_legal"]
+            self._cum_meta = d["cum_meta"]
 
 
 def main():
