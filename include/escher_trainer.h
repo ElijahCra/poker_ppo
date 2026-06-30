@@ -56,6 +56,9 @@ struct EscherConfig {
     // HUNL — deadly triad); 0<λ<1 → grounded bootstrap (MC anchors, bootstrap
     // cuts variance + covers rare actions).
     float    value_lambda  = 1.0f;
+    // Polyak target-net rate for the bootstrap value targets (deadly-triad
+    // stabiliser): target ← τ·value + (1−τ)·target. 0 disables (use live net).
+    float    value_tau     = 0.0f;
     int      buf_cap       = 4'000'000;
     int      eval_every    = 50;     // iterations between LBR evaluations
     int      lbr_hands     = 10000;
@@ -120,6 +123,7 @@ private:
     std::mt19937                       rng_;
 
     ActorCritic              value_{nullptr};
+    ActorCritic              value_target_{nullptr};   // Polyak snapshot (τ>0)
     ActorCritic              regret_{nullptr};
     ActorCritic              avg_{nullptr};
     std::unique_ptr<torch::optim::Adam> value_opt_, regret_opt_, avg_opt_;

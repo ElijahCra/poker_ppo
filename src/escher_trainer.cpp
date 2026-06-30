@@ -45,8 +45,12 @@ EscherTrainer::EscherTrainer(IPokerEnvironmentFactory& factory, EscherConfig cfg
         return ac;
     };
     value_  = make();
+    value_target_ = make();
     regret_ = make();
     avg_    = make();
+    { torch::NoGradGuard ng;  // value_target_ starts == value_
+      auto s = value_->parameters(); auto d = value_target_->parameters();
+      for (size_t i = 0; i < s.size(); ++i) d[i].copy_(s[i]); }
     value_opt_  = std::make_unique<torch::optim::Adam>(
         value_->parameters(), torch::optim::AdamOptions(cfg_.lr));
     regret_opt_ = std::make_unique<torch::optim::Adam>(
@@ -198,8 +202,10 @@ void EscherTrainer::collect_and_train_value() {
         }
         pending[i].clear();
     };
+    // bootstrap V̄(child) reads the target net (τ>0) for deadly-triad stability.
+    ActorCritic& vnet = (cfg_.value_tau > 0.f) ? value_target_ : value_;
     run_rollout(factory_, bet_cfg_, obs_dim_, A_, device_, kRolloutEnvs,
-                cfg_.value_traj, regret_, value_, act, finish);
+                cfg_.value_traj, regret_, vnet, act, finish);
 
     // train Q(obs, a_taken) -> signed terminal utility
     if (value_smp_.empty()) return;
@@ -221,6 +227,12 @@ void EscherTrainer::collect_and_train_value() {
         loss.backward();
         value_opt_->step();
         if (step == cfg_.value_steps - 1) last_val_loss_ = loss.item<float>();
+    }
+    if (cfg_.value_tau > 0.f) {  // Polyak: target ← τ·value + (1−τ)·target
+        torch::NoGradGuard ng;
+        auto s = value_->parameters(); auto d = value_target_->parameters();
+        for (size_t i = 0; i < s.size(); ++i)
+            d[i].mul_(1.f - cfg_.value_tau).add_(s[i], cfg_.value_tau);
     }
 }
 
@@ -323,9 +335,15 @@ void EscherTrainer::run_lbr(int iter) {
     lc.num_hands = cfg_.lbr_hands;
     lc.seed = cfg_.seed + 1000 + iter;
     LBREvaluator lbr(factory_, bet_cfg_, lc, device_);
-    auto res = lbr.evaluate(avg_);
-    std::printf("  [iter %4d] LBR exploitability = %.4f bb/hand  (win %.3f)\n",
-                iter, res.bb_per_hand, res.lbr_win_rate);
+    auto res = lbr.evaluate(avg_);                       // average policy π̄
+    // DIAGNOSTIC: also LBR the CURRENT σ = RM⁺(regret net). Comparing the two
+    // separates an averaging problem (avg ≫ σ) from a dynamics problem (σ
+    // itself bad/oscillating).
+    LBRConfig lc2 = lc; lc2.rm_plus = true; lc2.seed = cfg_.seed + 2000 + iter;
+    LBREvaluator lbr_cur(factory_, bet_cfg_, lc2, device_);
+    auto rc = lbr_cur.evaluate(regret_);
+    std::printf("  [iter %4d] LBR  avg=%.4f  cur-sigma=%.4f bb/hand  (avg win %.3f)\n",
+                iter, res.bb_per_hand, rc.bb_per_hand, res.lbr_win_rate);
     std::fflush(stdout);
 }
 
@@ -350,6 +368,9 @@ bool EscherTrainer::try_resume() {
     torch::load(regret_, cfg_.ckpt_dir + "/regret.pt");
     torch::load(avg_,    cfg_.ckpt_dir + "/avg.pt");
     value_->to(device_); regret_->to(device_); avg_->to(device_);
+    { torch::NoGradGuard ng;  // resync target net to the loaded value net
+      auto s = value_->parameters(); auto d = value_target_->parameters();
+      for (size_t i = 0; i < s.size(); ++i) d[i].copy_(s[i]); }
     std::ifstream(cfg_.ckpt_dir + "/iter.txt") >> resume_iter_;
     std::printf("  [resume] loaded checkpoint at iter %d\n", resume_iter_);
     return true;

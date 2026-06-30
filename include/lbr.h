@@ -46,6 +46,10 @@ struct LBRConfig {
     // exploitability of the policy as actually DEPLOYED, not just raw.
     float    play_min_p        = 0.0f;
     float    play_temp         = 1.0f;
+    // Interpret the target's actor head as RM⁺ regrets (clamp≥0, normalise
+    // over legal) instead of a softmax policy — lets LBR attack the CURRENT σ
+    // (an ESCHER regret net) rather than an average/softmax policy.
+    bool     rm_plus           = false;
     // Optional per-hand diagnostic JSONL (empty = off). The aggregate
     // breakdown table is always printed.
     std::string log_path;

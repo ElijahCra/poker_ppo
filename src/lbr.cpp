@@ -159,6 +159,20 @@ LBREvaluator::Result LBREvaluator::evaluate(ActorCritic& target) {
         return safe;
     };
 
+    // Target policy log-probs at obs/mask. Default = masked log-softmax of the
+    // actor; with cfg_.rm_plus = RM⁺ on the raw actor logits (clamp≥0,
+    // normalise over legal) so LBR can attack the CURRENT σ (ESCHER regret net).
+    auto target_logp = [&](const torch::Tensor& obs,
+                           const torch::Tensor& mask) -> torch::Tensor {
+        if (!cfg_.rm_plus) return target->masked_log_probs(obs, mask);
+        auto logits = target->actor_logits(obs);
+        auto pos = torch::clamp(logits, /*min=*/0.0) * mask;
+        auto s   = pos.sum(-1, /*keepdim=*/true);
+        auto cnt = mask.sum(-1, /*keepdim=*/true).clamp_min(1.0);
+        auto probs = torch::where(s > 1e-12, pos / s.clamp_min(1e-12), mask / cnt);
+        return probs.clamp_min(1e-12).log();
+    };
+
     // Filtered target policy probs at the CURRENT node for each active combo,
     // holding it counterfactually: [n_active, A] on CPU. mask is the public
     // legal mask (card-independent). Used for the Bayes update and the
@@ -174,7 +188,7 @@ LBREvaluator::Result LBREvaluator::evaluate(ActorCritic& target) {
         }
         auto obs_dev = obs.to(device_);
         auto mb_dev  = mask.unsqueeze(0).expand({n, A}).to(device_);
-        auto logp    = target->masked_log_probs(obs_dev, mb_dev);
+        auto logp    = target_logp(obs_dev, mb_dev);
         return apply_filter(logp).to(torch::kCPU).contiguous();  // [n, A]
     };
 
@@ -192,7 +206,7 @@ LBREvaluator::Result LBREvaluator::evaluate(ActorCritic& target) {
     auto sample_villain_action = [&](const torch::Tensor& mask) -> int {
         auto obs = env_->observation().unsqueeze(0).to(device_);
         auto md  = mask.unsqueeze(0).to(device_);
-        auto p   = apply_filter(target->masked_log_probs(obs, md));
+        auto p   = apply_filter(target_logp(obs, md));
         return static_cast<int>(p.multinomial(1).item<int64_t>());
     };
 
