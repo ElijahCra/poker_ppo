@@ -419,15 +419,16 @@ void EscherTrainer::run_lbr(int iter) {
     lc.seed = cfg_.seed + 1000 + iter;
     LBREvaluator lbr(factory_, bet_cfg_, lc, device_);
     auto res = lbr.evaluate(avg_);                       // average policy π̄
-    // DIAGNOSTIC: also LBR the CURRENT σ = RM⁺(regret net). Comparing the two
-    // separates an averaging problem (avg ≫ σ) from a dynamics problem (σ
-    // itself bad/oscillating).
-    LBRConfig lc2 = lc; lc2.rm_plus = true; lc2.seed = cfg_.seed + 2000 + iter;
-    LBREvaluator lbr_cur(factory_, bet_cfg_, lc2, device_);
-    auto rc = lbr_cur.evaluate(regret_);
-    std::printf("  [iter %4d] LBR  avg=%.4f  cur-sigma=%.4f bb/hand  (avg win %.3f)\n",
-                iter, res.bb_per_hand, rc.bb_per_hand, res.lbr_win_rate);
+    // Track the best LBR so the deployable strategy is the best avg, not the
+    // latest (CFR's current σ oscillates; the average is what's judged).
+    bool best = res.bb_per_hand < best_lbr_;
+    if (best) best_lbr_ = res.bb_per_hand;
+    std::printf("  [iter %4d] LBR avg=%.4f bb/hand  (win %.3f)%s\n",
+                iter, res.bb_per_hand, res.lbr_win_rate, best ? "  *best*" : "");
     std::fflush(stdout);
+    if (best && !cfg_.ckpt_dir.empty())   // snapshot the best avg net
+        torch::save(avg_, cfg_.ckpt_dir + "/avg_best.pt");
+    // cur-σ diagnostic available via LBRConfig.rm_plus on regret_ if needed.
 }
 
 // The 3 net weights fully encode the strategy: regret_ holds the cumulative

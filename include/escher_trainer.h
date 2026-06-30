@@ -158,6 +158,7 @@ private:
     std::unique_ptr<Reservoir> avg_buf_, regret_buf_;
     long iter_ = 0;
     float last_val_loss_ = 0.f, last_reg_loss_ = 0.f, last_reg_mag_ = 0.f;
+    double best_lbr_ = 1e9;   // best avg-net LBR so far → snapshot avg_best.pt
 };
 
 }  // namespace poker_ppo
