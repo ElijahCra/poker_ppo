@@ -173,7 +173,7 @@ int main(int argc, char** argv) {
         ecfg.lbr_hands    = envi("ESCHER_LBR_HANDS", ecfg.lbr_hands);
         ecfg.ckpt_every   = envi("ESCHER_CKPT_EVERY", ecfg.ckpt_every);
         if (const char* g = std::getenv("ESCHER_GAMMA")) ecfg.ncum_gamma = std::atof(g);
-        ecfg.dream = envi("ESCHER_DREAM", 0) != 0;
+        if (const char* l = std::getenv("ESCHER_LAMBDA")) ecfg.value_lambda = std::atof(l);
         if (const char* d = std::getenv("ESCHER_CKPT_DIR")) ecfg.ckpt_dir = d;
         EscherTrainer trainer(factory, ecfg, device);
         trainer.train();

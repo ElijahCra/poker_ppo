@@ -51,9 +51,11 @@ struct EscherConfig {
     float    lr            = 1e-3f;
     // neural RM⁺ cumulative regret discount (1.0 = pure RM⁺/CFR+; <1 = DCFR)
     float    ncum_gamma    = 1.0f;
-    // value target: false = MC terminal utility (pure ESCHER); true = DREAM
-    // bootstrap Q(h,a)→V̄(child) under σ (lower variance, all-action coverage).
-    bool     dream         = false;
+    // value target = λ·MC + (1−λ)·bootstrap (TD-λ). λ=1 → pure-ESCHER MC
+    // (default); λ=0 → DREAM bootstrap Q(h,a)→V̄(child) (collapses alone on
+    // HUNL — deadly triad); 0<λ<1 → grounded bootstrap (MC anchors, bootstrap
+    // cuts variance + covers rare actions).
+    float    value_lambda  = 1.0f;
     int      buf_cap       = 4'000'000;
     int      eval_every    = 50;     // iterations between LBR evaluations
     int      lbr_hands     = 10000;

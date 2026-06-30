@@ -163,40 +163,40 @@ static void run_rollout(IPokerEnvironmentFactory& factory, const BetConfig& bet,
 //     MC value never sampled.
 void EscherTrainer::collect_and_train_value() {
     value_smp_.clear();
+    const float lam = cfg_.value_lambda;
+    // full path per env (for the MC anchor); each node also gets its bootstrap
+    // V̄(child) stashed in .z during traversal, then mixed at finish.
     std::vector<std::vector<std::pair<size_t, int>>> pending(kRolloutEnvs);
-    // bootstrap one-step linkage: prev node's (sample idx, player) per env
-    std::vector<long> boot_idx(kRolloutEnvs, -1);
-    std::vector<int>  boot_player(kRolloutEnvs, 0);
 
     auto act = [&](int i, int player, const torch::Tensor& obs,
                    const torch::Tensor& mask, torch::Tensor lg, torch::Tensor q) {
         auto sig = sigma(regret_, lg, mask);
-        if (cfg_.dream && boot_idx[i] >= 0) {
-            // V̄(this node) is the bootstrap target for the PREVIOUS action.
+        if (lam < 1.0f && !pending[i].empty()) {
+            // V̄(this node) = bootstrap target of the PREVIOUS action (frame-
+            // flipped if the player changed).
             const float* qd = q.data_ptr<float>();
             double vbar = 0.0;
             for (int a = 0; a < A_; ++a) vbar += sig[a] * qd[a];
-            value_smp_[(size_t)boot_idx[i]].z =
-                (float)(boot_player[i] == player ? vbar : -vbar);
+            auto [pidx, pp] = pending[i].back();
+            value_smp_[pidx].z = (float)(pp == player ? vbar : -vbar);
         }
         int a = sample(sig, rng_);
         size_t si = value_smp_.size();
         value_smp_.push_back({obs.clone(), {}, a, 0.0f, 1.0f});
-        if (cfg_.dream) { boot_idx[i] = (long)si; boot_player[i] = player; }
-        else            pending[i].push_back({si, player});
+        pending[i].push_back({si, player});
         return a;
     };
     auto finish = [&](int i, float z_p0) {
-        if (cfg_.dream) {
-            if (boot_idx[i] >= 0)
-                value_smp_[(size_t)boot_idx[i]].z =
-                    (boot_player[i] == 0) ? z_p0 : -z_p0;
-            boot_idx[i] = -1;
-        } else {
-            for (auto& [si, p] : pending[i])
-                value_smp_[si].z = (p == 0) ? z_p0 : -z_p0;  // acting-player frame
-            pending[i].clear();
+        if (lam < 1.0f && !pending[i].empty()) {
+            auto [lidx, lp] = pending[i].back();  // last node's child is terminal
+            value_smp_[lidx].z = (lp == 0) ? z_p0 : -z_p0;
         }
+        for (auto& [idx, p] : pending[i]) {
+            float mc = (p == 0) ? z_p0 : -z_p0;            // acting-player frame
+            float boot = value_smp_[idx].z;                // V̄(child), or 0 if λ=1
+            value_smp_[idx].z = lam * mc + (1.0f - lam) * boot;
+        }
+        pending[i].clear();
     };
     run_rollout(factory_, bet_cfg_, obs_dim_, A_, device_, kRolloutEnvs,
                 cfg_.value_traj, regret_, value_, act, finish);
