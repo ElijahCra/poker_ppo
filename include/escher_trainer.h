@@ -51,6 +51,10 @@ struct EscherConfig {
     float    lr            = 1e-3f;
     // neural RM⁺ cumulative regret discount (1.0 = pure RM⁺/CFR+; <1 = DCFR)
     float    ncum_gamma    = 1.0f;
+    // regret update: false = neural-cumulative (warm net holds RM⁺ cumulative,
+    // my variant); true = the PAPER's Deep-CFR reservoir buffer (accumulate raw
+    // instantaneous regrets, REINIT the regret net each iter, RM at read).
+    bool     regret_buffer = false;
     // value target = λ·MC + (1−λ)·bootstrap (TD-λ). λ=1 → pure-ESCHER MC
     // (default); λ=0 → DREAM bootstrap Q(h,a)→V̄(child) (collapses alone on
     // HUNL — deadly triad); 0<λ<1 → grounded bootstrap (MC anchors, bootstrap
@@ -60,6 +64,8 @@ struct EscherConfig {
     // stabiliser): target ← τ·value + (1−τ)·target. 0 disables (use live net).
     float    value_tau     = 0.0f;
     int      buf_cap       = 4'000'000;
+    int      avg_warmup    = 0;      // skip averaging the first N iters' σ (the
+                                     // average is dragged by early off-Nash σ)
     int      eval_every    = 50;     // iterations between LBR evaluations
     int      lbr_hands     = 10000;
     uint64_t seed          = 0;
@@ -128,9 +134,10 @@ private:
     ActorCritic              avg_{nullptr};
     std::unique_ptr<torch::optim::Adam> value_opt_, regret_opt_, avg_opt_;
 
-    // value_/regret_ buffers are per-iteration (cleared); avg accumulates.
+    // value_/regret_ per-iteration buffers (cleared); avg + paper-mode regret
+    // reservoirs accumulate across iterations.
     std::vector<Sample>        value_smp_, regret_smp_;
-    std::unique_ptr<Reservoir> avg_buf_;
+    std::unique_ptr<Reservoir> avg_buf_, regret_buf_;
     long iter_ = 0;
     float last_val_loss_ = 0.f, last_reg_loss_ = 0.f, last_reg_mag_ = 0.f;
 };

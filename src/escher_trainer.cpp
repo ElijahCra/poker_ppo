@@ -57,7 +57,8 @@ EscherTrainer::EscherTrainer(IPokerEnvironmentFactory& factory, EscherConfig cfg
         regret_->parameters(), torch::optim::AdamOptions(cfg_.lr));
     avg_opt_    = std::make_unique<torch::optim::Adam>(
         avg_->parameters(), torch::optim::AdamOptions(cfg_.lr));
-    avg_buf_ = std::make_unique<Reservoir>(cfg_.buf_cap, cfg_.seed + 7);
+    avg_buf_    = std::make_unique<Reservoir>(cfg_.buf_cap, cfg_.seed + 7);
+    regret_buf_ = std::make_unique<Reservoir>(cfg_.buf_cap, cfg_.seed + 8);
 }
 
 // ── σ = RM⁺ on the regret net's actor logits, masked to legal ───────────────
@@ -242,22 +243,28 @@ void EscherTrainer::collect_regret(int traverser) {
                    const torch::Tensor& mask, torch::Tensor lg, torch::Tensor q) {
         auto sig = sigma(regret_, lg, mask);
         if (player == traverser) {
-            // instantaneous regret r(a) = Q(a) - V̄ (acting-player frame);
-            // neural RM⁺ target = max(0, γ·cum_regret(a) + r(a)).
             const float* qd = q.data_ptr<float>();
             const float* mk = mask.data_ptr<float>();
-            const float* cum = lg.data_ptr<float>();  // regret net = cumulative
+            const float* cum = lg.data_ptr<float>();  // regret net output
             double vbar = 0.0;
             for (int a = 0; a < A_; ++a) if (mk[a] > 0.5f) vbar += sig[a] * qd[a];
             auto tgt = torch::zeros({A_});
             float* td = tgt.data_ptr<float>();
-            for (int a = 0; a < A_; ++a)
-                if (mk[a] > 0.5f) {
-                    double inst = qd[a] - vbar;
-                    double v = cfg_.ncum_gamma * cum[a] + inst;
-                    td[a] = v > 0.0 ? (float)v : 0.0f;
-                }
-            regret_smp_.push_back({obs.clone(), tgt, -1, 0.0f, 1.0f});
+            if (cfg_.regret_buffer) {
+                // PAPER: store the RAW instantaneous regret r(a)=Q(a)−V̄; the
+                // reservoir accumulates across iters, weighted by iteration.
+                for (int a = 0; a < A_; ++a)
+                    if (mk[a] > 0.5f) td[a] = (float)(qd[a] - vbar);
+                regret_buf_->add({obs.clone(), tgt, -1, 0.0f, (float)iter_});
+            } else {
+                // my variant: neural RM⁺ target max(0, γ·cum(a) + r(a)).
+                for (int a = 0; a < A_; ++a)
+                    if (mk[a] > 0.5f) {
+                        double v = cfg_.ncum_gamma * cum[a] + (qd[a] - vbar);
+                        td[a] = v > 0.0 ? (float)v : 0.0f;
+                    }
+                regret_smp_.push_back({obs.clone(), tgt, -1, 0.0f, 1.0f});
+            }
             return sample_uniform(mask, rng_);   // fixed b_i: uniform
         }
         return sample(sig, rng_);                // opponent ~ σ
@@ -268,28 +275,50 @@ void EscherTrainer::collect_regret(int traverser) {
 }
 
 void EscherTrainer::fit_regret() {
-    if (regret_smp_.empty()) return;
-    std::uniform_int_distribution<size_t> pick(0, regret_smp_.size() - 1);
+    auto& data = cfg_.regret_buffer ? regret_buf_->data : regret_smp_;
+    if (data.empty()) return;
+    // PAPER (Deep CFR): REINIT the regret net each iteration and fit the whole
+    // reservoir, weighted by iteration (linear CFR) and globally normalised (RM
+    // is scale-invariant) so the net learns the iteration-weighted cumulative.
+    float scale = 1.0f;
+    if (cfg_.regret_buffer) {
+        const auto& pc = config::kPPOConfig;
+        regret_ = ActorCritic(obs_dim_, A_, pc.hidden_dim, pc.num_layers,
+                              pc.hist, pc.round_summary);
+        regret_->to(device_);
+        regret_opt_ = std::make_unique<torch::optim::Adam>(
+            regret_->parameters(), torch::optim::AdamOptions(cfg_.lr));
+        double ss = 0.0; long cnt = 0;
+        for (auto& s : data) {
+            const float* td = s.target.data_ptr<float>();
+            for (int a = 0; a < A_; ++a) { ss += (double)td[a] * td[a]; ++cnt; }
+        }
+        scale = (float)std::max(1e-6, std::sqrt(ss / std::max(1L, cnt)));
+    }
+    std::uniform_int_distribution<size_t> pick(0, data.size() - 1);
     for (int step = 0; step < cfg_.regret_steps; ++step) {
-        int B = std::min<int>(cfg_.batch_size, (int)regret_smp_.size());
+        int B = std::min<int>(cfg_.batch_size, (int)data.size());
         auto X = torch::empty({B, obs_dim_});
         auto Y = torch::empty({B, A_});
+        auto W = torch::empty({B, 1});
         for (int b = 0; b < B; ++b) {
-            const auto& s = regret_smp_[pick(rng_)];
-            X[b] = s.feat; Y[b] = s.target;
+            const auto& s = data[pick(rng_)];
+            X[b] = s.feat; Y[b] = s.target; W[b][0] = s.weight;
         }
-        X = X.to(device_); Y = Y.to(device_);
+        X = X.to(device_); Y = (Y / scale).to(device_); W = W.to(device_);
         regret_opt_->zero_grad();
-        auto pred = regret_->actor_logits(X);    // actor logits = cumulative regret
-        auto loss = torch::mse_loss(pred, Y);
+        auto pred = regret_->actor_logits(X);
+        auto loss = cfg_.regret_buffer
+            ? (W * (pred - Y).pow(2)).mean()   // iteration-weighted (linear CFR)
+            : torch::mse_loss(pred, Y);
         loss.backward();
         regret_opt_->step();
         if (step == cfg_.regret_steps - 1) {
             last_reg_loss_ = loss.item<float>();
-            last_reg_mag_  = Y.abs().mean().item<float>();  // cumulative-regret scale
+            last_reg_mag_  = Y.abs().mean().item<float>();
         }
     }
-    regret_smp_.clear();
+    if (!cfg_.regret_buffer) regret_smp_.clear();
 }
 
 // ── average phase: classification on (infoset, a_taken) under current σ ─────
@@ -389,7 +418,8 @@ void EscherTrainer::train() {
         auto t0 = clk(); collect_and_train_value();
         auto t1 = clk(); collect_regret(0); collect_regret(1);
         auto t2 = clk(); fit_regret();
-        auto t3 = clk(); collect_avg(iter_);
+        auto t3 = clk();
+        if (iter_ > cfg_.avg_warmup) collect_avg(iter_);  // burn-in: drop early σ
         auto t4 = clk(); fit_avg();
         auto t5 = clk();
         std::printf("  iter %4ld  %.0fms [val %.0f reg-roll %.0f reg-fit %.0f "
