@@ -6,6 +6,7 @@
 //   ./poker_ppo --strategy {serial|threadpool}   rollout strategy
 
 #include "commands.h"
+#include "escher_trainer.h"
 #include "poker_env.h"
 
 #include <cstdlib>
@@ -47,6 +48,7 @@ struct CliOptions {
     bool        play_mode       = false;
     bool        br_eval_mode    = false;
     bool        lbr_eval_mode   = false;
+    bool        escher_mode     = false;
     std::string play_model_path;
     std::string br_model_path;
     std::string lbr_model_path;
@@ -72,6 +74,8 @@ bool parse_cli(int argc, char** argv, CliOptions& out) {
         } else if (a == "--lbr-eval") {
             out.lbr_eval_mode = true;
             if (i + 1 < argc) { out.lbr_model_path = argv[i + 1]; ++i; }
+        } else if (a == "--escher") {
+            out.escher_mode = true;
         } else if (a == "--strategy") {
             if (i + 1 < argc) { out.strategy = argv[i + 1]; ++i; }
         } else {
@@ -152,6 +156,24 @@ int main(int argc, char** argv) {
     }
     if (opt.benchmark_mode) {
         return cmd_benchmark(factory, device, opt.benchmark_iters);
+    }
+    if (opt.escher_mode) {
+        EscherConfig ecfg;
+        auto envi = [](const char* k, int d) {
+            const char* v = std::getenv(k); return v ? std::atoi(v) : d;
+        };
+        ecfg.iterations   = envi("ESCHER_ITERS",   ecfg.iterations);
+        ecfg.value_traj   = envi("ESCHER_VAL_TRAJ", ecfg.value_traj);
+        ecfg.regret_traj  = envi("ESCHER_REG_TRAJ", ecfg.regret_traj);
+        ecfg.avg_traj     = envi("ESCHER_AVG_TRAJ", ecfg.avg_traj);
+        ecfg.value_steps  = envi("ESCHER_VAL_STEPS", ecfg.value_steps);
+        ecfg.regret_steps = envi("ESCHER_REG_STEPS", ecfg.regret_steps);
+        ecfg.avg_steps    = envi("ESCHER_AVG_STEPS", ecfg.avg_steps);
+        ecfg.eval_every   = envi("ESCHER_EVAL_EVERY", ecfg.eval_every);
+        ecfg.lbr_hands    = envi("ESCHER_LBR_HANDS", ecfg.lbr_hands);
+        EscherTrainer trainer(factory, ecfg, device);
+        trainer.train();
+        return 0;
     }
 
     PPOTrainer::Strategy strategy;

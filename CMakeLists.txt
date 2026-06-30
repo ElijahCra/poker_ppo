@@ -47,6 +47,7 @@ add_library(poker_ppo_lib
     src/best_response.cpp
     src/lbr.cpp
     src/commands.cpp
+    src/escher_trainer.cpp
 )
 target_include_directories(poker_ppo_lib PUBLIC
     include
