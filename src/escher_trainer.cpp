@@ -9,6 +9,8 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <functional>
 
 namespace poker_ppo {
@@ -302,17 +304,42 @@ void EscherTrainer::run_lbr(int iter) {
     std::fflush(stdout);
 }
 
-void EscherTrainer::save_checkpoint(int) { /* TODO */ }
+// The 3 net weights fully encode the strategy: regret_ holds the cumulative
+// regret, avg_ the average policy, value_ refits from current-π each iter. The
+// avg reservoir is NOT saved (it refills; avg_ already encodes the average).
+void EscherTrainer::save_checkpoint(int iter) {
+    if (cfg_.ckpt_dir.empty()) return;
+    std::filesystem::create_directories(cfg_.ckpt_dir);
+    torch::save(value_,  cfg_.ckpt_dir + "/value.pt");
+    torch::save(regret_, cfg_.ckpt_dir + "/regret.pt");
+    torch::save(avg_,    cfg_.ckpt_dir + "/avg.pt");
+    std::ofstream(cfg_.ckpt_dir + "/iter.txt") << iter;
+    std::printf("  [ckpt] saved iter %d -> %s\n", iter, cfg_.ckpt_dir.c_str());
+}
+
+bool EscherTrainer::try_resume() {
+    if (cfg_.ckpt_dir.empty() ||
+        !std::filesystem::exists(cfg_.ckpt_dir + "/avg.pt"))
+        return false;
+    torch::load(value_,  cfg_.ckpt_dir + "/value.pt");
+    torch::load(regret_, cfg_.ckpt_dir + "/regret.pt");
+    torch::load(avg_,    cfg_.ckpt_dir + "/avg.pt");
+    value_->to(device_); regret_->to(device_); avg_->to(device_);
+    std::ifstream(cfg_.ckpt_dir + "/iter.txt") >> resume_iter_;
+    std::printf("  [resume] loaded checkpoint at iter %d\n", resume_iter_);
+    return true;
+}
 
 // ── outer ESCHER loop ───────────────────────────────────────────────────────
 void EscherTrainer::train() {
     std::printf("ESCHER HUNL: %d iters, envs=%d, value/regret/avg traj=%d/%d/%d\n",
                 cfg_.iterations, kRolloutEnvs, cfg_.value_traj, cfg_.regret_traj,
                 cfg_.avg_traj);
+    try_resume();
     auto clk = [] { return std::chrono::steady_clock::now(); };
     auto el = [](auto a, auto b) {
         return std::chrono::duration<double, std::milli>(b - a).count(); };
-    for (iter_ = 1; iter_ <= cfg_.iterations; ++iter_) {
+    for (iter_ = resume_iter_ + 1; iter_ <= cfg_.iterations; ++iter_) {
         auto t0 = clk(); collect_and_train_value();
         auto t1 = clk(); collect_regret(0); collect_regret(1);
         auto t2 = clk(); fit_regret();
@@ -325,9 +352,12 @@ void EscherTrainer::train() {
                     el(t2, t3), el(t3, t4), el(t4, t5), last_val_loss_,
                     last_reg_loss_, last_reg_mag_);
         std::fflush(stdout);
+        if (!cfg_.ckpt_dir.empty() && iter_ % cfg_.ckpt_every == 0)
+            save_checkpoint((int)iter_);
         if (iter_ % cfg_.eval_every == 0 || iter_ == cfg_.iterations)
             run_lbr((int)iter_);
     }
+    save_checkpoint((int)cfg_.iterations);
 }
 
 }  // namespace poker_ppo

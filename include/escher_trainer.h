@@ -87,6 +87,8 @@ private:
 
     void run_lbr(int iter);
     void save_checkpoint(int iter);
+    bool try_resume();   // loads the 3 nets + iter from cfg_.ckpt_dir if present
+    int  resume_iter_ = 0;
 
     // Reservoir buffers (feature rows kept on CPU; uploaded per-minibatch).
     struct Sample {
