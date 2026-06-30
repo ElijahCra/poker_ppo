@@ -177,6 +177,7 @@ int main(int argc, char** argv) {
         if (const char* t = std::getenv("ESCHER_TAU")) ecfg.value_tau = std::atof(t);
         ecfg.avg_warmup = envi("ESCHER_AVG_WARMUP", ecfg.avg_warmup);
         ecfg.regret_buffer = envi("ESCHER_REGRET_BUFFER", 0) != 0;
+        ecfg.buf_cap = envi("ESCHER_BUF_CAP", ecfg.buf_cap);
         if (const char* d = std::getenv("ESCHER_CKPT_DIR")) ecfg.ckpt_dir = d;
         EscherTrainer trainer(factory, ecfg, device);
         trainer.train();

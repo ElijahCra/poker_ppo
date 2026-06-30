@@ -19,13 +19,70 @@ namespace {
 constexpr int kRolloutEnvs = 512;   // parallel envs for batched inference
 }
 
-// ── Reservoir ───────────────────────────────────────────────────────────────
-void EscherTrainer::Reservoir::add(Sample s) {
+// ── tensor-backed Reservoir ─────────────────────────────────────────────────
+EscherTrainer::Reservoir::Reservoir(size_t cap, int D, int A, uint64_t seed)
+    : cap_(cap), D_(D), A_(A), rng_(seed) {
+    feats_   = torch::empty({(long)cap, D}, torch::kFloat);
+    targets_ = torch::empty({(long)cap, A}, torch::kFloat);
+    actions_ = torch::empty({(long)cap}, torch::kLong);
+    weights_ = torch::empty({(long)cap}, torch::kFloat);
+}
+
+void EscherTrainer::Reservoir::add(const float* feat, const float* target,
+                                   int64_t action, float w) {
+    long slot;
+    if (filled_ < cap_) { slot = (long)filled_++; }
+    else {
+        std::uniform_int_distribution<long> d(0, n_);  // replace w/ prob cap/(n+1)
+        long j = d(rng_); ++n_;
+        if (j >= (long)cap_) return;                   // discard
+        slot = j;
+        std::memcpy(feats_.data_ptr<float>() + slot * D_, feat, D_ * sizeof(float));
+        if (target) std::memcpy(targets_.data_ptr<float>() + slot * A_, target,
+                                A_ * sizeof(float));
+        actions_.data_ptr<long>()[slot]   = action;
+        weights_.data_ptr<float>()[slot]  = w;
+        return;
+    }
     ++n_;
-    if (data.size() < cap_) { data.push_back(std::move(s)); return; }
-    std::uniform_int_distribution<long> d(0, n_ - 1);
-    long j = d(rng_);
-    if (j < static_cast<long>(cap_)) data[static_cast<size_t>(j)] = std::move(s);
+    std::memcpy(feats_.data_ptr<float>() + slot * D_, feat, D_ * sizeof(float));
+    if (target) std::memcpy(targets_.data_ptr<float>() + slot * A_, target,
+                            A_ * sizeof(float));
+    actions_.data_ptr<long>()[slot]  = action;
+    weights_.data_ptr<float>()[slot] = w;
+}
+
+EscherTrainer::Reservoir::MB
+EscherTrainer::Reservoir::sample(int B, std::mt19937& rng, torch::Device dev) {
+    auto idx = torch::empty({B}, torch::kLong);
+    long* ip = idx.data_ptr<long>();
+    std::uniform_int_distribution<long> d(0, (long)filled_ - 1);
+    for (int b = 0; b < B; ++b) ip[b] = d(rng);
+    return { feats_.index_select(0, idx).to(dev),
+             targets_.index_select(0, idx).to(dev),
+             actions_.index_select(0, idx).to(dev),
+             weights_.index_select(0, idx).to(dev) };
+}
+
+void EscherTrainer::Reservoir::save(const std::string& path) const {
+    long n = (long)filled_;
+    torch::save(std::vector<torch::Tensor>{
+        feats_.slice(0, 0, n).clone(), targets_.slice(0, 0, n).clone(),
+        actions_.slice(0, 0, n).clone(), weights_.slice(0, 0, n).clone()}, path);
+}
+
+void EscherTrainer::Reservoir::load(const std::string& path) {
+    std::vector<torch::Tensor> v; torch::load(v, path);
+    long n = v[0].size(0);
+    feats_.slice(0, 0, n).copy_(v[0]);   targets_.slice(0, 0, n).copy_(v[1]);
+    actions_.slice(0, 0, n).copy_(v[2]); weights_.slice(0, 0, n).copy_(v[3]);
+    filled_ = (size_t)n; n_ = n;
+}
+
+float EscherTrainer::Reservoir::target_rms() const {
+    if (filled_ == 0) return 1.0f;
+    return std::max(1e-6f, targets_.slice(0, 0, (long)filled_)
+                              .pow(2).mean().sqrt().item<float>());
 }
 
 // ── construction ────────────────────────────────────────────────────────────
@@ -57,8 +114,8 @@ EscherTrainer::EscherTrainer(IPokerEnvironmentFactory& factory, EscherConfig cfg
         regret_->parameters(), torch::optim::AdamOptions(cfg_.lr));
     avg_opt_    = std::make_unique<torch::optim::Adam>(
         avg_->parameters(), torch::optim::AdamOptions(cfg_.lr));
-    avg_buf_    = std::make_unique<Reservoir>(cfg_.buf_cap, cfg_.seed + 7);
-    regret_buf_ = std::make_unique<Reservoir>(cfg_.buf_cap, cfg_.seed + 8);
+    avg_buf_    = std::make_unique<Reservoir>(cfg_.buf_cap, obs_dim_, A_, cfg_.seed + 7);
+    regret_buf_ = std::make_unique<Reservoir>(cfg_.buf_cap, obs_dim_, A_, cfg_.seed + 8);
 }
 
 // ── σ = RM⁺ on the regret net's actor logits, masked to legal ───────────────
@@ -255,7 +312,8 @@ void EscherTrainer::collect_regret(int traverser) {
                 // reservoir accumulates across iters, weighted by iteration.
                 for (int a = 0; a < A_; ++a)
                     if (mk[a] > 0.5f) td[a] = (float)(qd[a] - vbar);
-                regret_buf_->add({obs.clone(), tgt, -1, 0.0f, (float)iter_});
+                regret_buf_->add(obs.contiguous().data_ptr<float>(),
+                                 tgt.data_ptr<float>(), -1, (float)iter_);
             } else {
                 // my variant: neural RM⁺ target max(0, γ·cum(a) + r(a)).
                 for (int a = 0; a < A_; ++a)
@@ -275,42 +333,48 @@ void EscherTrainer::collect_regret(int traverser) {
 }
 
 void EscherTrainer::fit_regret() {
-    auto& data = cfg_.regret_buffer ? regret_buf_->data : regret_smp_;
-    if (data.empty()) return;
-    // PAPER (Deep CFR): REINIT the regret net each iteration and fit the whole
-    // reservoir, weighted by iteration (linear CFR) and globally normalised (RM
-    // is scale-invariant) so the net learns the iteration-weighted cumulative.
-    float scale = 1.0f;
     if (cfg_.regret_buffer) {
+        // PAPER (Deep CFR): REINIT the regret net, fit the whole reservoir
+        // (tensor-backed → fast index_select minibatches), iteration-weighted
+        // (linear CFR), globally normalised (RM is scale-invariant).
+        if (regret_buf_->size() == 0) return;
         const auto& pc = config::kPPOConfig;
         regret_ = ActorCritic(obs_dim_, A_, pc.hidden_dim, pc.num_layers,
                               pc.hist, pc.round_summary);
         regret_->to(device_);
         regret_opt_ = std::make_unique<torch::optim::Adam>(
             regret_->parameters(), torch::optim::AdamOptions(cfg_.lr));
-        double ss = 0.0; long cnt = 0;
-        for (auto& s : data) {
-            const float* td = s.target.data_ptr<float>();
-            for (int a = 0; a < A_; ++a) { ss += (double)td[a] * td[a]; ++cnt; }
+        float scale = regret_buf_->target_rms();
+        int B = std::min(cfg_.batch_size, regret_buf_->size());
+        for (int step = 0; step < cfg_.regret_steps; ++step) {
+            auto mb = regret_buf_->sample(B, rng_, device_);
+            auto Y = mb.target / scale;
+            auto W = mb.weight.unsqueeze(1);
+            regret_opt_->zero_grad();
+            auto loss = (W * (regret_->actor_logits(mb.feat) - Y).pow(2)).mean();
+            loss.backward();
+            regret_opt_->step();
+            if (step == cfg_.regret_steps - 1) {
+                last_reg_loss_ = loss.item<float>();
+                last_reg_mag_  = Y.abs().mean().item<float>();
+            }
         }
-        scale = (float)std::max(1e-6, std::sqrt(ss / std::max(1L, cnt)));
+        return;
     }
-    std::uniform_int_distribution<size_t> pick(0, data.size() - 1);
+    // neural-cumulative: warm net, per-iter samples (small → per-row is fine).
+    if (regret_smp_.empty()) return;
+    std::uniform_int_distribution<size_t> pick(0, regret_smp_.size() - 1);
     for (int step = 0; step < cfg_.regret_steps; ++step) {
-        int B = std::min<int>(cfg_.batch_size, (int)data.size());
+        int B = std::min<int>(cfg_.batch_size, (int)regret_smp_.size());
         auto X = torch::empty({B, obs_dim_});
         auto Y = torch::empty({B, A_});
-        auto W = torch::empty({B, 1});
         for (int b = 0; b < B; ++b) {
-            const auto& s = data[pick(rng_)];
-            X[b] = s.feat; Y[b] = s.target; W[b][0] = s.weight;
+            const auto& s = regret_smp_[pick(rng_)];
+            X[b] = s.feat; Y[b] = s.target;
         }
-        X = X.to(device_); Y = (Y / scale).to(device_); W = W.to(device_);
+        X = X.to(device_); Y = Y.to(device_);
         regret_opt_->zero_grad();
-        auto pred = regret_->actor_logits(X);
-        auto loss = cfg_.regret_buffer
-            ? (W * (pred - Y).pow(2)).mean()   // iteration-weighted (linear CFR)
-            : torch::mse_loss(pred, Y);
+        auto loss = torch::mse_loss(regret_->actor_logits(X), Y);
         loss.backward();
         regret_opt_->step();
         if (step == cfg_.regret_steps - 1) {
@@ -318,7 +382,7 @@ void EscherTrainer::fit_regret() {
             last_reg_mag_  = Y.abs().mean().item<float>();
         }
     }
-    if (!cfg_.regret_buffer) regret_smp_.clear();
+    regret_smp_.clear();
 }
 
 // ── average phase: classification on (infoset, a_taken) under current σ ─────
@@ -327,7 +391,7 @@ void EscherTrainer::collect_avg(long t) {
                    const torch::Tensor& mask, torch::Tensor lg, torch::Tensor q) {
         auto sig = sigma(regret_, lg, mask);
         int a = sample(sig, rng_);
-        avg_buf_->add({obs.clone(), {}, a, 0.0f, (float)t});
+        avg_buf_->add(obs.contiguous().data_ptr<float>(), nullptr, a, (float)t);
         return a;
     };
     auto finish = [&](int, float) {};
@@ -336,24 +400,14 @@ void EscherTrainer::collect_avg(long t) {
 }
 
 void EscherTrainer::fit_avg() {
-    auto& data = avg_buf_->data;
-    if (data.empty()) return;
-    std::uniform_int_distribution<size_t> pick(0, data.size() - 1);
+    if (avg_buf_->size() == 0) return;
+    int B = std::min(cfg_.batch_size, avg_buf_->size());
     for (int step = 0; step < cfg_.avg_steps; ++step) {
-        int B = std::min<int>(cfg_.batch_size, (int)data.size());
-        auto X = torch::empty({B, obs_dim_});
-        auto act_idx = torch::empty({B}, torch::kLong);
-        auto W = torch::empty({B});
-        for (int b = 0; b < B; ++b) {
-            const auto& s = data[pick(rng_)];
-            X[b] = s.feat; act_idx[b] = s.action; W[b] = s.weight;
-        }
-        X = X.to(device_); act_idx = act_idx.to(device_); W = W.to(device_);
+        auto mb = avg_buf_->sample(B, rng_, device_);
         avg_opt_->zero_grad();
-        auto logits = avg_->actor_logits(X);
-        auto logp = torch::log_softmax(logits, 1);
-        auto nll = -logp.gather(1, act_idx.unsqueeze(1)).squeeze(1);  // [B]
-        auto loss = (W * nll).mean();
+        auto logp = torch::log_softmax(avg_->actor_logits(mb.feat), 1);
+        auto nll = -logp.gather(1, mb.action.unsqueeze(1)).squeeze(1);  // [B]
+        auto loss = (mb.weight * nll).mean();
         loss.backward();
         avg_opt_->step();
     }
@@ -385,6 +439,8 @@ void EscherTrainer::save_checkpoint(int iter) {
     torch::save(value_,  cfg_.ckpt_dir + "/value.pt");
     torch::save(regret_, cfg_.ckpt_dir + "/regret.pt");
     torch::save(avg_,    cfg_.ckpt_dir + "/avg.pt");
+    if (cfg_.regret_buffer)  // the reservoir IS the cumulative-regret state
+        regret_buf_->save(cfg_.ckpt_dir + "/regret_buf.pt");
     std::ofstream(cfg_.ckpt_dir + "/iter.txt") << iter;
     std::printf("  [ckpt] saved iter %d -> %s\n", iter, cfg_.ckpt_dir.c_str());
 }
@@ -400,6 +456,9 @@ bool EscherTrainer::try_resume() {
     { torch::NoGradGuard ng;  // resync target net to the loaded value net
       auto s = value_->parameters(); auto d = value_target_->parameters();
       for (size_t i = 0; i < s.size(); ++i) d[i].copy_(s[i]); }
+    if (cfg_.regret_buffer &&
+        std::filesystem::exists(cfg_.ckpt_dir + "/regret_buf.pt"))
+        regret_buf_->load(cfg_.ckpt_dir + "/regret_buf.pt");
     std::ifstream(cfg_.ckpt_dir + "/iter.txt") >> resume_iter_;
     std::printf("  [resume] loaded checkpoint at iter %d\n", resume_iter_);
     return true;

@@ -63,7 +63,7 @@ struct EscherConfig {
     // Polyak target-net rate for the bootstrap value targets (deadly-triad
     // stabiliser): target ← τ·value + (1−τ)·target. 0 disables (use live net).
     float    value_tau     = 0.0f;
-    int      buf_cap       = 4'000'000;
+    int      buf_cap       = 1'000'000;
     int      avg_warmup    = 0;      // skip averaging the first N iters' σ (the
                                      // average is dragged by early off-Nash σ)
     int      eval_every    = 50;     // iterations between LBR evaluations
@@ -104,19 +104,37 @@ private:
     bool try_resume();   // loads the 3 nets + iter from cfg_.ckpt_dir if present
     int  resume_iter_ = 0;
 
-    // Reservoir buffers (feature rows kept on CPU; uploaded per-minibatch).
+    // Per-iteration sample (small, cleared each iter — value MC + neural-cum).
     struct Sample {
-        torch::Tensor feat;   // [obs_dim]   (full obs; heads slice as needed)
-        torch::Tensor target; // [A] regret  OR scalar (value)  OR unused
-        int64_t       action; // value/avg: taken action; regret: -1
-        float         z;      // value: MC return; else 0
-        float         weight; // iteration weight (linear)
+        torch::Tensor feat;   // [obs_dim]
+        torch::Tensor target; // [A]
+        int64_t       action;
+        float         z;
+        float         weight;
     };
-    struct Reservoir {
-        explicit Reservoir(size_t cap, uint64_t seed) : cap_(cap), rng_(seed) {}
-        void add(Sample s);
-        std::vector<Sample> data;
-        size_t cap_; long n_ = 0; std::mt19937_64 rng_;
+
+    // TENSOR-BACKED reservoir: features/targets/actions/weights are contiguous
+    // CPU tensors (capacity-preallocated), so minibatches are one fast
+    // index_select instead of a per-row tensor build — the difference between
+    // ~24s/iter and paper-scale step counts. Checkpointable (the buffer IS the
+    // cumulative-regret state in paper mode).
+    class Reservoir {
+    public:
+        Reservoir(size_t cap, int D, int A, uint64_t seed);
+        // feat:[D] target:[A] (target may be null) — raw CPU pointers (memcpy).
+        void add(const float* feat, const float* target, int64_t action, float w);
+        int   size() const { return static_cast<int>(filled_); }
+        float target_rms() const;   // global RMS of the regret targets (RM scale)
+        struct MB { torch::Tensor feat, target, action, weight; };  // on device
+        MB   sample(int B, std::mt19937& rng, torch::Device dev);
+        void save(const std::string& path) const;
+        void load(const std::string& path);
+    private:
+        size_t cap_, filled_ = 0;
+        int    D_, A_;
+        long   n_ = 0;
+        std::mt19937_64 rng_;
+        torch::Tensor feats_, targets_, actions_, weights_;
     };
 
     IPokerEnvironmentFactory&          factory_;
