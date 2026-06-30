@@ -473,6 +473,18 @@ ActorCriticImpl::forward(torch::Tensor obs) {
     return {logits, critic_raw};
 }
 
+torch::Tensor ActorCriticImpl::actor_logits(torch::Tensor obs) {
+    auto encoded = encode_history(obs);
+    return actor_->forward(build_trunk_input(obs, encoded));
+}
+
+torch::Tensor ActorCriticImpl::critic_values(torch::Tensor obs) {
+    auto encoded = encode_history(obs);
+    auto critic_enc = (encoded.defined() && critic_detaches_encoder())
+        ? encoded.detach() : encoded;
+    return critic_->forward(build_critic_input(obs, critic_enc));
+}
+
 torch::Tensor ActorCriticImpl::get_value(torch::Tensor obs) {
     // Unmasked expected value (tests/play); the masked bootstrap form is
     // get_state_value.

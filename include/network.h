@@ -143,6 +143,12 @@ public:
     // Logits unmasked — use get_action()/evaluate() for masking.
     std::pair<torch::Tensor, torch::Tensor> forward(torch::Tensor obs);
 
+    // Head-only forwards: run the shared encoder once + ONE head, skipping the
+    // other (~2× cheaper than forward when only one head is needed — the ESCHER
+    // trainer's regret/average nets use the actor, its value net the critic).
+    torch::Tensor actor_logits(torch::Tensor obs);    // [B, A]
+    torch::Tensor critic_values(torch::Tensor obs);   // [B, A] (Q) or [B, 1]
+
     // Expected state value with masking, for the trajectory-tail bootstrap.
     // VRPO: V̄(s)=Σ_a π(a|s)Q(s,a). Else: V(s). Returns [B].
     torch::Tensor get_state_value(torch::Tensor obs, torch::Tensor legal_mask);

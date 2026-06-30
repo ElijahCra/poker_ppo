@@ -121,6 +121,7 @@ private:
     std::vector<Sample>        value_smp_, regret_smp_;
     std::unique_ptr<Reservoir> avg_buf_;
     long iter_ = 0;
+    float last_val_loss_ = 0.f, last_reg_loss_ = 0.f, last_reg_mag_ = 0.f;
 };
 
 }  // namespace poker_ppo

@@ -128,8 +128,8 @@ static void run_rollout(IPokerEnvironmentFactory& factory, const BetConfig& bet,
         obs_b = obs_b.to(device);
         torch::Tensor lg, q;
         { torch::NoGradGuard ng;
-          lg = regret->forward(obs_b).first.to(torch::kCPU);
-          q  = value->forward(obs_b).second.to(torch::kCPU); }
+          lg = regret->actor_logits(obs_b).to(torch::kCPU);
+          q  = value->critic_values(obs_b).to(torch::kCPU); }
         for (size_t k = 0; k < idx.size(); ++k) {
             int i = idx[k];
             auto& s = slots[i];
@@ -188,11 +188,12 @@ void EscherTrainer::collect_and_train_value() {
         }
         X = X.to(device_); act_idx = act_idx.to(device_); y = y.to(device_);
         value_opt_->zero_grad();
-        auto qall = value_->forward(X).second;                       // [B, A]
+        auto qall = value_->critic_values(X);                        // [B, A]
         auto pred = qall.gather(1, act_idx.unsqueeze(1)).squeeze(1);  // Q(s,a)
         auto loss = torch::mse_loss(pred, y);
         loss.backward();
         value_opt_->step();
+        if (step == cfg_.value_steps - 1) last_val_loss_ = loss.item<float>();
     }
 }
 
@@ -240,10 +241,14 @@ void EscherTrainer::fit_regret() {
         }
         X = X.to(device_); Y = Y.to(device_);
         regret_opt_->zero_grad();
-        auto pred = regret_->forward(X).first;   // actor logits = cumulative regret
+        auto pred = regret_->actor_logits(X);    // actor logits = cumulative regret
         auto loss = torch::mse_loss(pred, Y);
         loss.backward();
         regret_opt_->step();
+        if (step == cfg_.regret_steps - 1) {
+            last_reg_loss_ = loss.item<float>();
+            last_reg_mag_  = Y.abs().mean().item<float>();  // cumulative-regret scale
+        }
     }
     regret_smp_.clear();
 }
@@ -277,7 +282,7 @@ void EscherTrainer::fit_avg() {
         }
         X = X.to(device_); act_idx = act_idx.to(device_); W = W.to(device_);
         avg_opt_->zero_grad();
-        auto logits = avg_->forward(X).first;
+        auto logits = avg_->actor_logits(X);
         auto logp = torch::log_softmax(logits, 1);
         auto nll = -logp.gather(1, act_idx.unsqueeze(1)).squeeze(1);  // [B]
         auto loss = (W * nll).mean();
@@ -304,19 +309,21 @@ void EscherTrainer::train() {
     std::printf("ESCHER HUNL: %d iters, envs=%d, value/regret/avg traj=%d/%d/%d\n",
                 cfg_.iterations, kRolloutEnvs, cfg_.value_traj, cfg_.regret_traj,
                 cfg_.avg_traj);
+    auto clk = [] { return std::chrono::steady_clock::now(); };
+    auto el = [](auto a, auto b) {
+        return std::chrono::duration<double, std::milli>(b - a).count(); };
     for (iter_ = 1; iter_ <= cfg_.iterations; ++iter_) {
-        auto t0 = std::chrono::steady_clock::now();
-        collect_and_train_value();      // MC value under current σ
-        collect_regret(0);              // traverser = seat 0
-        collect_regret(1);              // traverser = seat 1
-        fit_regret();                   // neural RM⁺ cumulative update
-        collect_avg(iter_);             // accumulate average-policy samples
-        fit_avg();
-        auto t1 = std::chrono::steady_clock::now();
-        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-        std::printf("  iter %4ld   %.0f ms   (value_smp=%zu regret_smp=%zu "
-                    "avg_buf=%zu)\n", iter_, ms, value_smp_.size(),
-                    regret_smp_.size(), avg_buf_->data.size());
+        auto t0 = clk(); collect_and_train_value();
+        auto t1 = clk(); collect_regret(0); collect_regret(1);
+        auto t2 = clk(); fit_regret();
+        auto t3 = clk(); collect_avg(iter_);
+        auto t4 = clk(); fit_avg();
+        auto t5 = clk();
+        std::printf("  iter %4ld  %.0fms [val %.0f reg-roll %.0f reg-fit %.0f "
+                    "avg-roll %.0f avg-fit %.0f]  vloss=%.3f rloss=%.4f "
+                    "rmag=%.3f\n", iter_, el(t0, t5), el(t0, t1), el(t1, t2),
+                    el(t2, t3), el(t3, t4), el(t4, t5), last_val_loss_,
+                    last_reg_loss_, last_reg_mag_);
         std::fflush(stdout);
         if (iter_ % cfg_.eval_every == 0 || iter_ == cfg_.iterations)
             run_lbr((int)iter_);
