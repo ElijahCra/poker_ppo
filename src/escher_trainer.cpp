@@ -21,7 +21,7 @@
 namespace poker_ppo {
 
 namespace {
-constexpr int kRolloutEnvs = 512;   // parallel envs for batched inference
+// parallel rollout envs: EscherConfig::rollout_envs (ESCHER_ENVS)
 
 // RAII bf16 autocast for the SGD fits: matmuls run in bf16 (tensor cores +
 // half the activation bandwidth) while grads/params stay fp32 — bf16 keeps
@@ -372,9 +372,9 @@ void EscherTrainer::collect_and_train_value() {
     // shorter); overflow nodes are dropped.
     constexpr int kMaxNodes = 64;
     struct Node { int64_t action; int player; float boot; };
-    std::vector<float> stage_feat((size_t)kRolloutEnvs * kMaxNodes * obs_dim_);
-    std::vector<Node>  stage_node((size_t)kRolloutEnvs * kMaxNodes);
-    std::vector<int>   n_stage(kRolloutEnvs, 0);
+    std::vector<float> stage_feat((size_t)cfg_.rollout_envs * kMaxNodes * obs_dim_);
+    std::vector<Node>  stage_node((size_t)cfg_.rollout_envs * kMaxNodes);
+    std::vector<int>   n_stage(cfg_.rollout_envs, 0);
 
     auto act = [&](int i, int player, const float* obs, const float* mk,
                    const float* lg, const float* qd, const float* /*cum*/) {
@@ -432,7 +432,7 @@ void EscherTrainer::collect_and_train_value() {
     // bootstrap V̄(child) reads the target net (τ>0) for deadly-triad stability.
     ActorCritic& vnet = (cfg_.value_tau > 0.f) ? value_target_ : value_;
     ActorCritic& snet = (cfg_.regret_ema > 0.f) ? regret_ema_ : regret_;  // smoothed σ
-    run_rollout(factory_, bet_cfg_, obs_dim_, A_, device_, kRolloutEnvs,
+    run_rollout(factory_, bet_cfg_, obs_dim_, A_, device_, cfg_.rollout_envs,
                 cfg_.value_traj, snet, vnet, need_q, act, finish);
 
     // train Q(obs, a_taken) -> signed terminal utility (acting-player frame).
@@ -487,7 +487,7 @@ void EscherTrainer::collect_regret(int traverser) {
     // Play the smoothed σ (regret_ema_) but feed the TRUE regret_ as cum_net so
     // the neural-cum cumulative keeps accumulating unsmoothed.
     ActorCritic& snet = (cfg_.regret_ema > 0.f) ? regret_ema_ : regret_;
-    run_rollout(factory_, bet_cfg_, obs_dim_, A_, device_, kRolloutEnvs,
+    run_rollout(factory_, bet_cfg_, obs_dim_, A_, device_, cfg_.rollout_envs,
                 cfg_.regret_traj, snet, value_, /*need_q=*/true, act, finish,
                 cfg_.regret_ema > 0.f ? &regret_ : nullptr);
 }
@@ -547,7 +547,7 @@ void EscherTrainer::collect_avg(long t) {
     };
     auto finish = [&](int, float) {};
     ActorCritic& snet = (cfg_.regret_ema > 0.f) ? regret_ema_ : regret_;  // smoothed σ
-    run_rollout(factory_, bet_cfg_, obs_dim_, A_, device_, kRolloutEnvs,
+    run_rollout(factory_, bet_cfg_, obs_dim_, A_, device_, cfg_.rollout_envs,
                 cfg_.avg_traj, snet, value_, need_q, act, finish);
 }
 
@@ -790,7 +790,7 @@ bool EscherTrainer::try_resume() {
 // ── outer ESCHER loop ───────────────────────────────────────────────────────
 void EscherTrainer::train() {
     std::printf("ESCHER HUNL: %d iters, envs=%d, value/regret/avg traj=%d/%d/%d\n",
-                cfg_.iterations, kRolloutEnvs, cfg_.value_traj, cfg_.regret_traj,
+                cfg_.iterations, cfg_.rollout_envs, cfg_.value_traj, cfg_.regret_traj,
                 cfg_.avg_traj);
     std::printf("  value: lam=%.2f tau=%.3f eps=%.3f buf_cap=%d | regret: %s gamma=%.3f ema=%.3f pred=%.2f\n",
                 cfg_.value_lambda, cfg_.value_tau, cfg_.value_eps, cfg_.value_buf_cap,

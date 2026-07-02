@@ -49,6 +49,11 @@ struct EscherConfig {
     int      regret_steps  = 1500;
     int      avg_steps      = 1500;
     int      batch_size    = 2048;
+    // Parallel rollout envs. The rollout alternates a batched inference with
+    // CPU env stepping; more envs = fewer, fatter inference batches (the
+    // forwards at 512 rows are launch-bound on a 3060 Ti). Waste tail: envs
+    // mid-hand when n_traj is reached are discarded, so keep envs ≪ traj.
+    int      rollout_envs  = 512;
     float    lr            = 1e-3f;
     // neural RM⁺ cumulative regret discount (1.0 = pure RM⁺/CFR+; <1 = DCFR)
     float    ncum_gamma    = 1.0f;

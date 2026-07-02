@@ -170,6 +170,7 @@ int main(int argc, char** argv) {
         ecfg.regret_steps = envi("ESCHER_REG_STEPS", ecfg.regret_steps);
         ecfg.avg_steps    = envi("ESCHER_AVG_STEPS", ecfg.avg_steps);
         ecfg.batch_size   = envi("ESCHER_BATCH", ecfg.batch_size);
+        ecfg.rollout_envs = envi("ESCHER_ENVS", ecfg.rollout_envs);
         ecfg.eval_every   = envi("ESCHER_EVAL_EVERY", ecfg.eval_every);
         ecfg.lbr_hands    = envi("ESCHER_LBR_HANDS", ecfg.lbr_hands);
         ecfg.ckpt_every   = envi("ESCHER_CKPT_EVERY", ecfg.ckpt_every);
