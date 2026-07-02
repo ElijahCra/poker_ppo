@@ -146,6 +146,9 @@ class ESCHERPaper:
         self.tab_legal = {}
         self.val_traj = 2400   # current-π MC rollouts/iter (value net is data-hungry)
         self.val_steps = 600
+        self.reg_steps = 400   # Deep-CFR regret-fit budget (paper: ~5000 @ 2048)
+        self.reg_mb = 512
+        self.rm_plus = False   # paper uses plain RM; RM⁺ is a researched lever
         # action-conditioned Q only trains the taken action per sample; under
         # pure π, rarely-played actions never get a target. Mix in exploration
         # so every action gets MC coverage (slight bias toward V^{π_ε}).
@@ -268,9 +271,10 @@ class ESCHERPaper:
                     a = self._sample(legal, self.sigma(h, cards, p, legal))
                 h = g.step_history(h, a)
 
-    def fit_regret(self, player, steps=400, lr=3e-3, mb=512):
+    def fit_regret(self, player, lr=3e-3):
         # Deep CFR: REINIT, fit the reservoir (linear-weighted = cumulative),
         # global-normalised (RM is scale-invariant).
+        steps, mb = self.reg_steps, self.reg_mb
         self.regret_net[player] = MLP(self.feat.inf_dim, self.A, self.hidden).to(DEV)
         data = self.reg_buf[player].data
         if not data:

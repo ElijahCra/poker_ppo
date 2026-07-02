@@ -506,6 +506,8 @@ int cmd_lbr_eval(IPokerEnvironmentFactory& factory,
 
     LBRConfig cfg;
     cfg.seed = 0x1B20BEEFull;  // fixed for reproducibility
+    if (const char* e = std::getenv("POKER_PPO_LBR_SEED"))  // vary → measure noise
+        cfg.seed = std::strtoull(e, nullptr, 10);
     if (const char* e = std::getenv("POKER_PPO_LBR_HANDS")) {
         const int v = std::atoi(e);
         if (v > 0) cfg.num_hands = v;

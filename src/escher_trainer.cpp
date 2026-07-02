@@ -3,12 +3,17 @@
 #include "config.h"
 #include "lbr.h"
 
+#include <ATen/autocast_mode.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <ATen/cuda/CUDAGraph.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <torch/torch.h>
 
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -17,6 +22,39 @@ namespace poker_ppo {
 
 namespace {
 constexpr int kRolloutEnvs = 512;   // parallel envs for batched inference
+
+// RAII bf16 autocast for the SGD fits: matmuls run in bf16 (tensor cores +
+// half the activation bandwidth) while grads/params stay fp32 — bf16 keeps
+// fp32's exponent range so no GradScaler is needed. Only the forward+loss is
+// wrapped; backward/step run in fp32. POKER_PPO_ESCHER_NO_AMP=1 disables.
+struct AutocastBF16 {
+    bool on_;
+    explicit AutocastBF16(torch::Device dev)
+        : on_(dev.is_cuda() && std::getenv("POKER_PPO_ESCHER_NO_AMP") == nullptr) {
+        if (!on_) return;
+        at::autocast::set_autocast_enabled(at::kCUDA, true);
+        at::autocast::set_autocast_dtype(at::kCUDA, at::kBFloat16);
+    }
+    ~AutocastBF16() {
+        if (!on_) return;
+        at::autocast::set_autocast_enabled(at::kCUDA, false);
+        at::autocast::clear_cache();
+    }
+};
+
+// Params of `net` excluding the head it never trains (regret/avg use only the
+// actor via actor_logits, value only the critic via critic_values) + the shared
+// encoder. ForeachAdam requires EVERY managed param to receive a gradient (stock
+// Adam silently skips grad-less ones); the unused head would break its step.
+std::vector<torch::Tensor> params_except(ActorCritic& net, const char* prefix) {
+    std::vector<torch::Tensor> out;
+    for (const auto& item : net->named_parameters()) {
+        const std::string& k = item.key();
+        if (k.rfind(prefix, 0) == 0) continue;   // name starts with prefix → skip
+        out.push_back(item.value());
+    }
+    return out;
+}
 }
 
 // ── tensor-backed Reservoir ─────────────────────────────────────────────────
@@ -64,6 +102,15 @@ EscherTrainer::Reservoir::sample(int B, std::mt19937& rng, torch::Device dev) {
              weights_.index_select(0, idx).to(dev) };
 }
 
+EscherTrainer::Reservoir::MB
+EscherTrainer::Reservoir::upload(torch::Device dev) const {
+    long n = (long)filled_;
+    return { feats_.slice(0, 0, n).to(dev),
+             targets_.slice(0, 0, n).to(dev),
+             actions_.slice(0, 0, n).to(dev),
+             weights_.slice(0, 0, n).to(dev) };
+}
+
 void EscherTrainer::Reservoir::save(const std::string& path) const {
     long n = (long)filled_;
     torch::save(std::vector<torch::Tensor>{
@@ -85,6 +132,31 @@ float EscherTrainer::Reservoir::target_rms() const {
                               .pow(2).mean().sqrt().item<float>());
 }
 
+// ── CUDA-graphed fit step state ─────────────────────────────────────────────
+// One captured fwd+bwd graph per net (value/regret/avg). Static input tensors
+// are refilled by on-device index_select each step; replay() recomputes loss
+// + grads into stable tensors that ForeachAdam::step(grads) consumes. Same
+// recipe as ppo.cpp's ensure_update_graph. Paper-mode's per-iter regret
+// reinit stays graph-safe because reinit_regret_inplace() copies fresh
+// weights into the SAME parameter tensors the capture recorded.
+struct EscherTrainer::FitGraphs {
+    struct One {
+        int  B = 0;
+        bool ready = false, failed = false;
+        torch::Tensor feat, target, action, weight;   // static inputs (device)
+        torch::Tensor loss;                            // static output scalar
+        std::vector<torch::Tensor> grads;              // static grad outputs
+        std::unique_ptr<at::cuda::CUDAGraph> graph;
+    } value, regret, avg;
+    One& of(FitKind k) {
+        switch (k) {
+        case FitKind::Value:  return value;
+        case FitKind::Regret: return regret;
+        default:              return avg;
+        }
+    }
+};
+
 // ── construction ────────────────────────────────────────────────────────────
 EscherTrainer::EscherTrainer(IPokerEnvironmentFactory& factory, EscherConfig cfg,
                              torch::Device device)
@@ -101,34 +173,75 @@ EscherTrainer::EscherTrainer(IPokerEnvironmentFactory& factory, EscherConfig cfg
         ac->to(device_);
         return ac;
     };
+    // NOTE order: value_/regret_/avg_ FIRST (identical init RNG draws to the
+    // pre-value_target_ code at 5c29560), then the auxiliary nets — so adding
+    // value_target_/regret_ema_ does NOT shift the core nets' init basin. (The
+    // earlier ordering silently moved the σ oscillation into a worse basin.)
     value_  = make();
-    value_target_ = make();
     regret_ = make();
     avg_    = make();
-    { torch::NoGradGuard ng;  // value_target_ starts == value_
+    value_target_ = make();
+    regret_ema_ = make();
+    { torch::NoGradGuard ng;  // value_target_ starts == value_; ema starts == regret_
       auto s = value_->parameters(); auto d = value_target_->parameters();
-      for (size_t i = 0; i < s.size(); ++i) d[i].copy_(s[i]); }
-    value_opt_  = std::make_unique<torch::optim::Adam>(
-        value_->parameters(), torch::optim::AdamOptions(cfg_.lr));
-    regret_opt_ = std::make_unique<torch::optim::Adam>(
-        regret_->parameters(), torch::optim::AdamOptions(cfg_.lr));
-    avg_opt_    = std::make_unique<torch::optim::Adam>(
-        avg_->parameters(), torch::optim::AdamOptions(cfg_.lr));
+      for (size_t i = 0; i < s.size(); ++i) d[i].copy_(s[i]);
+      auto rs = regret_->parameters(); auto rd = regret_ema_->parameters();
+      for (size_t i = 0; i < rs.size(); ++i) rd[i].copy_(rs[i]);
+      auto rb = regret_->buffers(); auto rdb = regret_ema_->buffers();
+      for (size_t i = 0; i < rb.size(); ++i) rdb[i].copy_(rb[i]); }
+    value_opt_  = std::make_unique<ForeachAdam>(params_except(value_,  "actor."),  cfg_.lr);
+    regret_opt_ = std::make_unique<ForeachAdam>(params_except(regret_, "critic."), cfg_.lr);
+    avg_opt_    = std::make_unique<ForeachAdam>(params_except(avg_,    "critic."), cfg_.lr);
     avg_buf_    = std::make_unique<Reservoir>(cfg_.buf_cap, obs_dim_, A_, cfg_.seed + 7);
     regret_buf_ = std::make_unique<Reservoir>(cfg_.buf_cap, obs_dim_, A_, cfg_.seed + 8);
+    if (cfg_.value_buf_cap > 0)
+        value_buf_ = std::make_unique<Reservoir>(cfg_.value_buf_cap, obs_dim_, A_,
+                                                 cfg_.seed + 9);
+    // Per-iteration staging (cleared each iter). Caps sized ~16 decision
+    // nodes/trajectory; overflow reservoir-subsamples uniformly (benign).
+    if (cfg_.value_buf_cap <= 0)
+        value_iter_buf_ = std::make_unique<Reservoir>(
+            std::max(1 << 16, cfg_.value_traj * 16), obs_dim_, A_, cfg_.seed + 10);
+    if (!cfg_.regret_buffer)
+        regret_iter_buf_ = std::make_unique<Reservoir>(
+            std::max(1 << 16, cfg_.regret_traj * 16), obs_dim_, A_, cfg_.seed + 11);
+    graphs_ = std::make_unique<FitGraphs>();
 }
 
+EscherTrainer::~EscherTrainer() = default;
+
 // ── σ = RM⁺ on the regret net's actor logits, masked to legal ───────────────
-std::vector<float> EscherTrainer::sigma(ActorCritic& net,
-                                        const torch::Tensor& logits_row,
-                                        const torch::Tensor& mask_row) {
-    // logits_row, mask_row are CPU [A]
+std::vector<float> EscherTrainer::sigma(const float* lg, const float* mk) {
+    // lg, mk are CPU rows [A]
     std::vector<float> p(A_, 0.0f);
-    const float* lg = logits_row.data_ptr<float>();
-    const float* mk = mask_row.data_ptr<float>();
     double s = 0.0;
     for (int a = 0; a < A_; ++a)
         if (mk[a] > 0.5f) { float v = lg[a] > 0.f ? lg[a] : 0.f; p[a] = v; s += v; }
+    if (s > 1e-12) { for (int a = 0; a < A_; ++a) p[a] /= static_cast<float>(s); }
+    else {
+        int n = 0; for (int a = 0; a < A_; ++a) if (mk[a] > 0.5f) ++n;
+        for (int a = 0; a < A_; ++a) p[a] = (mk[a] > 0.5f) ? 1.0f / n : 0.0f;
+    }
+    return p;
+}
+
+// ── Predictive/Optimistic RM⁺: σ = RM⁺(cum + η·(Q − V̄_base)) ────────────────
+// V̄_base = Σ σ_base·Q with σ_base = RM⁺(cum). The current instantaneous regret
+// Q−V̄_base is an optimistic prediction of the next regret; adding it to the
+// cumulative before RM⁺ is exactly one step of lookahead (η=1 = full step).
+std::vector<float> EscherTrainer::sigma_pred(const float* lg, const float* qd,
+                                             const float* mk, float eta) {
+    auto base = sigma(lg, mk);   // σ_base = RM⁺(cum)
+    double vbar = 0.0;
+    for (int a = 0; a < A_; ++a) if (mk[a] > 0.5f) vbar += base[a] * qd[a];
+    std::vector<float> p(A_, 0.0f);
+    double s = 0.0;
+    for (int a = 0; a < A_; ++a)
+        if (mk[a] > 0.5f) {                          // RM⁺(cum + η·(Q − V̄))
+            double pl = static_cast<double>(lg[a]) + eta * (qd[a] - vbar);
+            double v = pl > 0.0 ? pl : 0.0;
+            p[a] = static_cast<float>(v); s += v;
+        }
     if (s > 1e-12) { for (int a = 0; a < A_; ++a) p[a] /= static_cast<float>(s); }
     else {
         int n = 0; for (int a = 0; a < A_; ++a) if (mk[a] > 0.5f) ++n;
@@ -145,8 +258,7 @@ int EscherTrainer::sample(const std::vector<float>& probs, std::mt19937& rng) {
     return last;
 }
 
-int EscherTrainer::sample_uniform(const torch::Tensor& mask_row, std::mt19937& rng) {
-    const float* mk = mask_row.data_ptr<float>();
+int EscherTrainer::sample_uniform(const float* mk, std::mt19937& rng) {
     std::vector<int> legal;
     for (int a = 0; a < A_; ++a) if (mk[a] > 0.5f) legal.push_back(a);
     std::uniform_int_distribution<size_t> d(0, legal.size() - 1);
@@ -155,12 +267,19 @@ int EscherTrainer::sample_uniform(const torch::Tensor& mask_row, std::mt19937& r
 
 // ── batched rollout engine ──────────────────────────────────────────────────
 // Runs kRolloutEnvs envs until `n_traj` terminations. Each step: batch the
-// acting obs, forward regret_ (σ) and value_ (Q), then per-env `act(...)`
-// chooses the action and records; `finish(i, z_p0)` fires on terminal.
+// acting obs, forward regret_ (σ) and — only when a consumer needs Q —
+// value_, then per-env `act(...)` chooses the action and records;
+// `finish(i, z_p0)` fires on terminal.
+//
+// Each env's obs/mask lives in row i of one contiguous CPU tensor pair
+// (written in place by step_into/reset_into), so batching is one
+// index_select instead of per-row tensor assignments, and the hot loop
+// hands raw row POINTERS to the callbacks — no per-row tensor views.
+// act(i, player, obs_row, mask_row, lg_row, q_row, cum_row); q_row/cum_row
+// are nullptr when that forward is skipped.
 namespace {
 struct EnvSlot {
     std::unique_ptr<IPokerEnvironment> env;
-    torch::Tensor obs, mask;   // current decision node (CPU [obs_dim]/[A])
     int player = 0;
     float z = 0.0f;            // accumulated P0-frame reward this trajectory
     bool live = false;
@@ -171,44 +290,60 @@ template <class Act, class Finish>
 static void run_rollout(IPokerEnvironmentFactory& factory, const BetConfig& bet,
                         int obs_dim, int A, torch::Device device, int n_envs,
                         int n_traj, ActorCritic& regret, ActorCritic& value,
-                        Act&& act, Finish&& finish) {
+                        bool need_q, Act&& act, Finish&& finish,
+                        ActorCritic* cum_net = nullptr) {
+    auto opts = torch::TensorOptions().dtype(torch::kFloat);
+    auto obs_all  = torch::empty({n_envs, obs_dim}, opts);
+    auto mask_all = torch::empty({n_envs, A}, opts);
+    float* ob = obs_all.data_ptr<float>();
+    float* mb = mask_all.data_ptr<float>();
     std::vector<EnvSlot> slots(n_envs);
-    for (auto& s : slots) {
+    for (int i = 0; i < n_envs; ++i) {
+        auto& s = slots[i];
         s.env = factory.create(bet);
-        auto r = s.env->reset();
-        s.obs = r.observation; s.mask = r.legal_action_mask;
+        s.env->reset_into(ob + (size_t)i * obs_dim, mb + (size_t)i * A);
         s.player = s.env->current_player(); s.z = 0.f; s.live = true;
     }
     int finished = 0;
-    auto opts = torch::TensorOptions().dtype(torch::kFloat);
+    auto idx_t = torch::empty({n_envs}, torch::kLong);
     while (finished < n_traj) {
-        // batch obs of all live slots
-        std::vector<int> idx;
-        idx.reserve(n_envs);
-        for (int i = 0; i < n_envs; ++i) if (slots[i].live) idx.push_back(i);
-        if (idx.empty()) break;
-        auto obs_b = torch::empty({(long)idx.size(), obs_dim}, opts);
-        for (size_t k = 0; k < idx.size(); ++k) obs_b[k] = slots[idx[k]].obs;
-        obs_b = obs_b.to(device);
-        torch::Tensor lg, q;
+        long* ip = idx_t.data_ptr<long>();
+        int n_live = 0;
+        for (int i = 0; i < n_envs; ++i) if (slots[i].live) ip[n_live++] = i;
+        if (n_live == 0) break;
+        torch::Tensor obs_b =
+            (n_live == n_envs)
+                ? obs_all.to(device)
+                : obs_all.index_select(0, idx_t.slice(0, 0, n_live)).to(device);
+        torch::Tensor lg, q, cg;
         { torch::NoGradGuard ng;
-          lg = regret->actor_logits(obs_b).to(torch::kCPU);
-          q  = value->critic_values(obs_b).to(torch::kCPU); }
-        for (size_t k = 0; k < idx.size(); ++k) {
-            int i = idx[k];
+          lg = regret->actor_logits(obs_b).to(torch::kCPU).contiguous();
+          if (need_q)
+              q = value->critic_values(obs_b).to(torch::kCPU).contiguous();
+          if (cum_net)
+              cg = (*cum_net)->actor_logits(obs_b).to(torch::kCPU).contiguous(); }
+        const float* lgp = lg.data_ptr<float>();
+        const float* qp  = q.defined()  ? q.data_ptr<float>()  : nullptr;
+        const float* cgp = cg.defined() ? cg.data_ptr<float>() : nullptr;
+        for (int k = 0; k < n_live; ++k) {
+            int i = (int)ip[k];
             auto& s = slots[i];
-            int a = act(i, s.player, s.obs, s.mask, lg[k], q[k]);
-            auto r = s.env->step(a);
+            int a = act(i, s.player,
+                        ob + (size_t)i * obs_dim, mb + (size_t)i * A,
+                        lgp + (size_t)k * A,
+                        qp  ? qp  + (size_t)k * A : nullptr,
+                        cgp ? cgp + (size_t)k * A : nullptr);
+            auto r = s.env->step_into(a, ob + (size_t)i * obs_dim,
+                                      mb + (size_t)i * A);
             s.z += r.reward;
             if (r.done) {
                 finish(i, s.z);
                 ++finished;
                 if (finished >= n_traj) { s.live = false; continue; }
-                auto rr = s.env->reset();
-                s.obs = rr.observation; s.mask = rr.legal_action_mask;
+                s.env->reset_into(ob + (size_t)i * obs_dim,
+                                  mb + (size_t)i * A);
                 s.player = s.env->current_player(); s.z = 0.f;
             } else {
-                s.obs = r.observation; s.mask = r.legal_action_mask;
                 s.player = s.env->current_player();
             }
         }
@@ -224,68 +359,88 @@ static void run_rollout(IPokerEnvironmentFactory& factory, const BetConfig& bet,
 //     because V̄(child) reads the value net at the child, it covers actions the
 //     MC value never sampled.
 void EscherTrainer::collect_and_train_value() {
-    value_smp_.clear();
     const float lam = cfg_.value_lambda;
-    // full path per env (for the MC anchor); each node also gets its bootstrap
-    // V̄(child) stashed in .z during traversal, then mixed at finish.
-    std::vector<std::vector<std::pair<size_t, int>>> pending(kRolloutEnvs);
+    // Q is only consumed here when the bootstrap or predictive σ needs it —
+    // pure-ESCHER (λ=1, no predictive) skips the value forward entirely.
+    const bool need_q = lam < 1.0f || cfg_.predictive > 0.f;
+    Reservoir& vbuf = value_buf_ ? *value_buf_ : *value_iter_buf_;
+    if (!value_buf_) value_iter_buf_->clear();
 
-    auto act = [&](int i, int player, const torch::Tensor& obs,
-                   const torch::Tensor& mask, torch::Tensor lg, torch::Tensor q) {
-        auto sig = sigma(regret_, lg, mask);
-        if (lam < 1.0f && !pending[i].empty()) {
+    // Per-env trajectory staging: nodes are held (feature row + action/player/
+    // boot) until the trajectory terminates and the MC anchor z is known, then
+    // flushed into the reservoir. Bounded at kMaxNodes (HUNL hands are far
+    // shorter); overflow nodes are dropped.
+    constexpr int kMaxNodes = 64;
+    struct Node { int64_t action; int player; float boot; };
+    std::vector<float> stage_feat((size_t)kRolloutEnvs * kMaxNodes * obs_dim_);
+    std::vector<Node>  stage_node((size_t)kRolloutEnvs * kMaxNodes);
+    std::vector<int>   n_stage(kRolloutEnvs, 0);
+
+    auto act = [&](int i, int player, const float* obs, const float* mk,
+                   const float* lg, const float* qd, const float* /*cum*/) {
+        auto sig = cfg_.predictive > 0.f
+                       ? sigma_pred(lg, qd, mk, cfg_.predictive)
+                       : sigma(lg, mk);
+        if (lam < 1.0f && n_stage[i] > 0) {
             // V̄(this node) = bootstrap target of the PREVIOUS action (frame-
             // flipped if the player changed).
-            const float* qd = q.data_ptr<float>();
             double vbar = 0.0;
             for (int a = 0; a < A_; ++a) vbar += sig[a] * qd[a];
-            auto [pidx, pp] = pending[i].back();
-            value_smp_[pidx].z = (float)(pp == player ? vbar : -vbar);
+            Node& prev = stage_node[(size_t)i * kMaxNodes + n_stage[i] - 1];
+            prev.boot = (float)(prev.player == player ? vbar : -vbar);
         }
-        int a = sample(sig, rng_);
-        size_t si = value_smp_.size();
-        value_smp_.push_back({obs.clone(), {}, a, 0.0f, 1.0f});
-        pending[i].push_back({si, player});
+        int a;
+        if (cfg_.value_eps > 0.f) {
+            // ε-uniform exploration for the SAMPLED action only (coverage);
+            // the bootstrap V̄ above still uses the on-policy σ, so only Q's
+            // estimated continuation carries the O(ε) bias, not the regret's
+            // target weights.
+            std::vector<float> samp = sig;
+            int nl = 0; for (int j = 0; j < A_; ++j) if (mk[j] > 0.5f) ++nl;
+            const float e = cfg_.value_eps;
+            for (int j = 0; j < A_; ++j)
+                if (mk[j] > 0.5f) samp[j] = (1.f - e) * sig[j] + e / nl;
+            a = sample(samp, rng_);
+        } else {
+            a = sample(sig, rng_);
+        }
+        if (n_stage[i] < kMaxNodes) {
+            int k = n_stage[i]++;
+            std::memcpy(&stage_feat[((size_t)i * kMaxNodes + k) * obs_dim_],
+                        obs, obs_dim_ * sizeof(float));
+            stage_node[(size_t)i * kMaxNodes + k] = {a, player, 0.0f};
+        }
         return a;
     };
+    std::vector<float> vtgt(A_, 0.f);   // scalar z parked at index 0 for the buf
     auto finish = [&](int i, float z_p0) {
-        if (lam < 1.0f && !pending[i].empty()) {
-            auto [lidx, lp] = pending[i].back();  // last node's child is terminal
-            value_smp_[lidx].z = (lp == 0) ? z_p0 : -z_p0;
+        int n = n_stage[i];
+        if (lam < 1.0f && n > 0) {       // last node's child is terminal
+            Node& last = stage_node[(size_t)i * kMaxNodes + n - 1];
+            last.boot = (last.player == 0) ? z_p0 : -z_p0;
         }
-        for (auto& [idx, p] : pending[i]) {
-            float mc = (p == 0) ? z_p0 : -z_p0;            // acting-player frame
-            float boot = value_smp_[idx].z;                // V̄(child), or 0 if λ=1
-            value_smp_[idx].z = lam * mc + (1.0f - lam) * boot;
+        for (int k = 0; k < n; ++k) {
+            const Node& nd = stage_node[(size_t)i * kMaxNodes + k];
+            float mc = (nd.player == 0) ? z_p0 : -z_p0;    // acting-player frame
+            vtgt[0] = lam * mc + (1.0f - lam) * nd.boot;
+            vbuf.add(&stage_feat[((size_t)i * kMaxNodes + k) * obs_dim_],
+                     vtgt.data(), nd.action,
+                     value_buf_ ? (float)iter_ : 1.0f);    // recency weight
         }
-        pending[i].clear();
+        n_stage[i] = 0;
     };
     // bootstrap V̄(child) reads the target net (τ>0) for deadly-triad stability.
     ActorCritic& vnet = (cfg_.value_tau > 0.f) ? value_target_ : value_;
+    ActorCritic& snet = (cfg_.regret_ema > 0.f) ? regret_ema_ : regret_;  // smoothed σ
     run_rollout(factory_, bet_cfg_, obs_dim_, A_, device_, kRolloutEnvs,
-                cfg_.value_traj, regret_, vnet, act, finish);
+                cfg_.value_traj, snet, vnet, need_q, act, finish);
 
-    // train Q(obs, a_taken) -> signed terminal utility
-    if (value_smp_.empty()) return;
-    std::uniform_int_distribution<size_t> pick(0, value_smp_.size() - 1);
-    for (int step = 0; step < cfg_.value_steps; ++step) {
-        int B = std::min<int>(cfg_.batch_size, (int)value_smp_.size());
-        auto X = torch::empty({B, obs_dim_});
-        auto act_idx = torch::empty({B}, torch::kLong);
-        auto y = torch::empty({B});
-        for (int b = 0; b < B; ++b) {
-            const auto& s = value_smp_[pick(rng_)];
-            X[b] = s.feat; act_idx[b] = s.action; y[b] = s.z;
-        }
-        X = X.to(device_); act_idx = act_idx.to(device_); y = y.to(device_);
-        value_opt_->zero_grad();
-        auto qall = value_->critic_values(X);                        // [B, A]
-        auto pred = qall.gather(1, act_idx.unsqueeze(1)).squeeze(1);  // Q(s,a)
-        auto loss = torch::mse_loss(pred, y);
-        loss.backward();
-        value_opt_->step();
-        if (step == cfg_.value_steps - 1) last_val_loss_ = loss.item<float>();
-    }
+    // train Q(obs, a_taken) -> signed terminal utility (acting-player frame).
+    // value_buf_ path: reservoir across iters, recency-weighted (~window× the
+    // data). Else: this iter's samples only (weights ≡ 1).
+    last_val_loss_ = run_fit(FitKind::Value, value_, *value_opt_, vbuf,
+                             cfg_.value_steps, /*scale_by_rms=*/false);
+
     if (cfg_.value_tau > 0.f) {  // Polyak: target ← τ·value + (1−τ)·target
         torch::NoGradGuard ng;
         auto s = value_->parameters(); auto d = value_target_->parameters();
@@ -296,121 +451,286 @@ void EscherTrainer::collect_and_train_value() {
 
 // ── regret phase: fixed sampler (traverser ~ uniform, opp ~ σ), value-fn Q ──
 void EscherTrainer::collect_regret(int traverser) {
-    auto act = [&](int i, int player, const torch::Tensor& obs,
-                   const torch::Tensor& mask, torch::Tensor lg, torch::Tensor q) {
-        auto sig = sigma(regret_, lg, mask);
+    std::vector<float> tgt(A_);          // reused target row (no per-node alloc)
+    auto act = [&](int i, int player, const float* obs, const float* mk,
+                   const float* lg, const float* qd, const float* cum_row) {
+        auto sig = cfg_.predictive > 0.f
+                       ? sigma_pred(lg, qd, mk, cfg_.predictive)
+                       : sigma(lg, mk);
         if (player == traverser) {
-            const float* qd = q.data_ptr<float>();
-            const float* mk = mask.data_ptr<float>();
-            const float* cum = lg.data_ptr<float>();  // regret net output
+            // cum = TRUE cumulative (regret_); lg may be the smoothed EMA σ-net,
+            // so take cum from cum_row when the EMA path supplies it.
+            const float* cum = cum_row ? cum_row : lg;
             double vbar = 0.0;
             for (int a = 0; a < A_; ++a) if (mk[a] > 0.5f) vbar += sig[a] * qd[a];
-            auto tgt = torch::zeros({A_});
-            float* td = tgt.data_ptr<float>();
+            std::fill(tgt.begin(), tgt.end(), 0.0f);
             if (cfg_.regret_buffer) {
                 // PAPER: store the RAW instantaneous regret r(a)=Q(a)−V̄; the
                 // reservoir accumulates across iters, weighted by iteration.
                 for (int a = 0; a < A_; ++a)
-                    if (mk[a] > 0.5f) td[a] = (float)(qd[a] - vbar);
-                regret_buf_->add(obs.contiguous().data_ptr<float>(),
-                                 tgt.data_ptr<float>(), -1, (float)iter_);
+                    if (mk[a] > 0.5f) tgt[a] = (float)(qd[a] - vbar);
+                regret_buf_->add(obs, tgt.data(), -1, (float)iter_);
             } else {
                 // my variant: neural RM⁺ target max(0, γ·cum(a) + r(a)).
                 for (int a = 0; a < A_; ++a)
                     if (mk[a] > 0.5f) {
                         double v = cfg_.ncum_gamma * cum[a] + (qd[a] - vbar);
-                        td[a] = v > 0.0 ? (float)v : 0.0f;
+                        tgt[a] = v > 0.0 ? (float)v : 0.0f;
                     }
-                regret_smp_.push_back({obs.clone(), tgt, -1, 0.0f, 1.0f});
+                regret_iter_buf_->add(obs, tgt.data(), -1, 1.0f);
             }
-            return sample_uniform(mask, rng_);   // fixed b_i: uniform
+            return sample_uniform(mk, rng_);     // fixed b_i: uniform
         }
         return sample(sig, rng_);                // opponent ~ σ
     };
     auto finish = [&](int, float) {};
+    // Play the smoothed σ (regret_ema_) but feed the TRUE regret_ as cum_net so
+    // the neural-cum cumulative keeps accumulating unsmoothed.
+    ActorCritic& snet = (cfg_.regret_ema > 0.f) ? regret_ema_ : regret_;
     run_rollout(factory_, bet_cfg_, obs_dim_, A_, device_, kRolloutEnvs,
-                cfg_.regret_traj, regret_, value_, act, finish);
+                cfg_.regret_traj, snet, value_, /*need_q=*/true, act, finish,
+                cfg_.regret_ema > 0.f ? &regret_ : nullptr);
+}
+
+// PAPER (Deep CFR) reinit, graph-safe: fresh weights are copied INTO the
+// existing parameter/buffer tensors (stable addresses for the captured fit
+// graph); the optimizer is rebuilt over the same tensors (fresh Adam state,
+// exactly the paper's re-train-from-scratch semantics). The fresh net is
+// drawn from the same ctor, so the init RNG stream matches the old
+// construct-and-swap code.
+void EscherTrainer::reinit_regret_inplace() {
+    const auto& pc = config::kPPOConfig;
+    ActorCritic fresh(obs_dim_, A_, pc.hidden_dim, pc.num_layers,
+                      pc.hist, pc.round_summary);
+    fresh->to(device_);
+    torch::NoGradGuard ng;
+    auto s = fresh->parameters(); auto d = regret_->parameters();
+    for (size_t i = 0; i < s.size(); ++i) d[i].copy_(s[i]);
+    auto sb = fresh->buffers(); auto db = regret_->buffers();
+    for (size_t i = 0; i < sb.size(); ++i) db[i].copy_(sb[i]);
+    regret_opt_ = std::make_unique<ForeachAdam>(
+        params_except(regret_, "critic."), cfg_.lr);
 }
 
 void EscherTrainer::fit_regret() {
     if (cfg_.regret_buffer) {
-        // PAPER (Deep CFR): REINIT the regret net, fit the whole reservoir
-        // (tensor-backed → fast index_select minibatches), iteration-weighted
-        // (linear CFR), globally normalised (RM is scale-invariant).
+        // PAPER (Deep CFR): REINIT the regret net, fit the whole reservoir,
+        // iteration-weighted (linear CFR), globally normalised (RM is
+        // scale-invariant).
         if (regret_buf_->size() == 0) return;
-        const auto& pc = config::kPPOConfig;
-        regret_ = ActorCritic(obs_dim_, A_, pc.hidden_dim, pc.num_layers,
-                              pc.hist, pc.round_summary);
-        regret_->to(device_);
-        regret_opt_ = std::make_unique<torch::optim::Adam>(
-            regret_->parameters(), torch::optim::AdamOptions(cfg_.lr));
-        float scale = regret_buf_->target_rms();
-        int B = std::min(cfg_.batch_size, regret_buf_->size());
-        for (int step = 0; step < cfg_.regret_steps; ++step) {
-            auto mb = regret_buf_->sample(B, rng_, device_);
-            auto Y = mb.target / scale;
-            auto W = mb.weight.unsqueeze(1);
-            regret_opt_->zero_grad();
-            auto loss = (W * (regret_->actor_logits(mb.feat) - Y).pow(2)).mean();
-            loss.backward();
-            regret_opt_->step();
-            if (step == cfg_.regret_steps - 1) {
-                last_reg_loss_ = loss.item<float>();
-                last_reg_mag_  = Y.abs().mean().item<float>();
-            }
-        }
+        reinit_regret_inplace();
+        last_reg_loss_ = run_fit(FitKind::Regret, regret_, *regret_opt_,
+                                 *regret_buf_, cfg_.regret_steps,
+                                 /*scale_by_rms=*/true, &last_reg_mag_);
         return;
     }
-    // neural-cumulative: warm net, per-iter samples (small → per-row is fine).
-    if (regret_smp_.empty()) return;
-    std::uniform_int_distribution<size_t> pick(0, regret_smp_.size() - 1);
-    for (int step = 0; step < cfg_.regret_steps; ++step) {
-        int B = std::min<int>(cfg_.batch_size, (int)regret_smp_.size());
-        auto X = torch::empty({B, obs_dim_});
-        auto Y = torch::empty({B, A_});
-        for (int b = 0; b < B; ++b) {
-            const auto& s = regret_smp_[pick(rng_)];
-            X[b] = s.feat; Y[b] = s.target;
-        }
-        X = X.to(device_); Y = Y.to(device_);
-        regret_opt_->zero_grad();
-        auto loss = torch::mse_loss(regret_->actor_logits(X), Y);
-        loss.backward();
-        regret_opt_->step();
-        if (step == cfg_.regret_steps - 1) {
-            last_reg_loss_ = loss.item<float>();
-            last_reg_mag_  = Y.abs().mean().item<float>();
-        }
-    }
-    regret_smp_.clear();
+    // neural-cumulative: warm net, this iter's samples only (weights ≡ 1).
+    if (regret_iter_buf_->size() == 0) return;
+    last_reg_loss_ = run_fit(FitKind::Regret, regret_, *regret_opt_,
+                             *regret_iter_buf_, cfg_.regret_steps,
+                             /*scale_by_rms=*/false, &last_reg_mag_);
+    regret_iter_buf_->clear();
 }
 
 // ── average phase: classification on (infoset, a_taken) under current σ ─────
 void EscherTrainer::collect_avg(long t) {
-    auto act = [&](int i, int player, const torch::Tensor& obs,
-                   const torch::Tensor& mask, torch::Tensor lg, torch::Tensor q) {
-        auto sig = sigma(regret_, lg, mask);
+    // Q is only consumed by the predictive-σ variant.
+    const bool need_q = cfg_.predictive > 0.f;
+    auto act = [&](int i, int player, const float* obs, const float* mk,
+                   const float* lg, const float* qd, const float* /*cum*/) {
+        auto sig = cfg_.predictive > 0.f
+                       ? sigma_pred(lg, qd, mk, cfg_.predictive)
+                       : sigma(lg, mk);
         int a = sample(sig, rng_);
-        avg_buf_->add(obs.contiguous().data_ptr<float>(), nullptr, a, (float)t);
+        avg_buf_->add(obs, nullptr, a, (float)t);
         return a;
     };
     auto finish = [&](int, float) {};
+    ActorCritic& snet = (cfg_.regret_ema > 0.f) ? regret_ema_ : regret_;  // smoothed σ
     run_rollout(factory_, bet_cfg_, obs_dim_, A_, device_, kRolloutEnvs,
-                cfg_.avg_traj, regret_, value_, act, finish);
+                cfg_.avg_traj, snet, value_, need_q, act, finish);
 }
 
 void EscherTrainer::fit_avg() {
     if (avg_buf_->size() == 0) return;
-    int B = std::min(cfg_.batch_size, avg_buf_->size());
-    for (int step = 0; step < cfg_.avg_steps; ++step) {
-        auto mb = avg_buf_->sample(B, rng_, device_);
-        avg_opt_->zero_grad();
-        auto logp = torch::log_softmax(avg_->actor_logits(mb.feat), 1);
-        auto nll = -logp.gather(1, mb.action.unsqueeze(1)).squeeze(1);  // [B]
-        auto loss = (mb.weight * nll).mean();
-        loss.backward();
-        avg_opt_->step();
+    run_fit(FitKind::Avg, avg_, *avg_opt_, *avg_buf_, cfg_.avg_steps,
+            /*scale_by_rms=*/false);
+}
+
+// ── unified fit engine ──────────────────────────────────────────────────────
+// CUDA path: ONE bulk upload of the filled reservoir rows per fit, then every
+// minibatch is on-device randint + index_select into the captured graph's
+// static inputs → replay (fwd+bwd) → ForeachAdam::step(static grads). No CPU
+// gather and no host sync inside the step loop (one .item() at the end), so
+// the whole fit pipelines on the GPU. Eager fallbacks: device-resident loop
+// (partial batch / capture failure / POKER_PPO_ESCHER_NO_FIT_GRAPH=1), and
+// the old Reservoir::sample loop on CPU devices.
+float EscherTrainer::run_fit(FitKind kind, ActorCritic& net, ForeachAdam& opt,
+                             Reservoir& buf, int steps, bool scale_by_rms,
+                             float* out_target_mag) {
+    if (buf.size() == 0 || steps <= 0) return 0.f;
+    const int n = buf.size();
+    const int B = std::min(cfg_.batch_size, n);
+
+    // Loss shapes (identical math to the pre-engine per-fit loops):
+    //   Regret: iteration-weighted MSE on the full-A regret row.
+    //   Avg:    iteration-weighted NLL of the taken action.
+    //   Value:  recency-normalised weighted MSE on Q(s, a_taken) vs z at [0].
+    auto loss_of = [&](const torch::Tensor& feat, const torch::Tensor& target,
+                       const torch::Tensor& action, const torch::Tensor& weight)
+        -> torch::Tensor {
+        switch (kind) {
+        case FitKind::Regret:
+            return (weight.unsqueeze(1) *
+                    (net->actor_logits(feat) - target).pow(2)).mean();
+        case FitKind::Avg: {
+            auto logp = torch::log_softmax(net->actor_logits(feat), 1);
+            auto nll  = -logp.gather(1, action.unsqueeze(1)).squeeze(1);
+            return (weight * nll).mean();
+        }
+        default: {  // Value
+            auto qall = net->critic_values(feat);                    // [B, A]
+            auto pred = qall.gather(1, action.unsqueeze(1)).squeeze(1);
+            auto y    = target.select(1, 0);                         // z at [0]
+            auto W    = weight / weight.mean().clamp_min(1e-6f);
+            return (W * (pred - y).pow(2)).mean();
+        }
+        }
+    };
+
+    if (!device_.is_cuda()) {   // CPU device: old per-step gather loop
+        const float scale = scale_by_rms ? buf.target_rms() : 1.0f;
+        torch::Tensor last_loss, last_y;
+        for (int step = 0; step < steps; ++step) {
+            auto mb = buf.sample(B, rng_, device_);
+            auto Y  = scale != 1.0f ? mb.target / scale : mb.target;
+            opt.zero_grad();
+            auto loss = loss_of(mb.feat, Y, mb.action, mb.weight);
+            loss.backward();
+            opt.step();
+            if (step == steps - 1) { last_loss = loss; last_y = Y; }
+        }
+        if (out_target_mag) *out_target_mag = last_y.abs().mean().item<float>();
+        return last_loss.item<float>();
     }
+
+    auto dv = buf.upload(device_);                       // one bulk H2D
+    const float scale = scale_by_rms
+        ? std::max(1e-6f, dv.target.pow(2).mean().sqrt().item<float>())
+        : 1.0f;
+    const bool use_amp = std::getenv("POKER_PPO_ESCHER_NO_AMP") == nullptr;
+    auto i_dev = torch::TensorOptions().dtype(torch::kLong).device(device_);
+
+    // one-time capture, full batches only (partial batch → eager path)
+    auto& fg = graphs_->of(kind);
+    if (!fg.ready && !fg.failed && B == cfg_.batch_size) {
+        if (std::getenv("POKER_PPO_ESCHER_NO_FIT_GRAPH") != nullptr) {
+            fg.failed = true;
+        } else {
+            try {
+                const long D = dv.feat.size(1);
+                auto f_dev = torch::TensorOptions().dtype(torch::kFloat)
+                                 .device(device_);
+                fg.feat   = torch::zeros({B, D}, f_dev);
+                fg.target = torch::zeros({B, (long)A_}, f_dev);
+                fg.action = torch::zeros({B}, i_dev);
+                fg.weight = torch::ones({B}, f_dev);
+                // live minibatch for warmup + capture
+                auto idx0 = torch::randint(0, n, {B}, i_dev);
+                at::index_select_out(fg.feat,   dv.feat,   0, idx0);
+                at::index_select_out(fg.target, dv.target, 0, idx0);
+                at::index_select_out(fg.action, dv.action, 0, idx0);
+                at::index_select_out(fg.weight, dv.weight, 0, idx0);
+                if (scale != 1.0f) fg.target.div_(scale);
+
+                // Autocast cache must be OFF from warmup through capture: a
+                // cached bf16 weight cast would be baked into the graph as a
+                // stale constant; uncached casts are recorded as kernels that
+                // re-read the live fp32 weights on every replay.
+                if (use_amp) at::autocast::set_autocast_cache_enabled(false);
+                auto run_once = [&] {
+                    if (use_amp) {
+                        at::autocast::set_autocast_enabled(at::kCUDA, true);
+                        at::autocast::set_autocast_dtype(at::kCUDA, at::kBFloat16);
+                    }
+                    auto l = loss_of(fg.feat, fg.target, fg.action, fg.weight);
+                    if (use_amp)
+                        at::autocast::set_autocast_enabled(at::kCUDA, false);
+                    return l;
+                };
+                const auto& params = opt.params();
+                torch::autograd::variable_list plist(params.begin(),
+                                                     params.end());
+                auto stream = at::cuda::getStreamFromPool();
+                {
+                    c10::cuda::CUDAStreamGuard guard(stream);
+                    for (int w = 0; w < 3; ++w) {   // warmup off-graph
+                        auto l = run_once();
+                        (void)torch::autograd::grad({l}, plist);
+                    }
+                    at::cuda::getCurrentCUDAStream().synchronize();
+                    fg.graph = std::make_unique<at::cuda::CUDAGraph>();
+                    fg.graph->capture_begin();
+                    auto l = run_once();
+                    auto g = torch::autograd::grad({l}, plist);
+                    fg.graph->capture_end();
+                    fg.loss = l;
+                    fg.grads.assign(g.begin(), g.end());
+                }
+                if (use_amp) at::autocast::set_autocast_cache_enabled(true);
+                torch::cuda::synchronize();
+                fg.B = B; fg.ready = true;
+                std::printf("  [fit] CUDA-graphed fit step, kind=%d B=%d "
+                            "(POKER_PPO_ESCHER_NO_FIT_GRAPH=1 disables)\n",
+                            (int)kind, B);
+            } catch (const std::exception& e) {
+                std::fprintf(stderr, "  [fit] graph capture failed, eager "
+                             "fallback: %s\n", e.what());
+                at::autocast::set_autocast_enabled(at::kCUDA, false);
+                at::autocast::set_autocast_cache_enabled(true);
+                fg.graph.reset(); fg.grads.clear();
+                fg.feat = fg.target = fg.action = fg.weight = fg.loss
+                        = torch::Tensor();
+                fg.failed = true;
+            }
+        }
+    }
+    const bool graphed = fg.ready && fg.B == B;
+
+    torch::Tensor last_loss, last_y;
+    for (int step = 0; step < steps; ++step) {
+        auto idx = torch::randint(0, n, {B}, i_dev);
+        if (graphed) {
+            at::index_select_out(fg.feat,   dv.feat,   0, idx);
+            at::index_select_out(fg.target, dv.target, 0, idx);
+            at::index_select_out(fg.action, dv.action, 0, idx);
+            at::index_select_out(fg.weight, dv.weight, 0, idx);
+            if (scale != 1.0f) fg.target.div_(scale);
+            fg.graph->replay();                 // fwd+bwd → fg.loss, fg.grads
+            opt.step(fg.grads);
+        } else {
+            auto feat = dv.feat.index_select(0, idx);
+            auto tgt  = dv.target.index_select(0, idx);
+            if (scale != 1.0f) tgt = tgt / scale;
+            auto actn = dv.action.index_select(0, idx);
+            auto w    = dv.weight.index_select(0, idx);
+            opt.zero_grad();
+            torch::Tensor loss;
+            { AutocastBF16 ac(device_);
+              loss = loss_of(feat, tgt, actn, w); }
+            loss.backward();
+            opt.step();
+            if (step == steps - 1) { last_loss = loss; last_y = tgt; }
+        }
+    }
+    // single host sync per fit
+    if (graphed) {
+        if (out_target_mag)
+            *out_target_mag = fg.target.abs().mean().item<float>();
+        return fg.loss.item<float>();
+    }
+    if (out_target_mag) *out_target_mag = last_y.abs().mean().item<float>();
+    return last_loss.item<float>();
 }
 
 void EscherTrainer::run_lbr(int iter) {
@@ -454,9 +774,11 @@ bool EscherTrainer::try_resume() {
     torch::load(regret_, cfg_.ckpt_dir + "/regret.pt");
     torch::load(avg_,    cfg_.ckpt_dir + "/avg.pt");
     value_->to(device_); regret_->to(device_); avg_->to(device_);
-    { torch::NoGradGuard ng;  // resync target net to the loaded value net
+    { torch::NoGradGuard ng;  // resync target + EMA nets to the loaded nets
       auto s = value_->parameters(); auto d = value_target_->parameters();
-      for (size_t i = 0; i < s.size(); ++i) d[i].copy_(s[i]); }
+      for (size_t i = 0; i < s.size(); ++i) d[i].copy_(s[i]);
+      auto rs = regret_->parameters(); auto rd = regret_ema_->parameters();
+      for (size_t i = 0; i < rs.size(); ++i) rd[i].copy_(rs[i]); }
     if (cfg_.regret_buffer &&
         std::filesystem::exists(cfg_.ckpt_dir + "/regret_buf.pt"))
         regret_buf_->load(cfg_.ckpt_dir + "/regret_buf.pt");
@@ -470,6 +792,10 @@ void EscherTrainer::train() {
     std::printf("ESCHER HUNL: %d iters, envs=%d, value/regret/avg traj=%d/%d/%d\n",
                 cfg_.iterations, kRolloutEnvs, cfg_.value_traj, cfg_.regret_traj,
                 cfg_.avg_traj);
+    std::printf("  value: lam=%.2f tau=%.3f eps=%.3f buf_cap=%d | regret: %s gamma=%.3f ema=%.3f pred=%.2f\n",
+                cfg_.value_lambda, cfg_.value_tau, cfg_.value_eps, cfg_.value_buf_cap,
+                cfg_.regret_buffer ? "reinit-buffer(RM)" : "neural-cum(RM+)",
+                cfg_.ncum_gamma, cfg_.regret_ema, cfg_.predictive);
     try_resume();
     auto clk = [] { return std::chrono::steady_clock::now(); };
     auto el = [](auto a, auto b) {
@@ -478,6 +804,14 @@ void EscherTrainer::train() {
         auto t0 = clk(); collect_and_train_value();
         auto t1 = clk(); collect_regret(0); collect_regret(1);
         auto t2 = clk(); fit_regret();
+        if (cfg_.regret_ema > 0.f) {  // regret_ema_ ← β·regret_ema_ + (1−β)·regret_
+            torch::NoGradGuard ng;
+            const float b = cfg_.regret_ema;
+            auto s = regret_->parameters(); auto d = regret_ema_->parameters();
+            for (size_t i = 0; i < s.size(); ++i) d[i].mul_(b).add_(s[i], 1.f - b);
+            auto sb = regret_->buffers(); auto db = regret_ema_->buffers();
+            for (size_t i = 0; i < sb.size(); ++i) db[i].copy_(sb[i]);
+        }
         auto t3 = clk();
         if (iter_ > cfg_.avg_warmup) collect_avg(iter_);  // burn-in: drop early σ
         auto t4 = clk(); fit_avg();
