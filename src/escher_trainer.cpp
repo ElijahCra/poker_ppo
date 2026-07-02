@@ -748,7 +748,17 @@ void EscherTrainer::run_lbr(int iter) {
     std::fflush(stdout);
     if (best && !cfg_.ckpt_dir.empty())   // snapshot the best avg net
         torch::save(avg_, cfg_.ckpt_dir + "/avg_best.pt");
-    // cur-σ diagnostic available via LBRConfig.rm_plus on regret_ if needed.
+    if (cfg_.lbr_cur) {   // drift-vs-floor diagnostic: attack the played σ
+        LBRConfig cc = lc;
+        cc.rm_plus = true;
+        cc.seed = lc.seed + 1;
+        LBREvaluator cur(factory_, bet_cfg_, cc, device_);
+        ActorCritic& played = (cfg_.regret_ema > 0.f) ? regret_ema_ : regret_;
+        auto cres = cur.evaluate(played);
+        std::printf("  [iter %4d] LBR cur=%.4f bb/hand  (win %.3f)\n",
+                    iter, cres.bb_per_hand, cres.lbr_win_rate);
+        std::fflush(stdout);
+    }
 }
 
 // The 3 net weights fully encode the strategy: regret_ holds the cumulative

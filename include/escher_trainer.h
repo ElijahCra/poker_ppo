@@ -101,6 +101,11 @@ struct EscherConfig {
                                      // average is dragged by early off-Nash σ)
     int      eval_every    = 50;     // iterations between LBR evaluations
     int      lbr_hands     = 10000;
+    // Also LBR the CURRENT σ (RM⁺ on the played regret net) each eval — the
+    // observable that separates σ-DRIFT (cur-σ degrades with the avg) from an
+    // approximation FLOOR (cur-σ flat while avg converges to it). Costs one
+    // extra LBR pass per eval.
+    bool     lbr_cur       = false;
     uint64_t seed          = 0;
     std::string ckpt_dir;            // empty = no checkpointing
     int      ckpt_every    = 100;
