@@ -101,6 +101,11 @@ struct EscherConfig {
                                      // average is dragged by early off-Nash σ)
     int      eval_every    = 50;     // iterations between LBR evaluations
     int      lbr_hands     = 10000;
+    // LBR hand shards run in parallel threads. Hands are independent, so
+    // sharding is the SAME estimator (per-shard RNG streams) — LBR is
+    // latency-bound (batch-1 net queries + CPU equity), not GPU-bound, so
+    // this scales ~linearly with cores. Shard 0 prints the attribution table.
+    int      lbr_threads   = 1;
     // Also LBR the CURRENT σ (RM⁺ on the played regret net) each eval — the
     // observable that separates σ-DRIFT (cur-σ degrades with the avg) from an
     // approximation FLOOR (cur-σ flat while avg converges to it). Costs one

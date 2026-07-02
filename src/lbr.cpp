@@ -461,6 +461,7 @@ LBREvaluator::Result LBREvaluator::evaluate(ActorCritic& target) {
     // ── Diagnostic breakdown: where the bb/hand comes from ────────────────
     const double N  = static_cast<double>(std::max(1, cfg_.num_hands));
     const double bb = static_cast<double>(std::max(1, big_blind));
+    if (cfg_.print_diag) {
     auto row = [&](const std::string& name, const Bucket& b) {
         std::cout << "  " << std::setw(14) << std::left << name << std::right
                   << std::setw(8)  << b.n
@@ -511,6 +512,7 @@ LBREvaluator::Result LBREvaluator::evaluate(ActorCritic& target) {
                                   "raise K or use analytic river)") << "\n";
     }
     std::cout.unsetf(std::ios::fixed);
+    }  // print_diag
 
     using ms = std::chrono::duration<double, std::milli>;
     Result r;

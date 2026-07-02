@@ -51,7 +51,9 @@ struct LBRConfig {
     // (an ESCHER regret net) rather than an average/softmax policy.
     bool     rm_plus           = false;
     // Optional per-hand diagnostic JSONL (empty = off). The aggregate
-    // breakdown table is always printed.
+    // breakdown table is printed when print_diag (sharded evaluation runs
+    // several evaluators in parallel; only shard 0 prints its table).
+    bool     print_diag        = true;
     std::string log_path;
     // Measure the target's fold-rate to a hypothetical pot-sized raise at
     // every LBR decision, bucketed by street — a direct read on whether the

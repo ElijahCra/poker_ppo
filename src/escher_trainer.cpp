@@ -17,6 +17,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <thread>
 
 namespace poker_ppo {
 
@@ -734,29 +735,75 @@ float EscherTrainer::run_fit(FitKind kind, ActorCritic& net, ForeachAdam& opt,
 }
 
 void EscherTrainer::run_lbr(int iter) {
-    LBRConfig lc;
-    lc.num_hands = cfg_.lbr_hands;
-    lc.seed = cfg_.seed + 1000 + iter;
-    LBREvaluator lbr(factory_, bet_cfg_, lc, device_);
-    auto res = lbr.evaluate(avg_);                       // average policy π̄
+    if (iter <= cfg_.avg_warmup) {
+        // collect_avg hasn't run yet — the avg net is still random init, so
+        // an eval here measures nothing (and its LBR would poison best_lbr_).
+        std::printf("  [iter %4d] LBR skipped (avg warmup ends at %d)\n",
+                    iter, cfg_.avg_warmup);
+        std::fflush(stdout);
+        return;
+    }
+    // Shard the hands across lbr_threads evaluators (own env + RNG stream
+    // each; hands are independent, so the merged bound is the same
+    // estimator). Shard 0 prints the attribution table for its subset.
+    auto eval_sharded = [&](ActorCritic& net, bool rm_plus,
+                            uint64_t seed) -> LBREvaluator::Result {
+        const int T = std::max(1, std::min(cfg_.lbr_threads, cfg_.lbr_hands));
+        std::vector<LBREvaluator::Result> shard(T);
+        auto run_shard = [&](int t) {
+            LBRConfig lc;
+            lc.num_hands  = cfg_.lbr_hands / T
+                            + (t == 0 ? cfg_.lbr_hands % T : 0);
+            lc.seed       = seed + 7919u * static_cast<uint64_t>(t);
+            lc.rm_plus    = rm_plus;
+            lc.print_diag = (t == 0);
+            LBREvaluator ev(factory_, bet_cfg_, lc, device_);
+            shard[t] = ev.evaluate(net);
+        };
+        if (T == 1) { run_shard(0); return shard[0]; }
+        std::vector<std::thread> ws;
+        ws.reserve(T);
+        for (int t = 0; t < T; ++t) ws.emplace_back(run_shard, t);
+        for (auto& w : ws) w.join();
+        LBREvaluator::Result r;
+        double bb = 0.0, mbb = 0.0, win = 0.0;
+        for (const auto& s : shard) {
+            r.num_hands += s.num_hands;
+            bb  += s.bb_per_hand  * s.num_hands;
+            mbb += s.mbb_per_hand * s.num_hands;
+            win += s.lbr_win_rate * s.num_hands;
+            r.wall_ms = std::max(r.wall_ms, s.wall_ms);
+        }
+        const double n = std::max(1, r.num_hands);
+        r.bb_per_hand  = bb / n;
+        r.mbb_per_hand = mbb / n;
+        r.lbr_win_rate = win / n;
+        return r;
+    };
+
+    auto res = eval_sharded(avg_, /*rm_plus=*/false,   // average policy π̄
+                            cfg_.seed + 1000 + iter);
     // Track the best LBR so the deployable strategy is the best avg, not the
     // latest (CFR's current σ oscillates; the average is what's judged).
     bool best = res.bb_per_hand < best_lbr_;
     if (best) best_lbr_ = res.bb_per_hand;
-    std::printf("  [iter %4d] LBR avg=%.4f bb/hand  (win %.3f)%s\n",
-                iter, res.bb_per_hand, res.lbr_win_rate, best ? "  *best*" : "");
+    std::printf("  [iter %4d] LBR avg=%.4f bb/hand  (win %.3f, %.0fs)%s\n",
+                iter, res.bb_per_hand, res.lbr_win_rate,
+                res.wall_ms / 1000.0, best ? "  *best*" : "");
     std::fflush(stdout);
-    if (best && !cfg_.ckpt_dir.empty())   // snapshot the best avg net
+    if (best && !cfg_.ckpt_dir.empty()) {  // snapshot the best avg net
+        // First best can precede the first save_checkpoint() (iter ckpt_every),
+        // which is what otherwise creates the directory.
+        std::filesystem::create_directories(cfg_.ckpt_dir);
         torch::save(avg_, cfg_.ckpt_dir + "/avg_best.pt");
+    }
     if (cfg_.lbr_cur) {   // drift-vs-floor diagnostic: attack the played σ
-        LBRConfig cc = lc;
-        cc.rm_plus = true;
-        cc.seed = lc.seed + 1;
-        LBREvaluator cur(factory_, bet_cfg_, cc, device_);
         ActorCritic& played = (cfg_.regret_ema > 0.f) ? regret_ema_ : regret_;
-        auto cres = cur.evaluate(played);
-        std::printf("  [iter %4d] LBR cur=%.4f bb/hand  (win %.3f)\n",
-                    iter, cres.bb_per_hand, cres.lbr_win_rate);
+        auto cres = eval_sharded(played, /*rm_plus=*/true,
+                                 cfg_.seed + 2000 + iter);
+        std::printf("  [iter %4d] LBR cur=%.4f bb/hand  (win %.3f, %.0fs)\n",
+                    iter, cres.bb_per_hand, cres.lbr_win_rate,
+                    cres.wall_ms / 1000.0);
         std::fflush(stdout);
     }
 }

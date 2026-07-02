@@ -173,6 +173,7 @@ int main(int argc, char** argv) {
         ecfg.rollout_envs = envi("ESCHER_ENVS", ecfg.rollout_envs);
         ecfg.eval_every   = envi("ESCHER_EVAL_EVERY", ecfg.eval_every);
         ecfg.lbr_hands    = envi("ESCHER_LBR_HANDS", ecfg.lbr_hands);
+        ecfg.lbr_threads  = envi("ESCHER_LBR_THREADS", ecfg.lbr_threads);
         ecfg.lbr_cur      = envi("ESCHER_LBR_CUR", 0) != 0;
         ecfg.ckpt_every   = envi("ESCHER_CKPT_EVERY", ecfg.ckpt_every);
         if (const char* g = std::getenv("ESCHER_GAMMA")) ecfg.ncum_gamma = std::atof(g);
