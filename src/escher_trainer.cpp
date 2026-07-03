@@ -360,7 +360,7 @@ static void run_rollout(IPokerEnvironmentFactory& factory, const BetConfig& bet,
 //     terminal utility at leaves. One-step Bellman backup; lower variance and,
 //     because V̄(child) reads the value net at the child, it covers actions the
 //     MC value never sampled.
-void EscherTrainer::collect_and_train_value() {
+void EscherTrainer::collect_and_train_value(bool fit) {
     const float lam = cfg_.value_lambda;
     // Q is only consumed here when the bootstrap or predictive σ needs it —
     // pure-ESCHER (λ=1, no predictive) skips the value forward entirely.
@@ -436,6 +436,7 @@ void EscherTrainer::collect_and_train_value() {
     ActorCritic& snet = (cfg_.regret_ema > 0.f) ? regret_ema_ : regret_;  // smoothed σ
     run_rollout(factory_, bet_cfg_, obs_dim_, A_, device_, cfg_.rollout_envs,
                 cfg_.value_traj, snet, vnet, need_q, act, finish);
+    if (!fit) return;   // resume prefill: data only
 
     // train Q(obs, a_taken) -> signed terminal utility (acting-player frame).
     // value_buf_ path: reservoir across iters, recency-weighted (~window× the
@@ -919,6 +920,30 @@ void EscherTrainer::train() {
                 cfg_.regret_buffer ? "reinit-buffer(RM)" : "neural-cum(RM+)",
                 cfg_.ncum_gamma, cfg_.regret_ema, cfg_.predictive);
     try_resume();
+    if (resume_iter_ > 0) {
+        // Prefill the non-checkpointed reservoirs to steady state BEFORE any
+        // fit touches them. Resuming with a thin refilling value buffer feeds
+        // ~7x-noisier Q into the gamma=1 regret cumulative, which rectifies
+        // and KEEPS it (observed at resume@2500: rloss 0.16->0.52 and rmag
+        // 6.9->9.1 within ~50 iters, cur-LBR 1.5->5.3, despite warm
+        // Adam/EMA). Rollout-only passes are ~0.2s each; fresh on-sigma data
+        // beats checkpointing stale buffers.
+        iter_ = resume_iter_;   // recency weights for the prefill rows
+        auto t0 = std::chrono::steady_clock::now();
+        if (value_buf_)
+            while (value_buf_->size() < cfg_.value_buf_cap)
+                collect_and_train_value(/*fit=*/false);
+        if (resume_iter_ > cfg_.avg_warmup)
+            while (avg_buf_->size() < cfg_.buf_cap)
+                collect_avg(resume_iter_);
+        std::chrono::duration<double> el =
+            std::chrono::steady_clock::now() - t0;
+        std::printf("  [resume] reservoirs prefilled (value %d, avg %d) "
+                    "in %.1fs\n",
+                    value_buf_ ? value_buf_->size() : 0, avg_buf_->size(),
+                    el.count());
+        std::fflush(stdout);
+    }
     auto clk = [] { return std::chrono::steady_clock::now(); };
     auto el = [](auto a, auto b) {
         return std::chrono::duration<double, std::milli>(b - a).count(); };

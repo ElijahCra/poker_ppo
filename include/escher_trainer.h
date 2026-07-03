@@ -145,7 +145,8 @@ private:
     int sample_uniform(const float* mk, std::mt19937& rng);
 
     // ── the three ESCHER phases (one outer iteration) ──
-    void collect_and_train_value();      // MC, current σ, both seats (cleared)
+    // fit=false → rollout-only (resume prefill of the value reservoir).
+    void collect_and_train_value(bool fit = true);
     void collect_regret(int traverser);  // fixed sampler → regret samples
     void fit_regret();                   // neural RM⁺ cumulative update (in-net)
     void collect_avg(long t);            // current σ → avg reservoir
