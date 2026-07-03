@@ -526,6 +526,9 @@ int cmd_lbr_eval(IPokerEnvironmentFactory& factory,
         const float t = static_cast<float>(std::atof(e));
         if (t > 0.0f) cfg.play_temp = t;
     }
+    // RM⁺ readout (clamp≥0, normalise) instead of softmax — for ESCHER
+    // regret/EMA nets (cur_best.pt), whose actor head holds regrets.
+    if (std::getenv("POKER_PPO_LBR_RM_PLUS") != nullptr) cfg.rm_plus = true;
     if (const char* e = std::getenv("POKER_PPO_LBR_LOG")) cfg.log_path = e;
     if (std::getenv("POKER_PPO_LBR_FOLD_PROBE") != nullptr) cfg.fold_probe = true;
     // Rollout raise pricing: off (analytic river-only) | river (rollout,
