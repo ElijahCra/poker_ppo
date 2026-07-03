@@ -182,6 +182,7 @@ int main(int argc, char** argv) {
         if (const char* e = std::getenv("ESCHER_VALUE_EPS")) ecfg.value_eps = std::atof(e);
         ecfg.value_buf_cap = envi("ESCHER_VALUE_BUF_CAP", ecfg.value_buf_cap);
         ecfg.avg_warmup = envi("ESCHER_AVG_WARMUP", ecfg.avg_warmup);
+        if (const char* ap = std::getenv("ESCHER_AVG_POW")) ecfg.avg_pow = std::atof(ap);
         ecfg.regret_buffer = envi("ESCHER_REGRET_BUFFER", 0) != 0;
         if (const char* re = std::getenv("ESCHER_REGRET_EMA")) ecfg.regret_ema = std::atof(re);
         if (const char* pr = std::getenv("ESCHER_PREDICTIVE")) ecfg.predictive = std::atof(pr);

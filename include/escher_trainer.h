@@ -99,6 +99,11 @@ struct EscherConfig {
     int      buf_cap       = 1'000'000;
     int      avg_warmup    = 0;      // skip averaging the first N iters' σ (the
                                      // average is dragged by early off-Nash σ)
+    // Average-policy iteration weight = t^k. k=1 = linear CFR (right for an
+    // OSCILLATING σ). Under regret_ema the σ sequence is smooth and improving,
+    // so the time-average mostly adds stale history — k=2..3 concentrates the
+    // average on late σ (confirmed HUNL: cur-σ 2.2 stable vs linear-avg 5.5+).
+    float    avg_pow       = 1.0f;
     int      eval_every    = 50;     // iterations between LBR evaluations
     int      lbr_hands     = 10000;
     // LBR hand shards run in parallel threads. Hands are independent, so

@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -439,8 +440,17 @@ void EscherTrainer::collect_and_train_value() {
     // train Q(obs, a_taken) -> signed terminal utility (acting-player frame).
     // value_buf_ path: reservoir across iters, recency-weighted (~window× the
     // data). Else: this iter's samples only (weights ≡ 1).
+    // Fit budget ∝ reservoir fullness: while the buffer refills (fresh start
+    // or resume — it isn't checkpointed), a full-budget fit overfits the few
+    // rows present and shocks Q, whose error the regret cumulative then
+    // rectifies in (the observed post-resume rmag inflation).
+    int vsteps = cfg_.value_steps;
+    if (value_buf_)
+        vsteps = static_cast<int>(std::lround(
+            cfg_.value_steps *
+            std::min(1.0, vbuf.size() / (double)cfg_.value_buf_cap)));
     last_val_loss_ = run_fit(FitKind::Value, value_, *value_opt_, vbuf,
-                             cfg_.value_steps, /*scale_by_rms=*/false);
+                             vsteps, /*scale_by_rms=*/false);
 
     if (cfg_.value_tau > 0.f) {  // Polyak: target ← τ·value + (1−τ)·target
         torch::NoGradGuard ng;
@@ -537,13 +547,15 @@ void EscherTrainer::fit_regret() {
 void EscherTrainer::collect_avg(long t) {
     // Q is only consumed by the predictive-σ variant.
     const bool need_q = cfg_.predictive > 0.f;
+    // t^k iteration weight (k=1 linear CFR; see EscherConfig::avg_pow).
+    const float w_avg = std::pow(static_cast<float>(t), cfg_.avg_pow);
     auto act = [&](int i, int player, const float* obs, const float* mk,
                    const float* lg, const float* qd, const float* /*cum*/) {
         auto sig = cfg_.predictive > 0.f
                        ? sigma_pred(lg, qd, mk, cfg_.predictive)
                        : sigma(lg, mk);
         int a = sample(sig, rng_);
-        avg_buf_->add(obs, nullptr, a, (float)t);
+        avg_buf_->add(obs, nullptr, a, w_avg);
         return a;
     };
     auto finish = [&](int, float) {};
@@ -554,7 +566,13 @@ void EscherTrainer::collect_avg(long t) {
 
 void EscherTrainer::fit_avg() {
     if (avg_buf_->size() == 0) return;
-    run_fit(FitKind::Avg, avg_, *avg_opt_, *avg_buf_, cfg_.avg_steps,
+    // Budget ∝ fullness, as in the value fit: after a resume the (warm, good)
+    // avg net would otherwise be yanked by full-budget fits on a near-empty
+    // refilling reservoir.
+    const int steps = static_cast<int>(std::lround(
+        cfg_.avg_steps *
+        std::min(1.0, avg_buf_->size() / (double)cfg_.buf_cap)));
+    run_fit(FitKind::Avg, avg_, *avg_opt_, *avg_buf_, steps,
             /*scale_by_rms=*/false);
 }
 
@@ -817,9 +835,25 @@ void EscherTrainer::save_checkpoint(int iter) {
     torch::save(value_,  cfg_.ckpt_dir + "/value.pt");
     torch::save(regret_, cfg_.ckpt_dir + "/regret.pt");
     torch::save(avg_,    cfg_.ckpt_dir + "/avg.pt");
+    if (cfg_.regret_ema > 0.f)  // EMA σ state, so resume keeps the smoothing
+        torch::save(regret_ema_, cfg_.ckpt_dir + "/regret_ema.pt");
     if (cfg_.regret_buffer)  // the reservoir IS the cumulative-regret state
         regret_buf_->save(cfg_.ckpt_dir + "/regret_buf.pt");
-    std::ofstream(cfg_.ckpt_dir + "/iter.txt") << iter;
+    // Adam moments: in neural-cum mode the regret net IS the cumulative-
+    // regret state, so a cold-Adam restart writes shocked steps straight
+    // into it (observed: resume at iter 1000 cost ~1.5 bb of cur-σ LBR and
+    // inflated rmag 5.3→7.8). Persist all three optimizers.
+    auto save_opt = [&](const ForeachAdam& opt, const std::string& path) {
+        std::vector<torch::Tensor> st;
+        for (const auto& t : opt.exp_avg())    st.push_back(t.clone());
+        for (const auto& t : opt.exp_avg_sq()) st.push_back(t.clone());
+        st.push_back(torch::tensor(opt.step_count()));
+        torch::save(st, path);
+    };
+    save_opt(*value_opt_,  cfg_.ckpt_dir + "/opt_value.pt");
+    save_opt(*regret_opt_, cfg_.ckpt_dir + "/opt_regret.pt");
+    save_opt(*avg_opt_,    cfg_.ckpt_dir + "/opt_avg.pt");
+    std::ofstream(cfg_.ckpt_dir + "/iter.txt") << iter << "\n" << best_lbr_;
     std::printf("  [ckpt] saved iter %d -> %s\n", iter, cfg_.ckpt_dir.c_str());
 }
 
@@ -836,11 +870,34 @@ bool EscherTrainer::try_resume() {
       for (size_t i = 0; i < s.size(); ++i) d[i].copy_(s[i]);
       auto rs = regret_->parameters(); auto rd = regret_ema_->parameters();
       for (size_t i = 0; i < rs.size(); ++i) rd[i].copy_(rs[i]); }
+    if (std::filesystem::exists(cfg_.ckpt_dir + "/regret_ema.pt")) {
+        // Real EMA state (newer checkpoints); else the regret_ copy above
+        // stands and the EMA re-forms over ~1/(1-β) iters.
+        torch::load(regret_ema_, cfg_.ckpt_dir + "/regret_ema.pt");
+        regret_ema_->to(device_);
+    }
     if (cfg_.regret_buffer &&
         std::filesystem::exists(cfg_.ckpt_dir + "/regret_buf.pt"))
         regret_buf_->load(cfg_.ckpt_dir + "/regret_buf.pt");
-    std::ifstream(cfg_.ckpt_dir + "/iter.txt") >> resume_iter_;
-    std::printf("  [resume] loaded checkpoint at iter %d\n", resume_iter_);
+    auto load_opt = [&](ForeachAdam& opt, const std::string& path) {
+        if (!std::filesystem::exists(path)) return;   // pre-fix checkpoint
+        std::vector<torch::Tensor> st;
+        torch::load(st, path);
+        const size_t n = opt.exp_avg().size();
+        if (st.size() != 2 * n + 1) return;           // param set changed
+        std::vector<torch::Tensor> m(st.begin(), st.begin() + n);
+        std::vector<torch::Tensor> v(st.begin() + n, st.begin() + 2 * n);
+        opt.load_state(m, v, st.back().item<int64_t>());
+    };
+    load_opt(*value_opt_,  cfg_.ckpt_dir + "/opt_value.pt");
+    load_opt(*regret_opt_, cfg_.ckpt_dir + "/opt_regret.pt");
+    load_opt(*avg_opt_,    cfg_.ckpt_dir + "/opt_avg.pt");
+    std::ifstream itf(cfg_.ckpt_dir + "/iter.txt");
+    itf >> resume_iter_;
+    double b;                                          // pre-fix files lack it
+    if (itf >> b) best_lbr_ = b;
+    std::printf("  [resume] loaded checkpoint at iter %d (best %.3f)\n",
+                resume_iter_, best_lbr_);
     return true;
 }
 
