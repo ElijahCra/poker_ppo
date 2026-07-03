@@ -559,8 +559,13 @@ int cmd_lbr_eval(IPokerEnvironmentFactory& factory,
         std::cout << " (min_p=" << cfg.play_min_p << " temp=" << cfg.play_temp << ")";
     std::cout << "\n";
 
-    LBREvaluator lbr(factory, bet_cfg, cfg, device);
-    auto r = lbr.evaluate(trainer.network());
+    int threads = 1;
+    if (const char* e = std::getenv("POKER_PPO_LBR_THREADS")) {
+        const int v = std::atoi(e);
+        if (v > 0) threads = v;
+    }
+    auto r = LBREvaluator::evaluate_sharded(factory, bet_cfg, cfg, device,
+                                            trainer.network(), threads);
 
     std::cout << std::fixed << std::setprecision(3)
               << "\n══════════ LBR (exploitability lower bound) ══════════\n"

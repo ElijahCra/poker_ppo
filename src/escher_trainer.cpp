@@ -175,14 +175,21 @@ EscherTrainer::EscherTrainer(IPokerEnvironmentFactory& factory, EscherConfig cfg
         ac->to(device_);
         return ac;
     };
+    auto make_value = [&] {   // critic-capacity override (cfg_.val_hidden)
+        if (cfg_.val_hidden <= 0) return make();
+        ActorCritic ac(obs_dim_, A_, cfg_.val_hidden, pc.num_layers,
+                       pc.hist, pc.round_summary);
+        ac->to(device_);
+        return ac;
+    };
     // NOTE order: value_/regret_/avg_ FIRST (identical init RNG draws to the
     // pre-value_target_ code at 5c29560), then the auxiliary nets — so adding
     // value_target_/regret_ema_ does NOT shift the core nets' init basin. (The
     // earlier ordering silently moved the σ oscillation into a worse basin.)
-    value_  = make();
+    value_  = make_value();
     regret_ = make();
     avg_    = make();
-    value_target_ = make();
+    value_target_ = make_value();
     regret_ema_ = make();
     { torch::NoGradGuard ng;  // value_target_ starts == value_; ema starts == regret_
       auto s = value_->parameters(); auto d = value_target_->parameters();
@@ -762,42 +769,15 @@ void EscherTrainer::run_lbr(int iter) {
         std::fflush(stdout);
         return;
     }
-    // Shard the hands across lbr_threads evaluators (own env + RNG stream
-    // each; hands are independent, so the merged bound is the same
-    // estimator). Shard 0 prints the attribution table for its subset.
+    // Sharded across cfg_.lbr_threads — see LBREvaluator::evaluate_sharded.
     auto eval_sharded = [&](ActorCritic& net, bool rm_plus,
                             uint64_t seed) -> LBREvaluator::Result {
-        const int T = std::max(1, std::min(cfg_.lbr_threads, cfg_.lbr_hands));
-        std::vector<LBREvaluator::Result> shard(T);
-        auto run_shard = [&](int t) {
-            LBRConfig lc;
-            lc.num_hands  = cfg_.lbr_hands / T
-                            + (t == 0 ? cfg_.lbr_hands % T : 0);
-            lc.seed       = seed + 7919u * static_cast<uint64_t>(t);
-            lc.rm_plus    = rm_plus;
-            lc.print_diag = (t == 0);
-            LBREvaluator ev(factory_, bet_cfg_, lc, device_);
-            shard[t] = ev.evaluate(net);
-        };
-        if (T == 1) { run_shard(0); return shard[0]; }
-        std::vector<std::thread> ws;
-        ws.reserve(T);
-        for (int t = 0; t < T; ++t) ws.emplace_back(run_shard, t);
-        for (auto& w : ws) w.join();
-        LBREvaluator::Result r;
-        double bb = 0.0, mbb = 0.0, win = 0.0;
-        for (const auto& s : shard) {
-            r.num_hands += s.num_hands;
-            bb  += s.bb_per_hand  * s.num_hands;
-            mbb += s.mbb_per_hand * s.num_hands;
-            win += s.lbr_win_rate * s.num_hands;
-            r.wall_ms = std::max(r.wall_ms, s.wall_ms);
-        }
-        const double n = std::max(1, r.num_hands);
-        r.bb_per_hand  = bb / n;
-        r.mbb_per_hand = mbb / n;
-        r.lbr_win_rate = win / n;
-        return r;
+        LBRConfig lc;
+        lc.num_hands = cfg_.lbr_hands;
+        lc.seed      = seed;
+        lc.rm_plus   = rm_plus;
+        return LBREvaluator::evaluate_sharded(factory_, bet_cfg_, lc, device_,
+                                              net, cfg_.lbr_threads);
     };
 
     auto res = eval_sharded(avg_, /*rm_plus=*/false,   // average policy π̄

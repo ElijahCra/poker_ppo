@@ -187,6 +187,11 @@ int main(int argc, char** argv) {
         if (const char* re = std::getenv("ESCHER_REGRET_EMA")) ecfg.regret_ema = std::atof(re);
         if (const char* pr = std::getenv("ESCHER_PREDICTIVE")) ecfg.predictive = std::atof(pr);
         ecfg.buf_cap = envi("ESCHER_BUF_CAP", ecfg.buf_cap);
+        ecfg.val_hidden = envi("ESCHER_VAL_HIDDEN", ecfg.val_hidden);
+        if (const char* s = std::getenv("ESCHER_SEED")) {
+            ecfg.seed = std::strtoull(s, nullptr, 10);
+            torch::manual_seed(ecfg.seed);   // net inits too, not just rollouts
+        }
         if (const char* d = std::getenv("ESCHER_CKPT_DIR")) ecfg.ckpt_dir = d;
         EscherTrainer trainer(factory, ecfg, device);
         trainer.train();

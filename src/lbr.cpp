@@ -12,6 +12,7 @@
 #include <iostream>
 #include <map>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace poker_ppo {
@@ -124,6 +125,46 @@ int pot_raise_index(const PokerEnvironment& env, const torch::Tensor& mask) {
 }
 
 }  // namespace
+
+LBREvaluator::Result
+LBREvaluator::evaluate_sharded(IPokerEnvironmentFactory& factory,
+                               const BetConfig&          bet_cfg,
+                               const LBRConfig&          cfg,
+                               torch::Device             device,
+                               ActorCritic&              target,
+                               int                       threads) {
+    const int T = std::max(1, std::min(threads, cfg.num_hands));
+    std::vector<Result> shard(T);
+    auto run_shard = [&](int t) {
+        LBRConfig lc = cfg;
+        lc.num_hands  = cfg.num_hands / T + (t == 0 ? cfg.num_hands % T : 0);
+        lc.seed       = cfg.seed + 7919u * static_cast<uint64_t>(t);
+        lc.print_diag = cfg.print_diag && (t == 0);
+        if (t != 0 && !lc.log_path.empty())
+            lc.log_path += "." + std::to_string(t);
+        LBREvaluator ev(factory, bet_cfg, lc, device);
+        shard[t] = ev.evaluate(target);
+    };
+    if (T == 1) { run_shard(0); return shard[0]; }
+    std::vector<std::thread> ws;
+    ws.reserve(T);
+    for (int t = 0; t < T; ++t) ws.emplace_back(run_shard, t);
+    for (auto& w : ws) w.join();
+    Result r;
+    double bb = 0.0, mbb = 0.0, win = 0.0;
+    for (const auto& s : shard) {
+        r.num_hands += s.num_hands;
+        bb  += s.bb_per_hand  * s.num_hands;
+        mbb += s.mbb_per_hand * s.num_hands;
+        win += s.lbr_win_rate * s.num_hands;
+        r.wall_ms = std::max(r.wall_ms, s.wall_ms);
+    }
+    const double n = std::max(1, r.num_hands);
+    r.bb_per_hand  = bb / n;
+    r.mbb_per_hand = mbb / n;
+    r.lbr_win_rate = win / n;
+    return r;
+}
 
 LBREvaluator::Result LBREvaluator::evaluate(ActorCritic& target) {
     using clock = std::chrono::steady_clock;

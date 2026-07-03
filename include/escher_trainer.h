@@ -97,6 +97,13 @@ struct EscherConfig {
     // within a few iters). Set to ~3–5 iters worth of nodes to bound staleness.
     int      value_buf_cap = 0;
     int      buf_cap       = 1'000'000;
+    // Value-net hidden dim override (0 = kPPOConfig.hidden_dim). The critic
+    // is the floor-setter (noise study: permanent Q bias is untreatable
+    // downstream) and doubling its DATA didn't move the HUNL floor — so
+    // capacity is the live hypothesis. Applies to value_/value_target_ only.
+    // NOTE: not resume-compatible with checkpoints of a different size, and
+    // changing it shifts the init RNG stream of the nets built after value_.
+    int      val_hidden    = 0;
     int      avg_warmup    = 0;      // skip averaging the first N iters' σ (the
                                      // average is dragged by early off-Nash σ)
     // Average-policy iteration weight = t^k. k=1 = linear CFR (right for an

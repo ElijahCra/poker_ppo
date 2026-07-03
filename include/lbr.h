@@ -100,6 +100,18 @@ public:
     // attacked as-is (raw policy, no deployment filter).
     Result evaluate(ActorCritic& target);
 
+    // Shard cfg.num_hands across `threads` parallel evaluators (each owns its
+    // env + RNG stream; hands are independent, so the merged bound is the
+    // SAME estimator — LBR is latency-bound, so this scales ~linearly with
+    // cores). Shard 0 prints the attribution table for its subset; per-hand
+    // logs get a ".<shard>" suffix. threads<=1 = plain evaluate().
+    static Result evaluate_sharded(IPokerEnvironmentFactory& factory,
+                                   const BetConfig&          bet_cfg,
+                                   const LBRConfig&          cfg,
+                                   torch::Device             device,
+                                   ActorCritic&              target,
+                                   int                       threads);
+
 private:
     IPokerEnvironmentFactory&          factory_;
     BetConfig                          bet_cfg_;
