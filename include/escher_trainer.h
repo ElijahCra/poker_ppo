@@ -229,6 +229,10 @@ private:
     long iter_ = 0;
     float last_val_loss_ = 0.f, last_reg_loss_ = 0.f, last_reg_mag_ = 0.f;
     double best_lbr_ = 1e9;   // best avg-net LBR so far → snapshot avg_best.pt
+    double best_cur_ = 1e9;   // best cur-σ LBR so far → snapshot cur_best.pt
+                              // (the played EMA σ via RM⁺ readout — the
+                              // deployable artifact; late runs creep, so the
+                              // trough state must be captured, not the last)
 };
 
 }  // namespace poker_ppo

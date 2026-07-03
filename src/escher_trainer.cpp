@@ -819,10 +819,16 @@ void EscherTrainer::run_lbr(int iter) {
         ActorCritic& played = (cfg_.regret_ema > 0.f) ? regret_ema_ : regret_;
         auto cres = eval_sharded(played, /*rm_plus=*/true,
                                  cfg_.seed + 2000 + iter);
-        std::printf("  [iter %4d] LBR cur=%.4f bb/hand  (win %.3f, %.0fs)\n",
+        bool cbest = cres.bb_per_hand < best_cur_;
+        if (cbest) best_cur_ = cres.bb_per_hand;
+        std::printf("  [iter %4d] LBR cur=%.4f bb/hand  (win %.3f, %.0fs)%s\n",
                     iter, cres.bb_per_hand, cres.lbr_win_rate,
-                    cres.wall_ms / 1000.0);
+                    cres.wall_ms / 1000.0, cbest ? "  *best*" : "");
         std::fflush(stdout);
+        if (cbest && !cfg_.ckpt_dir.empty()) {  // deployable σ: RM⁺ readout
+            std::filesystem::create_directories(cfg_.ckpt_dir);
+            torch::save(played, cfg_.ckpt_dir + "/cur_best.pt");
+        }
     }
 }
 
@@ -853,7 +859,8 @@ void EscherTrainer::save_checkpoint(int iter) {
     save_opt(*value_opt_,  cfg_.ckpt_dir + "/opt_value.pt");
     save_opt(*regret_opt_, cfg_.ckpt_dir + "/opt_regret.pt");
     save_opt(*avg_opt_,    cfg_.ckpt_dir + "/opt_avg.pt");
-    std::ofstream(cfg_.ckpt_dir + "/iter.txt") << iter << "\n" << best_lbr_;
+    std::ofstream(cfg_.ckpt_dir + "/iter.txt")
+        << iter << "\n" << best_lbr_ << "\n" << best_cur_;
     std::printf("  [ckpt] saved iter %d -> %s\n", iter, cfg_.ckpt_dir.c_str());
 }
 
@@ -894,10 +901,11 @@ bool EscherTrainer::try_resume() {
     load_opt(*avg_opt_,    cfg_.ckpt_dir + "/opt_avg.pt");
     std::ifstream itf(cfg_.ckpt_dir + "/iter.txt");
     itf >> resume_iter_;
-    double b;                                          // pre-fix files lack it
+    double b;                                          // pre-fix files lack these
     if (itf >> b) best_lbr_ = b;
-    std::printf("  [resume] loaded checkpoint at iter %d (best %.3f)\n",
-                resume_iter_, best_lbr_);
+    if (itf >> b) best_cur_ = b;
+    std::printf("  [resume] loaded checkpoint at iter %d (best avg %.3f, "
+                "cur %.3f)\n", resume_iter_, best_lbr_, best_cur_);
     return true;
 }
 
