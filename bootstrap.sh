@@ -86,22 +86,22 @@ ls -lh HandRanks.dat
 #     knee on many-core boxes). Batch scaling / bigger model are NOT here —
 #     they change dynamics and must be done deliberately + BR-validated
 #     (see tools/scale_config.sh and the notes below).
-if [ "${TUNE:-1}" = "1" ]; then
-    echo "==> auto-tuning rollout shape (bench_throughput.sh apply)"
-    bash tools/bench_throughput.sh apply || \
-        echo "    rollout tuning skipped/failed (non-fatal — default kept)"
-
-    NE=$(sed -n "/static constexpr PPOConfig kPPOConfig/,/^};/{s/.*\.num_envs[[:space:]]*=[[:space:]]*\([0-9][0-9]*\).*/\1/p;}" "$REPO_DIR/include/config.h" | head -1)
-    echo "==> auto-tuning CPU workers at num_envs=$NE"
-    T=$(bash tools/bench_throughput.sh threads "$NE" 20 8 16 32 48 64 96 128 2>/dev/null \
-        | sed -n 's/.*POKER_PPO_STEP_THREADS=\([0-9][0-9]*\).*/\1/p')
-    if [ -n "$T" ]; then
-        echo "export POKER_PPO_STEP_THREADS=$T" > tune.env
-        echo "    best workers=$T → wrote tune.env (source it before training)"
-    else
-        echo "    thread tuning skipped/failed (non-fatal — default all-cores)"
-    fi
-fi
+#if [ "${TUNE:-1}" = "1" ]; then
+#    echo "==> auto-tuning rollout shape (bench_throughput.sh apply)"
+#    bash tools/bench_throughput.sh apply || \
+#        echo "    rollout tuning skipped/failed (non-fatal — default kept)"
+#
+#    NE=$(sed -n "/static constexpr PPOConfig kPPOConfig/,/^};/{s/.*\.num_envs[[:space:]]*=[[:space:]]*\([0-9][0-9]*\).*/\1/p;}" "$REPO_DIR/include/config.h" | head -1)
+#    echo "==> auto-tuning CPU workers at num_envs=$NE"
+#    T=$(bash tools/bench_throughput.sh threads "$NE" 20 8 16 32 48 64 96 128 2>/dev/null \
+#        | sed -n 's/.*POKER_PPO_STEP_THREADS=\([0-9][0-9]*\).*/\1/p')
+#    if [ -n "$T" ]; then
+#        echo "export POKER_PPO_STEP_THREADS=$T" > tune.env
+#        echo "    best workers=$T → wrote tune.env (source it before training)"
+#    else
+#        echo "    thread tuning skipped/failed (non-fatal — default all-cores)"
+#    fi
+#fi
 
 cat <<NOTE
 
