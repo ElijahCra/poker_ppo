@@ -150,7 +150,9 @@ struct EscherTrainer::FitGraphs {
         std::vector<torch::Tensor> grads;              // static grad outputs
         std::unique_ptr<at::cuda::CUDAGraph> graph;
     } value, regret, avg;
-    One& of(FitKind k) {
+    std::vector<One> value_ens;   // Q-ensemble extras (one graph per net)
+    One& of(FitKind k, int ens = 0) {
+        if (k == FitKind::Value && ens > 0) return value_ens[ens - 1];
         switch (k) {
         case FitKind::Value:  return value;
         case FitKind::Regret: return regret;
@@ -198,7 +200,17 @@ EscherTrainer::EscherTrainer(IPokerEnvironmentFactory& factory, EscherConfig cfg
       for (size_t i = 0; i < rs.size(); ++i) rd[i].copy_(rs[i]);
       auto rb = regret_->buffers(); auto rdb = regret_ema_->buffers();
       for (size_t i = 0; i < rb.size(); ++i) rdb[i].copy_(rb[i]); }
+    // Q-ensemble extras: constructed LAST (K=1 leaves the RNG stream of the
+    // nets above untouched), independently initialized on purpose.
+    for (int k = 1; k < std::max(1, cfg_.val_ensemble); ++k)
+        value_ens_.push_back(make_value());
+    if (!value_ens_.empty() && cfg_.value_tau > 0.f)
+        std::fprintf(stderr, "  [escher] warning: val_ensemble>1 reads live "
+                     "ensemble Q; value_tau target net is ignored\n");
     value_opt_  = std::make_unique<ForeachAdam>(params_except(value_,  "actor."),  cfg_.lr);
+    for (auto& n : value_ens_)
+        value_ens_opt_.push_back(std::make_unique<ForeachAdam>(
+            params_except(n, "actor."), cfg_.lr));
     regret_opt_ = std::make_unique<ForeachAdam>(params_except(regret_, "critic."), cfg_.lr);
     avg_opt_    = std::make_unique<ForeachAdam>(params_except(avg_,    "critic."), cfg_.lr);
     avg_buf_    = std::make_unique<Reservoir>(cfg_.buf_cap, obs_dim_, A_, cfg_.seed + 7);
@@ -215,6 +227,14 @@ EscherTrainer::EscherTrainer(IPokerEnvironmentFactory& factory, EscherConfig cfg
         regret_iter_buf_ = std::make_unique<Reservoir>(
             std::max(1 << 16, cfg_.regret_traj * 16), obs_dim_, A_, cfg_.seed + 11);
     graphs_ = std::make_unique<FitGraphs>();
+    graphs_->value_ens.resize(value_ens_.size());
+}
+
+std::vector<ActorCritic*> EscherTrainer::q_nets(ActorCritic* single) {
+    if (value_ens_.empty()) return {single};
+    std::vector<ActorCritic*> v{&value_};
+    for (auto& n : value_ens_) v.push_back(&n);
+    return v;
 }
 
 EscherTrainer::~EscherTrainer() = default;
@@ -298,7 +318,8 @@ struct EnvSlot {
 template <class Act, class Finish>
 static void run_rollout(IPokerEnvironmentFactory& factory, const BetConfig& bet,
                         int obs_dim, int A, torch::Device device, int n_envs,
-                        int n_traj, ActorCritic& regret, ActorCritic& value,
+                        int n_traj, ActorCritic& regret,
+                        const std::vector<ActorCritic*>& qnets,
                         bool need_q, Act&& act, Finish&& finish,
                         ActorCritic* cum_net = nullptr) {
     auto opts = torch::TensorOptions().dtype(torch::kFloat);
@@ -327,8 +348,16 @@ static void run_rollout(IPokerEnvironmentFactory& factory, const BetConfig& bet,
         torch::Tensor lg, q, cg;
         { torch::NoGradGuard ng;
           lg = regret->actor_logits(obs_b).to(torch::kCPU).contiguous();
-          if (need_q)
-              q = value->critic_values(obs_b).to(torch::kCPU).contiguous();
+          if (need_q) {
+              torch::Tensor qsum;   // Q-ensemble: mean over members
+              for (ActorCritic* n : qnets) {
+                  auto qi = (*n)->critic_values(obs_b);
+                  qsum = qsum.defined() ? qsum + qi : qi;
+              }
+              if (qnets.size() > 1)
+                  qsum = qsum / static_cast<double>(qnets.size());
+              q = qsum.to(torch::kCPU).contiguous();
+          }
           if (cum_net)
               cg = (*cum_net)->actor_logits(obs_b).to(torch::kCPU).contiguous(); }
         const float* lgp = lg.data_ptr<float>();
@@ -438,11 +467,12 @@ void EscherTrainer::collect_and_train_value(bool fit) {
         }
         n_stage[i] = 0;
     };
-    // bootstrap V̄(child) reads the target net (τ>0) for deadly-triad stability.
+    // bootstrap V̄(child) reads the target net (τ>0) for deadly-triad
+    // stability; with a Q-ensemble the live mean is read instead.
     ActorCritic& vnet = (cfg_.value_tau > 0.f) ? value_target_ : value_;
     ActorCritic& snet = (cfg_.regret_ema > 0.f) ? regret_ema_ : regret_;  // smoothed σ
     run_rollout(factory_, bet_cfg_, obs_dim_, A_, device_, cfg_.rollout_envs,
-                cfg_.value_traj, snet, vnet, need_q, act, finish);
+                cfg_.value_traj, snet, q_nets(&vnet), need_q, act, finish);
     if (!fit) return;   // resume prefill: data only
 
     // train Q(obs, a_taken) -> signed terminal utility (acting-player frame).
@@ -457,8 +487,14 @@ void EscherTrainer::collect_and_train_value(bool fit) {
         vsteps = static_cast<int>(std::lround(
             cfg_.value_steps *
             std::min(1.0, vbuf.size() / (double)cfg_.value_buf_cap)));
-    last_val_loss_ = run_fit(FitKind::Value, value_, *value_opt_, vbuf,
-                             vsteps, /*scale_by_rms=*/false);
+    float vloss = run_fit(FitKind::Value, value_, *value_opt_, vbuf,
+                          vsteps, /*scale_by_rms=*/false);
+    // Ensemble members: same reservoir, independent init + minibatch draws.
+    for (size_t i = 0; i < value_ens_.size(); ++i)
+        vloss += run_fit(FitKind::Value, value_ens_[i], *value_ens_opt_[i],
+                         vbuf, vsteps, /*scale_by_rms=*/false,
+                         /*out_target_mag=*/nullptr, /*ens_idx=*/(int)i + 1);
+    last_val_loss_ = vloss / (1.0f + value_ens_.size());
 
     if (cfg_.value_tau > 0.f) {  // Polyak: target ← τ·value + (1−τ)·target
         torch::NoGradGuard ng;
@@ -507,8 +543,8 @@ void EscherTrainer::collect_regret(int traverser) {
     // the neural-cum cumulative keeps accumulating unsmoothed.
     ActorCritic& snet = (cfg_.regret_ema > 0.f) ? regret_ema_ : regret_;
     run_rollout(factory_, bet_cfg_, obs_dim_, A_, device_, cfg_.rollout_envs,
-                cfg_.regret_traj, snet, value_, /*need_q=*/true, act, finish,
-                cfg_.regret_ema > 0.f ? &regret_ : nullptr);
+                cfg_.regret_traj, snet, q_nets(&value_), /*need_q=*/true,
+                act, finish, cfg_.regret_ema > 0.f ? &regret_ : nullptr);
 }
 
 // PAPER (Deep CFR) reinit, graph-safe: fresh weights are copied INTO the
@@ -569,7 +605,7 @@ void EscherTrainer::collect_avg(long t) {
     auto finish = [&](int, float) {};
     ActorCritic& snet = (cfg_.regret_ema > 0.f) ? regret_ema_ : regret_;  // smoothed σ
     run_rollout(factory_, bet_cfg_, obs_dim_, A_, device_, cfg_.rollout_envs,
-                cfg_.avg_traj, snet, value_, need_q, act, finish);
+                cfg_.avg_traj, snet, q_nets(&value_), need_q, act, finish);
 }
 
 void EscherTrainer::fit_avg() {
@@ -594,7 +630,7 @@ void EscherTrainer::fit_avg() {
 // the old Reservoir::sample loop on CPU devices.
 float EscherTrainer::run_fit(FitKind kind, ActorCritic& net, ForeachAdam& opt,
                              Reservoir& buf, int steps, bool scale_by_rms,
-                             float* out_target_mag) {
+                             float* out_target_mag, int ens_idx) {
     if (buf.size() == 0 || steps <= 0) return 0.f;
     const int n = buf.size();
     const int B = std::min(cfg_.batch_size, n);
@@ -649,7 +685,7 @@ float EscherTrainer::run_fit(FitKind kind, ActorCritic& net, ForeachAdam& opt,
     auto i_dev = torch::TensorOptions().dtype(torch::kLong).device(device_);
 
     // one-time capture, full batches only (partial batch → eager path)
-    auto& fg = graphs_->of(kind);
+    auto& fg = graphs_->of(kind, ens_idx);
     if (!fg.ready && !fg.failed && B == cfg_.batch_size) {
         if (std::getenv("POKER_PPO_ESCHER_NO_FIT_GRAPH") != nullptr) {
             fg.failed = true;
@@ -840,6 +876,11 @@ void EscherTrainer::save_checkpoint(int iter) {
     save_opt(*value_opt_,  cfg_.ckpt_dir + "/opt_value.pt");
     save_opt(*regret_opt_, cfg_.ckpt_dir + "/opt_regret.pt");
     save_opt(*avg_opt_,    cfg_.ckpt_dir + "/opt_avg.pt");
+    for (size_t i = 0; i < value_ens_.size(); ++i) {
+        const std::string sfx = std::to_string(i) + ".pt";
+        torch::save(value_ens_[i], cfg_.ckpt_dir + "/value_ens" + sfx);
+        save_opt(*value_ens_opt_[i], cfg_.ckpt_dir + "/opt_value_ens" + sfx);
+    }
     std::ofstream(cfg_.ckpt_dir + "/iter.txt")
         << iter << "\n" << best_lbr_ << "\n" << best_cur_;
     std::printf("  [ckpt] saved iter %d -> %s\n", iter, cfg_.ckpt_dir.c_str());
@@ -880,6 +921,18 @@ bool EscherTrainer::try_resume() {
     load_opt(*value_opt_,  cfg_.ckpt_dir + "/opt_value.pt");
     load_opt(*regret_opt_, cfg_.ckpt_dir + "/opt_regret.pt");
     load_opt(*avg_opt_,    cfg_.ckpt_dir + "/opt_avg.pt");
+    for (size_t i = 0; i < value_ens_.size(); ++i) {
+        const std::string sfx = std::to_string(i) + ".pt";
+        const std::string np  = cfg_.ckpt_dir + "/value_ens" + sfx;
+        if (std::filesystem::exists(np)) {
+            torch::load(value_ens_[i], np);
+            value_ens_[i]->to(device_);
+        } else {
+            std::fprintf(stderr, "  [resume] warning: %s missing — ensemble "
+                         "member %zu starts from fresh init\n", np.c_str(), i);
+        }
+        load_opt(*value_ens_opt_[i], cfg_.ckpt_dir + "/opt_value_ens" + sfx);
+    }
     std::ifstream itf(cfg_.ckpt_dir + "/iter.txt");
     itf >> resume_iter_;
     double b;                                          // pre-fix files lack these
@@ -895,8 +948,9 @@ void EscherTrainer::train() {
     std::printf("ESCHER HUNL: %d iters, envs=%d, value/regret/avg traj=%d/%d/%d\n",
                 cfg_.iterations, cfg_.rollout_envs, cfg_.value_traj, cfg_.regret_traj,
                 cfg_.avg_traj);
-    std::printf("  value: lam=%.2f tau=%.3f eps=%.3f buf_cap=%d | regret: %s gamma=%.3f ema=%.3f pred=%.2f\n",
+    std::printf("  value: lam=%.2f tau=%.3f eps=%.3f buf_cap=%d hid=%d ens=%d | regret: %s gamma=%.3f ema=%.3f pred=%.2f\n",
                 cfg_.value_lambda, cfg_.value_tau, cfg_.value_eps, cfg_.value_buf_cap,
+                cfg_.val_hidden, 1 + (int)value_ens_.size(),
                 cfg_.regret_buffer ? "reinit-buffer(RM)" : "neural-cum(RM+)",
                 cfg_.ncum_gamma, cfg_.regret_ema, cfg_.predictive);
     try_resume();

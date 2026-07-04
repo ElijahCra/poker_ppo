@@ -104,6 +104,13 @@ struct EscherConfig {
     // NOTE: not resume-compatible with checkpoints of a different size, and
     // changing it shifts the init RNG stream of the nets built after value_.
     int      val_hidden    = 0;
+    // Q-ensemble size (1 = off). K independently-initialized value nets fit
+    // the same reservoir (independent minibatch streams); regret/bootstrap Q
+    // reads their MEAN. Independent inits give decorrelated approximation
+    // errors — the remaining attack on the PERMANENT-bias floor after data
+    // (2x), capacity (2x) and coverage (2.5x) all failed to move it (troughs
+    // 1.0-1.2 across all four HUNL configs). value_tau is ignored when K>1.
+    int      val_ensemble  = 1;
     int      avg_warmup    = 0;      // skip averaging the first N iters' σ (the
                                      // average is dragged by early off-Nash σ)
     // Average-policy iteration weight = t^k. k=1 = linear CFR (right for an
@@ -200,9 +207,11 @@ private:
     // replay a captured fwd+bwd graph per step (ForeachAdam consumes the
     // static grad tensors). CPU device: falls back to Reservoir::sample.
     enum class FitKind { Value, Regret, Avg };
+    // ens_idx: 0 = the primary net of this kind; >0 = Q-ensemble member
+    // (its own captured fit graph — a graph is bound to one net's params).
     float run_fit(FitKind kind, ActorCritic& net, ForeachAdam& opt,
                   Reservoir& buf, int steps, bool scale_by_rms,
-                  float* out_target_mag = nullptr);
+                  float* out_target_mag = nullptr, int ens_idx = 0);
     // Paper-mode per-iter reinit that keeps parameter ADDRESSES stable (the
     // captured fit graph reads params by pointer): draw a fresh net, copy_
     // its params/buffers into regret_, rebuild the optimizer state.
@@ -224,6 +233,13 @@ private:
     ActorCritic              regret_{nullptr};
     ActorCritic              regret_ema_{nullptr};   // σ-smoothing shadow of regret_
     ActorCritic              avg_{nullptr};
+    // Q-ensemble EXTRA members (empty when val_ensemble==1, so the default
+    // path — including ctor init RNG draws — is unchanged).
+    std::vector<ActorCritic>              value_ens_;
+    std::vector<std::unique_ptr<ForeachAdam>> value_ens_opt_;
+    // The Q nets a rollout should read: {single} when the ensemble is off,
+    // else {value_, extras...} (mean is taken inside the rollout).
+    std::vector<ActorCritic*> q_nets(ActorCritic* single);
     // ForeachAdam (multi-tensor, fused) not stock torch::optim::Adam: the nets
     // are small, so stock Adam's per-parameter kernel loop is pure launch
     // overhead and the SGD fits dominate each iter. See include/optim.h.

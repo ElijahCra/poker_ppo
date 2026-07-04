@@ -44,6 +44,13 @@ RESULTS (1000 iters, Leduc, 2026-07-02) — final exploitability:
   catastrophic and untreatable by sigma-dynamics. Critic-Polyak (qema=3)
   is a wash. sigma-EMA beta=.9 beats .95/.98 (lag dominates).
 
+  round 3 (3000 iters, ema.9 base, gentle discounts, 2026-07-04): gamma<1
+  hurts at EVERY strength (noise final: gamma1 0.17, .9995 0.21, .999 0.27)
+  and NO late creep appears in this chassis even at 3000 iters — the HUNL
+  cur-LBR creep is therefore a NET-fitting phenomenon (warm regret-net drift
+  / sigma-sharpening coverage feedback), not an accumulation-rule property.
+  Harvest best-iterates (cur_best.pt); don't discount.
+
 CONCLUSIONS for the HUNL trainer:
   1. iid value noise is benign; PERSISTENT critic bias sets the floor.
      Fix the critic, not the sampler: ESCHER_VALUE_EPS>0 (converts the
@@ -315,10 +322,28 @@ def round2_cells(iters):
     return cells
 
 
+def round3_cells(iters):
+    # Late-creep control: with sigma near Nash, true regrets shrink and the
+    # gamma=1 cumulative integrates rectified noise (observed on HUNL: cur-LBR
+    # creeps up past ~iter 2300, rmag grows monotonically). Does a GENTLE
+    # discount (0.999/0.9995 — round 1's 0.99 was too aggressive) bound the
+    # integral without hurting the floor? All rules on top of ema.9 (prod).
+    rules = [dict(name="ema.9", ema=0.9),
+             dict(name="g.9995", ema=0.9, gamma=0.9995),
+             dict(name="g.999", ema=0.9, gamma=0.999)]
+    cells = []
+    for r in rules:
+        cells.append((r, 0.5, 0.5, iters, 7, 10, 1))   # mild drifting bias
+        cells.append((r, 0.0, 0.0, iters, 7, 10, 1))   # clean control
+    return cells
+
+
 def main():
     which = sys.argv[1] if len(sys.argv) > 1 else "round1"
     iters = int(sys.argv[2]) if len(sys.argv) > 2 else 1000
-    cells = round1_cells(iters) if which == "round1" else round2_cells(iters)
+    cells = (round1_cells(iters) if which == "round1"
+             else round2_cells(iters) if which == "round2"
+             else round3_cells(iters))
     with ProcessPoolExecutor(max_workers=7) as ex:
         for name, sp, si, redraw, qema, evals in ex.map(run_cell, cells):
             final = evals[-1][1]
@@ -326,6 +351,9 @@ def main():
             tag = "fixed" if redraw == FIXED else f"rd{redraw}"
             print(f"  {name:8s} sp={sp:4.2f} si={si:4.2f} {tag:6s} qema={qema}"
                   f"  final={final:.4f}  best={best:.4f}", flush=True)
+            if which == "round3":   # creep needs the trajectory, not extrema
+                traj = "   " + " ".join(f"{t}:{e:.2f}" for t, e in evals)
+                print(traj, flush=True)
 
 
 if __name__ == "__main__":
