@@ -48,6 +48,24 @@ struct HunlValueOracle {
     virtual void value(poker_ppo::PokerEnvironment& env, const uint8_t* board,
                        int nb, const HunlPBS& beta,
                        std::array<std::vector<double>, 2>& out) = 0;
+    // All candidate next cards of one leaf in a single call: base board is
+    // the street's nb_base cards; row i uses base+cards[i]. Default loops
+    // value(); net oracles override with ONE batched forward — the entire
+    // GPU win for leaf queries.
+    virtual void value_batch(poker_ppo::PokerEnvironment& env,
+                             const uint8_t* base_board, int nb_base,
+                             const std::vector<uint8_t>& cards,
+                             const std::vector<HunlPBS>& betas,
+                             std::vector<std::array<std::vector<double>, 2>>&
+                                 outs) {
+        outs.resize(cards.size());
+        std::array<uint8_t, 5> b{};
+        for (int i = 0; i < nb_base; ++i) b[i] = base_board[i];
+        for (size_t i = 0; i < cards.size(); ++i) {
+            b[nb_base] = cards[i];
+            value(env, b.data(), nb_base + 1, betas[i], outs[i]);
+        }
+    }
 };
 
 class HunlSolver {

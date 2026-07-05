@@ -70,6 +70,14 @@ Built and validated on this machine (target =rebel_hunl=):
     requires; unsafe-resolving gap ~0.09 bb at this root.
   The trainer's probe now uses the composed judge; value targets are in
   POT units (paper normalization).
+- trainer observability + GPU (2026-07-05): =heldout= = masked MSE on each
+  epoch's FRESH samples BEFORE training on them (in-replay MSE is
+  memorization at small scale — the old probe read 0.000000); per-epoch
+  phase timings; the net lives on CUDA when available and leaf queries are
+  ONE batched [48, D] forward per leaf. Expected GPU profile: utilization
+  stays LOW — the CFR walks are CPU-bound per-combo recursion; the GPU
+  serves leaf forwards + training. Parallel episodes / flat-tensor solver
+  are the next scaling steps if CPU saturates.
 
 - =hunl_value=: PBS value net (street/board/pot + both 1326-ranges →
   per-combo values both players) + Algorithm-1 endgame self-play

@@ -1,6 +1,7 @@
 #include "hunl_value.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 
@@ -49,33 +50,58 @@ torch::Tensor HunlValueNetImpl::forward(torch::Tensor x) {
 void HunlNetOracle::value(poker_ppo::PokerEnvironment& env,
                           const uint8_t* board, int nb, const HunlPBS& beta,
                           std::array<std::vector<double>, 2>& out) {
+    std::vector<uint8_t> cards = {board[nb - 1]};
+    std::vector<HunlPBS> betas = {beta};
+    std::vector<std::array<std::vector<double>, 2>> outs;
+    value_batch(env, board, nb - 1, cards, betas, outs);
+    out = std::move(outs[0]);
+}
+
+void HunlNetOracle::value_batch(
+    poker_ppo::PokerEnvironment& env, const uint8_t* base_board, int nb_base,
+    const std::vector<uint8_t>& cards, const std::vector<HunlPBS>& betas,
+    std::vector<std::array<std::vector<double>, 2>>& outs) {
+    const long N = static_cast<long>(cards.size());
+    outs.resize(cards.size());
+    if (N == 0) return;
     const double contrib =
         static_cast<double>(env.game_config().initial_stack) - env.stack(0);
     const double pot = 2.0 * contrib;
     torch::NoGradGuard ng;
-    auto f = HunlFeaturizer::features(street_of(nb), board, nb, pot, stack_,
-                                      beta);
-    auto x = torch::from_blob(f.data(), {1, HunlFeaturizer::kDim},
-                              torch::kFloat)
-                 .clone();
-    auto y = net_->forward(x).squeeze(0);
-    auto acc = y.accessor<float, 1>();
-    // net predicts values in POT units (paper normalization: well-
-    // conditioned across pot sizes; future betting can push |v| past 1)
-    for (int p = 0; p < 2; ++p) {
-        out[p].assign(kCombos, 0.0);
-        for (int i = 0; i < kCombos; ++i)
-            out[p][i] = static_cast<double>(acc[p * kCombos + i]) * pot;
+    auto X = torch::empty({N, HunlFeaturizer::kDim}, torch::kFloat);
+    std::array<uint8_t, 5> b{};
+    for (int i = 0; i < nb_base; ++i) b[i] = base_board[i];
+    for (long r = 0; r < N; ++r) {
+        b[nb_base] = cards[static_cast<size_t>(r)];
+        auto f = HunlFeaturizer::features(street_of(nb_base + 1), b.data(),
+                                          nb_base + 1, pot, stack_,
+                                          betas[static_cast<size_t>(r)]);
+        std::copy(f.begin(), f.end(),
+                  X.data_ptr<float>() +
+                      static_cast<size_t>(r) * HunlFeaturizer::kDim);
     }
+    // ONE forward for the whole leaf (all candidate cards) on the device.
+    // Net predicts values in POT units (paper normalization).
+    auto y = net_->forward(X.to(device_)).to(torch::kCPU).contiguous();
+    auto acc = y.accessor<float, 2>();
+    for (long r = 0; r < N; ++r)
+        for (int p = 0; p < 2; ++p) {
+            auto& o = outs[static_cast<size_t>(r)][p];
+            o.assign(kCombos, 0.0);
+            for (int i = 0; i < kCombos; ++i)
+                o[i] = static_cast<double>(acc[r][p * kCombos + i]) * pot;
+        }
 }
 
 EndgameTrainer::EndgameTrainer(EndgameConfig cfg)
     : cfg_(std::move(cfg)),
       stack_(static_cast<double>(
           poker_ppo::kPokerConfig.game.initial_stack)),
+      device_(torch::cuda::is_available() ? torch::kCUDA : torch::kCPU),
       rng_(static_cast<unsigned>(cfg_.seed)) {
     torch::manual_seed(cfg_.seed);
     net_ = HunlValueNet(cfg_.hidden);
+    net_->to(device_);
     opt_ = std::make_unique<torch::optim::Adam>(net_->parameters(), cfg_.lr);
 }
 
@@ -103,7 +129,8 @@ std::vector<double> EndgameTrainer::random_range(std::mt19937& rng) {
 }
 
 void EndgameTrainer::self_play_episode(poker_ppo::PokerEnvironment& env,
-                                       std::mt19937& rng) {
+                                       std::mt19937& rng,
+                                       std::vector<Sample>& fresh) {
     for (int tries = 0; tries < 50; ++tries)
         if (sample_turn_root(env, rng)) break;
     if (env.is_terminal() || env.round() != 2) return;
@@ -111,7 +138,7 @@ void EndgameTrainer::self_play_episode(poker_ppo::PokerEnvironment& env,
     HunlPBS beta;
     beta.r0 = random_range(rng);
     beta.r1 = random_range(rng);
-    HunlNetOracle oracle(net_, stack_);
+    HunlNetOracle oracle(net_, stack_, device_);
     HunlSolver s(env, beta, &oracle, cfg_.actions);
     s.refresh_every = 5;
 
@@ -164,15 +191,7 @@ void EndgameTrainer::self_play_episode(poker_ppo::PokerEnvironment& env,
             smp.mask[p * kCombos + i] = 1.0f;
         }
     }
-    ++seen_;
-    if (static_cast<int>(replay_.size()) < cfg_.replay_cap) {
-        replay_.push_back(std::move(smp));
-    } else {
-        std::uniform_int_distribution<long> d(0, seen_ - 1);
-        const long j = d(rng_);
-        if (j < static_cast<long>(replay_.size()))
-            replay_[static_cast<size_t>(j)] = std::move(smp);
-    }
+    fresh.push_back(std::move(smp));   // probed out-of-sample, then merged
 }
 
 double EndgameTrainer::train_net() {
@@ -197,8 +216,9 @@ double EndgameTrainer::train_net() {
                       M.data_ptr<float>() + static_cast<size_t>(b) * n_out);
         }
         opt_->zero_grad();
-        auto loss =
-            ((net_->forward(X) - Y).pow(2) * M).sum() / M.sum().clamp_min(1.0);
+        auto Xd = X.to(device_), Yd = Y.to(device_), Md = M.to(device_);
+        auto loss = ((net_->forward(Xd) - Yd).pow(2) * Md).sum() /
+                    Md.sum().clamp_min(1.0);
         loss.backward();
         opt_->step();
         if (step == cfg_.sgd_steps - 1) last = loss.item<double>();
@@ -206,16 +226,15 @@ double EndgameTrainer::train_net() {
     return last;
 }
 
-double EndgameTrainer::probe_mse(int k) {
-    if (replay_.empty()) return 0.0;
+double EndgameTrainer::heldout_mse(const std::vector<Sample>& fresh) {
+    if (fresh.empty()) return 0.0;
     torch::NoGradGuard ng;
-    std::uniform_int_distribution<size_t> pick(0, replay_.size() - 1);
     double se = 0.0, cnt = 0.0;
-    for (int i = 0; i < k; ++i) {
-        const Sample& s = replay_[pick(rng_)];
+    for (const Sample& s : fresh) {
         auto x = torch::from_blob(const_cast<float*>(s.feat.data()),
-                                  {1, HunlFeaturizer::kDim}, torch::kFloat);
-        auto y = net_->forward(x).squeeze(0);
+                                  {1, HunlFeaturizer::kDim}, torch::kFloat)
+                     .to(device_);
+        auto y = net_->forward(x).squeeze(0).to(torch::kCPU).contiguous();
         auto acc = y.accessor<float, 1>();
         for (int j = 0; j < 2 * kCombos; ++j)
             if (s.mask[j] > 0.5f) {
@@ -244,38 +263,67 @@ double EndgameTrainer::probe_turn_expl(poker_ppo::PokerEnvironment& env,
 }
 
 void EndgameTrainer::run() {
+    using clock = std::chrono::steady_clock;
+    auto secs = [](clock::time_point a, clock::time_point b) {
+        return std::chrono::duration<double>(b - a).count();
+    };
     poker_ppo::PokerEnvironment env(poker_ppo::kPokerConfig,
                                     poker_ppo::config::kBetConfig,
                                     cfg_.seed + 99);
     const double bb =
         static_cast<double>(env.game_config().big_blind);
     std::printf("HUNL endgame ReBeL: T_turn=%d T_river=%d episodes=%d "
-                "epochs=%d hidden=%d\n",
+                "epochs=%d hidden=%d device=%s\n",
                 cfg_.t_turn, cfg_.t_river, cfg_.episodes, cfg_.epochs,
-                cfg_.hidden);
+                cfg_.hidden, device_.is_cuda() ? "cuda" : "cpu");
     // reference: the same probe turn solve with EXACT leaves (slow, once)
+    auto t0 = clock::now();
     ExactStreetOracle exact(cfg_.t_river / 2, cfg_.actions);
     const double ref =
         probe_turn_expl(env, &exact, /*T=*/30, /*refresh_every=*/10);
-    std::printf("  probe turn expl (exact leaves, T=30): %.4f bb\n",
-                ref / bb);
+    std::printf("  probe turn expl (exact leaves, T=30): %.4f bb  (%.0fs)\n",
+                ref / bb, secs(t0, clock::now()));
     std::fflush(stdout);
 
     for (int ep = 1; ep <= cfg_.epochs; ++ep) {
+        auto t_sp0 = clock::now();
+        std::vector<Sample> fresh;
         for (int e = 0; e < cfg_.episodes; ++e)
-            self_play_episode(env, rng_);
+            self_play_episode(env, rng_, fresh);
+        auto t_sp1 = clock::now();
+        // out-of-sample probe BEFORE these rows are trained on
+        const double heldout = heldout_mse(fresh);
+        for (Sample& smp : fresh) {
+            ++seen_;
+            if (static_cast<int>(replay_.size()) < cfg_.replay_cap) {
+                replay_.push_back(std::move(smp));
+            } else {
+                std::uniform_int_distribution<long> d(0, seen_ - 1);
+                const long j = d(rng_);
+                if (j < static_cast<long>(replay_.size()))
+                    replay_[static_cast<size_t>(j)] = std::move(smp);
+            }
+        }
+        auto t_tr0 = clock::now();
         const double vloss = train_net();
-        const double probe = probe_mse(cfg_.probe_k);
-        double net_expl = -1.0;
+        auto t_tr1 = clock::now();
+        double net_expl = -1.0, t_probe = 0.0;
         if (ep % 5 == 0 || ep == cfg_.epochs) {
-            HunlNetOracle no(net_, stack_);
+            auto t_pr0 = clock::now();
+            HunlNetOracle no(net_, stack_, device_);
             net_expl = probe_turn_expl(env, &no, /*T=*/30,
                                        /*refresh_every=*/1);
+            t_probe = secs(t_pr0, clock::now());
         }
-        std::printf("  epoch %3d  replay=%5zu  vloss=%.6f  probe=%.6f",
-                    ep, replay_.size(), vloss, probe);
+        std::printf("  epoch %3d  replay=%5zu  vloss=%.3e  heldout=%.3e"
+                    "  [sp %.0fs train %.0fs",
+                    ep, replay_.size(), vloss, heldout,
+                    secs(t_sp0, t_sp1), secs(t_tr0, t_tr1));
         if (net_expl >= 0.0)
-            std::printf("  probe-turn-expl(net)=%.4f bb", net_expl / bb);
+            std::printf(" probe %.0fs]  probe-turn-expl(net)=%.4f bb",
+                        t_probe, net_expl / bb);
+        else
+            std::printf("]");
         std::printf("\n");
         std::fflush(stdout);
     }

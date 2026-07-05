@@ -45,14 +45,23 @@ TORCH_MODULE(HunlValueNet);
 
 class HunlNetOracle : public HunlValueOracle {
 public:
-    HunlNetOracle(HunlValueNet net, double stack) : net_(net), stack_(stack) {}
+    HunlNetOracle(HunlValueNet net, double stack, torch::Device device)
+        : net_(net), stack_(stack), device_(device) {}
     void value(poker_ppo::PokerEnvironment& env, const uint8_t* board, int nb,
                const HunlPBS& beta,
                std::array<std::vector<double>, 2>& out) override;
+    // one [N, kDim] forward for a whole leaf's candidate cards
+    void value_batch(poker_ppo::PokerEnvironment& env,
+                     const uint8_t* base_board, int nb_base,
+                     const std::vector<uint8_t>& cards,
+                     const std::vector<HunlPBS>& betas,
+                     std::vector<std::array<std::vector<double>, 2>>& outs)
+        override;
 
 private:
     HunlValueNet net_;
     double stack_;
+    torch::Device device_;
 };
 
 struct EndgameConfig {
@@ -77,17 +86,23 @@ public:
     void run();
 
 private:
+    struct Sample {
+        std::vector<float> feat, target, mask;   // target/mask [2*kCombos]
+    };
+
     // env positioned at a random turn root (random board, random pot via a
     // random legal prefix); returns false if the prefix ended the hand.
     bool sample_turn_root(poker_ppo::PokerEnvironment& env, std::mt19937& rng);
     std::vector<double> random_range(std::mt19937& rng);
-    void self_play_episode(poker_ppo::PokerEnvironment& env,
-                           std::mt19937& rng);
+    // appends this episode's target (if any) to `fresh` (probed before
+    // being merged into the replay)
+    void self_play_episode(poker_ppo::PokerEnvironment& env, std::mt19937& rng,
+                           std::vector<Sample>& fresh);
     double train_net();
-    // Masked MSE of the net vs stored targets on a random replay subset —
-    // targets here ARE exact river solves, so this is a true accuracy probe
-    // (unlike Leduc, no bootstrapped-target caveat).
-    double probe_mse(int k);
+    // Masked MSE of the net on the given samples. Called on each epoch's
+    // FRESH samples BEFORE they are trained on — a true out-of-sample
+    // generalization probe (in-replay MSE is memorization at small scale).
+    double heldout_mse(const std::vector<Sample>& fresh);
     // Internal exploitability of a turn solve on a FIXED probe situation
     // with the given oracle — comparing net leaves vs exact leaves on the
     // same root is the cross-validation of the trained net.
@@ -96,13 +111,11 @@ private:
 
     EndgameConfig cfg_;
     double        stack_;
+    torch::Device device_;
     HunlValueNet  net_{nullptr};
     std::unique_ptr<torch::optim::Adam> opt_;
     std::mt19937  rng_;
 
-    struct Sample {
-        std::vector<float> feat, target, mask;   // target/mask [2*kCombos]
-    };
     std::vector<Sample> replay_;
     long                seen_ = 0;
 };

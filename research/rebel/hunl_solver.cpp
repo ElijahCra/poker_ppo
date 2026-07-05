@@ -182,6 +182,8 @@ void HunlSolver::refresh_leaves() {
         reaches_to(L, /*average=*/true, r0, r1);   // CFR-AVG leaf beliefs
         env_.push_state();
         for (int a : nodes_[L].path) env_.step(a);
+        std::vector<uint8_t> cards;
+        std::vector<HunlPBS> betas;
         for (int c = 0; c < kCards; ++c) {
             bool on_board = false;
             for (int b = 0; b < nb_root_; ++b)
@@ -192,10 +194,14 @@ void HunlSolver::refresh_leaves() {
             beta.r1 = r1;
             mask_card(beta.r0, static_cast<uint8_t>(c));
             mask_card(beta.r1, static_cast<uint8_t>(c));
-            std::array<uint8_t, 5> nb = board_;
-            nb[nb_root_] = static_cast<uint8_t>(c);
-            oracle_->value(env_, nb.data(), nb_root_ + 1, beta, per[c]);
+            cards.push_back(static_cast<uint8_t>(c));
+            betas.push_back(std::move(beta));
         }
+        std::vector<std::array<std::vector<double>, 2>> outs;
+        oracle_->value_batch(env_, board_.data(), nb_root_, cards, betas,
+                             outs);
+        for (size_t k = 0; k < cards.size(); ++k)
+            per[cards[k]] = std::move(outs[k]);
         env_.pop_state();
     }
 }
