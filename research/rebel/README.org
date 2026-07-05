@@ -1,0 +1,60 @@
+#+TITLE: ReBeL — research stage (Kuhn/Leduc), validated before HUNL
+
+Faithful implementation of ReBeL (Brown, Bakhtin, Lerer, Gong 2020,
+arXiv:2007.13544) on the repo's exact-judge small games. Build target
+=rebel=; see rebel.h for the faithfulness notes and the two documented
+deviations (no policy-net warm start; unsafe test-time composition).
+
+* Validation ladder (2026-07-04, this machine, CPU)
+
+| test                                   | result                        |
+|----------------------------------------+-------------------------------|
+| kuhn exact (solver sanity, no leaves)  | expl 0.0056 → 0.00018 (T=1k)  |
+| leduc exact-leaf CFR-D (decomposition) | expl ~0.10–0.12 (see below)   |
+| leduc train, 20 epochs (full loop)     | expl 2.21 → 0.26–0.37, probe-MSE 0.062 → 0.012 |
+
+* Findings worth remembering
+
+1. *CFR-AVG is load-bearing.* Leaf beliefs from the CURRENT iterate
+   (textbook CFR-D) diverge outright with a re-solved exact oracle
+   (expl 1.6): continuation-equilibrium values jump discontinuously as
+   the oscillating iterate moves the beliefs. Average-policy beliefs
+   (the paper's CFR-AVG) converge. This reproduces the paper's stated
+   motivation exactly.
+2. *The unreached-subgame gap is real and grows with T.* As RM⁺
+   sparsifies the trunk support, more round-boundary beliefs are
+   zero-mass; their subgames are solved from uniform fallbacks and the
+   best response farms them (expl rose 0.10→0.18 from T=1k→3k;
+   REBEL_EVAL_SMOOTH=0.001 flattens it to 0.118→0.123). This is the
+   classic unsafe-resolving cost — the safe-resolving gadget (Burch et
+   al. 2014) is the known fix and the main open item.
+3. *Per-query re-solved value oracles are WORSE than a trained net.*
+   Sharpening the exact oracle (400→2000 inner iters) RAISED trunk
+   exploitability (0.118→0.184): per-infostate values of a 2p0s
+   subgame are not unique across equilibria, and sharper solves snap
+   between selections as beliefs vary. A single trained v̂ is
+   self-consistent by construction — the learned loop is expected to
+   (and does) approach the composed floor. Don't use the exact mode as
+   the quality bar; it's a mechanics smoke test.
+
+* HUNL port map (stage 2)
+
+- Beliefs/ranges: LBR's =Belief= (src/lbr.cpp) already Bayes-tracks
+  1326-combo ranges — reuse for the PBS tracker.
+- Subgame solver: this solver's structure, vectorized over 1326 hands
+  on GPU tensors; terminal fold eval O(n) via the sum-minus-blockers
+  trick; showdown eval O(n·52) via rank-sort sweep (Game/Utility
+  RangeEquity/HandStrength kernels are the starting point).
+- Depth limit: current street; river subgames solve to terminal
+  (exact, no net) — mirrors round-2 here.
+- Leaf value net: public state (board one-hots + pot/stack features +
+  bet history) + both ranges → per-hand values both players.
+  The ESCHER privileged critic marginalized over a range is a
+  reasonable warm-start / baseline comparator.
+- Bet abstraction: the env's existing 14-action config.
+- Self-play at scale: batch leaf-net queries per iteration (already
+  the structure here), episodes parallel across CPU workers, net on
+  GPU.
+- Open items, in priority order: safe-resolving gadget for unreached
+  subgames; policy-net warm start (paper §5, optional); longer
+  training + larger nets; exploitability judged by LBR on HUNL.

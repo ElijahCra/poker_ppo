@@ -124,6 +124,25 @@ endif()
 add_executable(escher_validate research/escher_cpp/validate_main.cpp)
 target_include_directories(escher_validate PRIVATE research/escher_cpp)
 
+# ── ReBeL research binary (PBS subgame solver + value net; Kuhn/Leduc) ───────
+# Faithful Brown et al. 2020 on the exact-judge small games — stage 1 of the
+# HUNL port. Reuses the validated escher_cpp games + exact BR.
+add_executable(rebel
+    research/rebel/rebel.cpp
+    research/rebel/rebel_main.cpp
+)
+target_include_directories(rebel PRIVATE research/rebel research/escher_cpp)
+target_link_libraries(rebel PRIVATE "${TORCH_LIBRARIES}")
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+    target_compile_options(rebel PRIVATE
+        "SHELL:-include ${GLIBC_FEATURES_H}/features.h"
+        "SHELL:-include cstring"
+        "SHELL:-include cstdlib"
+        "SHELL:-include limits"
+        "SHELL:-include mutex"
+    )
+endif()
+
 # ── Tests ─────────────────────────────────────────────────────────────────────
 # Opt-in via -DBUILD_TESTS=ON (default ON). Pulls GoogleTest via
 # FetchContent inside Game/tests/.
