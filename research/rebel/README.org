@@ -78,6 +78,19 @@ Built and validated on this machine (target =rebel_hunl=):
   stays LOW — the CFR walks are CPU-bound per-combo recursion; the GPU
   serves leaf forwards + training. Parallel episodes / flat-tensor solver
   are the next scaling steps if CPU saturates.
+- sample-rate fix (2026-07-05): the box run showed the diagnosis clearly —
+  heldout flat ~0.3 through 4.5k samples, vloss rising: NOT a bug, sample
+  starvation (1 target per 120-iteration turn solve; this regression class
+  needs 1e5-1e7 rows — DeepStack used ~1M river situations). Fixes:
+  (1) harvest: each turn solve also exact-solves `harvest` random
+  (leaf,card) PBSs from its own final-average query distribution (~9
+  targets/episode); (2) =train_river= mode (DeepStack recipe): direct
+  river-situation sampling, no turn solves — ~28 targets/s on 8 laptop
+  cores, first genuine learning curve (heldout 0.19→0.10 in 3 epochs).
+  Net checkpointing added (rebel_value.pt, load-if-exists + save per
+  epoch) for the two-phase workflow: big train_river pretrain → train_turn
+  fine-tune on the on-distribution data. seed=0 now draws a random seed
+  (printed) — fixed-seed resumes replayed identical "fresh" data.
 - CPU parallel self-play (2026-07-05): episodes fan out over a worker pool
   (own env + RNG per worker, work-stealing counter, net read-only; torch
   intra-op pinned to 1; HandRanks pre-warmed before spawn). REBEL_THREADS

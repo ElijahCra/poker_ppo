@@ -81,6 +81,19 @@ struct EndgameConfig {
     // independent: each worker owns an env + RNG; the net is read-only at
     // inference. torch intra-op threads are pinned to 1 when workers > 1.
     int    threads      = 0;
+    // Extra river targets harvested per turn solve from the (leaf, card)
+    // PBSs the solver queries at final-average beliefs — the net's exact
+    // query distribution, at ~1 river solve each. Algorithm 1's t* leaf
+    // sample alone is 1 target per ~35 core-seconds: sample-starved (this
+    // regression needs 1e5-1e7 rows; DeepStack used ~1M river situations).
+    int    harvest      = 8;
+    // train_river mode: direct river-situation sampling (DeepStack recipe) —
+    // no turn solves at all; `episodes` = river targets per epoch.
+    bool   river_only   = false;
+    // net checkpoint: loaded at start if present, saved each epoch. Lets a
+    // train_turn run fine-tune a river-pretrained net (and later serves the
+    // play-time solver). Empty = off.
+    std::string ckpt    = "rebel_value.pt";
     uint64_t seed       = 0;
 };
 
@@ -94,9 +107,16 @@ private:
         std::vector<float> feat, target, mask;   // target/mask [2*kCombos]
     };
 
-    // env positioned at a random turn root (random board, random pot via a
-    // random legal prefix); returns false if the prefix ended the hand.
-    bool sample_turn_root(poker_ppo::PokerEnvironment& env, std::mt19937& rng);
+    // env positioned at a random street root (random board, random pot via
+    // a random legal prefix); returns false if the prefix ended the hand.
+    bool sample_street_root(poker_ppo::PokerEnvironment& env,
+                            std::mt19937& rng, int target_round);
+    // Exact-solve the river PBS at the env's CURRENT state (must be a river
+    // root) and append a training sample. beta is card-masked, unnormalized.
+    bool river_sample_at(poker_ppo::PokerEnvironment& env, const uint8_t* b5,
+                         const HunlPBS& beta, std::vector<Sample>& out);
+    void direct_river_episode(poker_ppo::PokerEnvironment& env,
+                              std::mt19937& rng, std::vector<Sample>& fresh);
     std::vector<double> random_range(std::mt19937& rng);
     // appends this episode's target (if any) to `fresh` (probed before
     // being merged into the replay)

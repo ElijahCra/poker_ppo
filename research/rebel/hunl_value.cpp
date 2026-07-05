@@ -6,6 +6,7 @@
 #include <thread>
 #include <cmath>
 #include <cstdio>
+#include <filesystem>
 
 #include "config.h"
 
@@ -101,24 +102,104 @@ EndgameTrainer::EndgameTrainer(EndgameConfig cfg)
           poker_ppo::kPokerConfig.game.initial_stack)),
       device_(torch::cuda::is_available() ? torch::kCUDA : torch::kCPU),
       rng_(static_cast<unsigned>(cfg_.seed)) {
+    if (cfg_.seed == 0) {
+        // distinct data streams across resumed runs (seed collisions make a
+        // resumed run's "fresh" samples replay the previous run's exactly);
+        // pass an explicit seed for reproducibility.
+        cfg_.seed = std::random_device{}();
+        std::printf("  [seed] %llu\n",
+                    static_cast<unsigned long long>(cfg_.seed));
+    }
+    rng_.seed(static_cast<unsigned>(cfg_.seed));
     torch::manual_seed(cfg_.seed);
     net_ = HunlValueNet(cfg_.hidden);
+    if (!cfg_.ckpt.empty() && std::filesystem::exists(cfg_.ckpt)) {
+        torch::load(net_, cfg_.ckpt);
+        std::printf("  [ckpt] loaded %s\n", cfg_.ckpt.c_str());
+    }
     net_->to(device_);
     opt_ = std::make_unique<torch::optim::Adam>(net_->parameters(), cfg_.lr);
 }
 
-bool EndgameTrainer::sample_turn_root(poker_ppo::PokerEnvironment& env,
-                                      std::mt19937& rng) {
+bool EndgameTrainer::sample_street_root(poker_ppo::PokerEnvironment& env,
+                                        std::mt19937& rng, int target_round) {
     std::uniform_real_distribution<double> u(0.0, 1.0);
     env.reset();
-    while (!env.is_terminal() && env.round() < 2) {
+    while (!env.is_terminal() && env.round() < target_round) {
         // mostly call/check, sometimes pot-raise: varied pots, rare all-ins
         const int a = u(rng) < 0.25 ? 7 : 1;
         auto mask = env.legal_action_mask();
         auto ma = mask.accessor<float, 1>();
         env.step(ma[a] > 0.5f ? a : 1);
     }
-    return !env.is_terminal() && env.round() == 2;
+    return !env.is_terminal() && env.round() == target_round;
+}
+
+bool EndgameTrainer::river_sample_at(poker_ppo::PokerEnvironment& env,
+                                     const uint8_t* b5, const HunlPBS& beta,
+                                     std::vector<Sample>& out) {
+    ExactStreetOracle exact(cfg_.t_river, cfg_.actions);
+    std::array<std::vector<double>, 2> v;
+    exact.value(env, b5, 5, beta, v);
+    const double contrib =
+        static_cast<double>(env.game_config().initial_stack) - env.stack(0);
+    if (contrib <= 0.0) return false;
+
+    std::vector<uint8_t> v5;
+    board_valid(b5, 5, v5);
+    // normalized ranges for the FEATURES (the solver normalized its own copy)
+    HunlPBS nb = beta;
+    {
+        double s0 = 0.0, s1 = 0.0;
+        for (int i = 0; i < kCombos; ++i) {
+            if (!v5[i]) {
+                nb.r0[i] = nb.r1[i] = 0.0;
+                continue;
+            }
+            s0 += nb.r0[i];
+            s1 += nb.r1[i];
+        }
+        if (s0 <= 0.0 || s1 <= 0.0) return false;
+        for (int i = 0; i < kCombos; ++i) {
+            nb.r0[i] /= s0;
+            nb.r1[i] /= s1;
+        }
+    }
+    std::array<std::vector<double>, 2> omass;
+    compat_mass(nb.r1, v5, omass[0]);
+    compat_mass(nb.r0, v5, omass[1]);
+
+    Sample smp;
+    const double pot_leaf = 2.0 * contrib;
+    smp.feat = HunlFeaturizer::features(3, b5, 5, pot_leaf, stack_, nb);
+    smp.target.assign(2 * kCombos, 0.0f);
+    smp.mask.assign(2 * kCombos, 0.0f);
+    for (int p = 0; p < 2; ++p) {
+        const auto& own = p == 0 ? nb.r0 : nb.r1;
+        for (int i = 0; i < kCombos; ++i) {
+            if (!v5[i] || own[i] <= 0.0 || omass[p][i] <= 0.0) continue;
+            smp.target[p * kCombos + i] =
+                static_cast<float>(v[p][i] / pot_leaf);   // pot units
+            smp.mask[p * kCombos + i] = 1.0f;
+        }
+    }
+    out.push_back(std::move(smp));
+    return true;
+}
+
+void EndgameTrainer::direct_river_episode(poker_ppo::PokerEnvironment& env,
+                                          std::mt19937& rng,
+                                          std::vector<Sample>& fresh) {
+    for (int tries = 0; tries < 50; ++tries)
+        if (sample_street_root(env, rng, 3)) break;
+    if (env.is_terminal() || env.round() != 3) return;
+    uint8_t b5[5];
+    for (int i = 0; i < 5; ++i)
+        b5[i] = static_cast<uint8_t>(env.community_card(i));
+    HunlPBS beta;
+    beta.r0 = random_range(rng);
+    beta.r1 = random_range(rng);
+    river_sample_at(env, b5, beta, fresh);
 }
 
 std::vector<double> EndgameTrainer::random_range(std::mt19937& rng) {
@@ -134,7 +215,7 @@ void EndgameTrainer::self_play_episode(poker_ppo::PokerEnvironment& env,
                                        std::mt19937& rng,
                                        std::vector<Sample>& fresh) {
     for (int tries = 0; tries < 50; ++tries)
-        if (sample_turn_root(env, rng)) break;
+        if (sample_street_root(env, rng, 2)) break;
     if (env.is_terminal() || env.round() != 2) return;
 
     HunlPBS beta;
@@ -157,43 +238,70 @@ void EndgameTrainer::self_play_episode(poker_ppo::PokerEnvironment& env,
             have = s.sample_leaf(rng, cfg_.eps_explore, explorer, &leaf,
                                  &card, &leaf_beta);
     }
-    if (!have) return;   // walk ended at an in-street terminal
 
-    // exact river solve at the sampled leaf = the grounded target
-    std::array<uint8_t, 5> b5 = s.board();
-    b5[s.board_count()] = card;
-    env.push_state();
-    for (int a : s.nodes()[leaf].path) env.step(a);
-    ExactStreetOracle exact(cfg_.t_river, cfg_.actions);
-    std::array<std::vector<double>, 2> v;
-    exact.value(env, b5.data(), 5, leaf_beta, v);
-    const double contrib =
-        static_cast<double>(env.game_config().initial_stack) - env.stack(0);
-    env.pop_state();
-
-    // masks: valid on the full board, own mass, opponent compatible mass
-    std::vector<uint8_t> v5;
-    board_valid(b5.data(), 5, v5);
-    std::array<std::vector<double>, 2> omass;
-    compat_mass(leaf_beta.r1, v5, omass[0]);
-    compat_mass(leaf_beta.r0, v5, omass[1]);
-
-    Sample smp;
-    smp.feat = HunlFeaturizer::features(3, b5.data(), 5, 2.0 * contrib,
-                                        stack_, leaf_beta);
-    smp.target.assign(2 * kCombos, 0.0f);
-    smp.mask.assign(2 * kCombos, 0.0f);
-    const double pot_leaf = 2.0 * contrib;
-    for (int p = 0; p < 2; ++p) {
-        const auto& own = p == 0 ? leaf_beta.r0 : leaf_beta.r1;
-        for (int i = 0; i < kCombos; ++i) {
-            if (!v5[i] || own[i] <= 0.0 || omass[p][i] <= 0.0) continue;
-            smp.target[p * kCombos + i] =
-                static_cast<float>(v[p][i] / pot_leaf);   // pot units
-            smp.mask[p * kCombos + i] = 1.0f;
-        }
+    // Algorithm 1's t*-sampled continuation leaf (ε-explored coverage)
+    if (have) {
+        std::array<uint8_t, 5> b5 = s.board();
+        b5[s.board_count()] = card;
+        env.push_state();
+        for (int a : s.nodes()[leaf].path) env.step(a);
+        river_sample_at(env, b5.data(), leaf_beta, fresh);
+        env.pop_state();
     }
-    fresh.push_back(std::move(smp));   // probed out-of-sample, then merged
+
+    // Harvest: additional (leaf, card) PBSs from the solver's own query
+    // distribution (final-average beliefs) — each is one cheap river solve.
+    const auto& nodes = s.nodes();
+    std::vector<int> leaves;
+    for (size_t i = 0; i < nodes.size(); ++i)
+        if (nodes[i].kind == HunlSolver::Node::StreetEnd)
+            leaves.push_back(static_cast<int>(i));
+    if (leaves.empty()) return;
+    for (int h = 0; h < cfg_.harvest; ++h) {
+        const int L = leaves[rng() % leaves.size()];
+        // random candidate card off the board
+        uint8_t c;
+        while (true) {
+            c = static_cast<uint8_t>(rng() % kCards);
+            bool dead = false;
+            for (int b = 0; b < s.board_count(); ++b)
+                if (s.board()[b] == c) dead = true;
+            if (!dead) break;
+        }
+        // final-average leaf beliefs, card-masked (river_sample_at
+        // normalizes for the features; the solver normalizes its own copy)
+        HunlPBS lb;
+        {
+            std::vector<double> r0, r1;
+            // reaches under the final average profile at L
+            // (private helper equivalent: rebuild via avg policies)
+            r0 = beta.r0;
+            r1 = beta.r1;
+            int node = 0;
+            for (int a : nodes[L].path) {
+                const auto& nd = nodes[node];
+                int k = 0;
+                while (nd.acts[k] != a) ++k;
+                std::vector<double>& mine = nd.player == 0 ? r0 : r1;
+                for (int x = 0; x < kCombos; ++x)
+                    if (mine[x] > 0.0)
+                        mine[x] *= s.avg_policy(node, x)[k];
+                node = nd.child[k];
+            }
+            lb.r0 = std::move(r0);
+            lb.r1 = std::move(r1);
+            const auto& ct = ComboTable::get();
+            for (int i = 0; i < kCombos; ++i)
+                if (ct.cards[i][0] == c || ct.cards[i][1] == c)
+                    lb.r0[i] = lb.r1[i] = 0.0;
+        }
+        std::array<uint8_t, 5> b5 = s.board();
+        b5[s.board_count()] = c;
+        env.push_state();
+        for (int a : nodes[L].path) env.step(a);
+        river_sample_at(env, b5.data(), lb, fresh);
+        env.pop_state();
+    }
 }
 
 double EndgameTrainer::train_net() {
@@ -255,7 +363,7 @@ double EndgameTrainer::probe_turn_expl(poker_ppo::PokerEnvironment& env,
                                        int refresh_every) {
     std::mt19937 fixed(12345);          // fixed probe situation
     for (int tries = 0; tries < 50; ++tries)
-        if (sample_turn_root(env, fixed)) break;
+        if (sample_street_root(env, fixed, 2)) break;
     HunlPBS beta;
     beta.r0 = random_range(fixed);
     beta.r1 = random_range(fixed);
@@ -281,10 +389,12 @@ void EndgameTrainer::run() {
         : static_cast<int>(std::thread::hardware_concurrency());
     W = std::max(1, std::min(W, cfg_.episodes));
     if (W > 1) torch::set_num_threads(1);   // workers ARE the parallelism
-    std::printf("HUNL endgame ReBeL: T_turn=%d T_river=%d episodes=%d "
-                "epochs=%d hidden=%d device=%s workers=%d\n",
+    std::printf("HUNL endgame ReBeL (%s): T_turn=%d T_river=%d episodes=%d "
+                "epochs=%d hidden=%d harvest=%d device=%s workers=%d\n",
+                cfg_.river_only ? "direct-river" : "turn-selfplay",
                 cfg_.t_turn, cfg_.t_river, cfg_.episodes, cfg_.epochs,
-                cfg_.hidden, device_.is_cuda() ? "cuda" : "cpu", W);
+                cfg_.hidden, cfg_.harvest,
+                device_.is_cuda() ? "cuda" : "cpu", W);
     // per-worker envs + HandRanks pre-warm (lazy 120MB load isn't racy
     // only because we touch it before spawning)
     std::vector<std::unique_ptr<poker_ppo::PokerEnvironment>> envs;
@@ -316,7 +426,10 @@ void EndgameTrainer::run() {
             while (true) {
                 const int e = next.fetch_add(1);
                 if (e >= cfg_.episodes) break;
-                self_play_episode(*envs[w], wrng, fresh_w[w]);
+                if (cfg_.river_only)
+                    direct_river_episode(*envs[w], wrng, fresh_w[w]);
+                else
+                    self_play_episode(*envs[w], wrng, fresh_w[w]);
             }
         };
         if (W == 1) {
@@ -366,6 +479,7 @@ void EndgameTrainer::run() {
             std::printf("]");
         std::printf("\n");
         std::fflush(stdout);
+        if (!cfg_.ckpt.empty()) torch::save(net_, cfg_.ckpt);
     }
 }
 

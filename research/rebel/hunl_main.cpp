@@ -279,12 +279,19 @@ int main(int argc, char** argv) {
         const int Ti = argc > 3 ? std::atoi(argv[3]) : 100;
         return run_turn(To, Ti);
     }
-    if (mode == "train_turn") {
+    if (mode == "train_turn" || mode == "train_river") {
         EndgameConfig cfg;
+        cfg.river_only = (mode == "train_river");
+        if (cfg.river_only) {
+            cfg.episodes = 2000;   // direct river targets per epoch
+            cfg.sgd_steps = 500;
+        }
         if (argc > 2) cfg.epochs = std::atoi(argv[2]);
         if (argc > 3) cfg.episodes = std::atoi(argv[3]);
         if (const char* t = std::getenv("REBEL_THREADS"))
             cfg.threads = std::atoi(t);
+        if (const char* h = std::getenv("REBEL_HARVEST"))
+            cfg.harvest = std::atoi(h);
         EndgameTrainer tr(cfg);
         tr.run();
         return 0;
