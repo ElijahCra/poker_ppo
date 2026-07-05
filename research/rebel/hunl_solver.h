@@ -83,6 +83,17 @@ public:
     // there are no StreetEnd leaves; with an oracle it is BR within the
     // depth-limited game (leaf values held fixed at final-average beliefs).
     double exploitability();
+    // TRUE composed two-street exploitability: re-solves every (leaf, card)
+    // river subgame at the final-average leaf beliefs (the agent's
+    // deployment rule), then best-responds through BOTH streets — unlike
+    // exploitability(), whose BR is confined to the leaf-valued game. The
+    // Leduc-grade full-game judge for turn+river endgames.
+    // Costs |leaves| × ~48 river solves of t_river iterations.
+    double exploitability_composed(int t_river);
+    // BR values for player p vs the current average profile with an explicit
+    // (unnormalized) opponent reach vector — counterfactual sums, the
+    // building block exploitability_composed uses across streets.
+    std::vector<double> best_response(int p, std::vector<double> opp_reach);
     // Root per-combo values of the average profile (normalized by opponent
     // compatible mass); mask = target well-defined.
     void root_values(std::array<std::vector<double>, 2>& v,
@@ -104,7 +115,7 @@ public:
                      int* leaf_node, uint8_t* card, HunlPBS* beta);
 
 private:
-    int build();
+    int build(std::vector<int> path);
     void refresh_leaves();
     // Alternating-update / value walk. update=false → both play the average
     // profile, no state changes (used for root values and BR terminals).

@@ -51,11 +51,25 @@ Built and validated on this machine (target =rebel_hunl=):
   - river, full 14 actions (78,327 nodes):     2.66 → 0.54 → 0.28 bb (T=200)
 - turn decomposition (StreetEnd chance leaves → per-river-card PBS values
   via ExactStreetOracle; all-in-one-card-early terminals enumerated exactly)
-  — the Leduc round-1/round-2 pattern at HUNL scale:
-  sparse turn subgame, exact river leaves (inner T=40, refresh_every=5):
-  1.84 bb @ T=10 → 0.57 bb @ T=25, same profile as the river solves.
+  — the Leduc round-1/round-2 pattern at HUNL scale.
   Cost note: each exact refresh ≈ |leaves|×48 river re-solves — the
   measured economic case for the value net (one batched forward instead).
+- gap closers (2026-07-05), both exact judges from OUTSIDE the solver:
+  - =check_terminals=: payoff model vs env ground truth on dealt hands —
+    fold 0.000 / showdown 0.000 / allin 0.006 chips over 855 terminals,
+    30 states. PASS. (Caught a REAL bug on first run: node paths were
+    assigned post-recursion, truncating every path deeper than one action
+    — invisible to the internal BR, which lives in the same tree. All
+    pre-fix turn numbers were tainted; below are post-fix.)
+    Also: env.terminal_utility is REALIZED utility — bogus for all-in
+    terminals; the equity value only flows through the step reward.
+  - =turn_true=: TRUE composed two-street exploitability
+    (exploitability_composed — BR may deviate on the river, against the
+    agent's re-solve composition): T=12: internal 2.90 / composed 2.99 bb;
+    T=25: internal 1.29 / composed 1.38 bb. Composed ≥ internal as theory
+    requires; unsafe-resolving gap ~0.09 bb at this root.
+  The trainer's probe now uses the composed judge; value targets are in
+  POT units (paper normalization).
 
 - =hunl_value=: PBS value net (street/board/pot + both 1326-ranges →
   per-combo values both players) + Algorithm-1 endgame self-play

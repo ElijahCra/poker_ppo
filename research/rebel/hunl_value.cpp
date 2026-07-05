@@ -60,10 +60,12 @@ void HunlNetOracle::value(poker_ppo::PokerEnvironment& env,
                  .clone();
     auto y = net_->forward(x).squeeze(0);
     auto acc = y.accessor<float, 1>();
+    // net predicts values in POT units (paper normalization: well-
+    // conditioned across pot sizes; future betting can push |v| past 1)
     for (int p = 0; p < 2; ++p) {
         out[p].assign(kCombos, 0.0);
         for (int i = 0; i < kCombos; ++i)
-            out[p][i] = static_cast<double>(acc[p * kCombos + i]) * stack_;
+            out[p][i] = static_cast<double>(acc[p * kCombos + i]) * pot;
     }
 }
 
@@ -152,12 +154,13 @@ void EndgameTrainer::self_play_episode(poker_ppo::PokerEnvironment& env,
                                         stack_, leaf_beta);
     smp.target.assign(2 * kCombos, 0.0f);
     smp.mask.assign(2 * kCombos, 0.0f);
+    const double pot_leaf = 2.0 * contrib;
     for (int p = 0; p < 2; ++p) {
         const auto& own = p == 0 ? leaf_beta.r0 : leaf_beta.r1;
         for (int i = 0; i < kCombos; ++i) {
             if (!v5[i] || own[i] <= 0.0 || omass[p][i] <= 0.0) continue;
             smp.target[p * kCombos + i] =
-                static_cast<float>(v[p][i] / stack_);
+                static_cast<float>(v[p][i] / pot_leaf);   // pot units
             smp.mask[p * kCombos + i] = 1.0f;
         }
     }
@@ -236,7 +239,8 @@ double EndgameTrainer::probe_turn_expl(poker_ppo::PokerEnvironment& env,
     HunlSolver s(env, beta, oracle, cfg_.actions);
     s.refresh_every = refresh_every;
     for (int t = 1; t <= T; ++t) s.iterate(t);
-    return s.exploitability();
+    // the TRUE judge: composed two-street BR (river deviations allowed)
+    return s.exploitability_composed(cfg_.t_river / 2);
 }
 
 void EndgameTrainer::run() {

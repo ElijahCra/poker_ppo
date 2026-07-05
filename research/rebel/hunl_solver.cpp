@@ -51,15 +51,16 @@ HunlSolver::HunlSolver(poker_ppo::PokerEnvironment& env, HunlPBS root,
     board_valid(board_.data(), nb_root_, valid_);
     normalize_range(root_.r0, valid_);
     normalize_range(root_.r1, valid_);
-    build();
+    build({});
     leaf_v_.resize(nodes_.size());
 }
 
-int HunlSolver::build() {
+int HunlSolver::build(std::vector<int> path) {
     const int id = static_cast<int>(nodes_.size());
     nodes_.push_back({});
     {
         Node& nd = nodes_.back();
+        nd.path = std::move(path);   // at CREATION — children copy from it
         nd.contrib = {
             static_cast<int>(env_.game_config().initial_stack) - env_.stack(0),
             static_cast<int>(env_.game_config().initial_stack) - env_.stack(1)};
@@ -95,11 +96,11 @@ int HunlSolver::build() {
     for (int a : acts) {
         env_.push_state();
         env_.step(a);
-        const int cid = build();   // may reallocate nodes_
+        std::vector<int> child_path = nodes_[id].path;
+        child_path.push_back(a);
+        const int cid = build(std::move(child_path));  // may realloc nodes_
         if (nodes_[cid].kind == Node::Fold)
             nodes_[cid].player = nodes_[id].player;   // the folder
-        nodes_[cid].path = nodes_[id].path;
-        nodes_[cid].path.push_back(a);
         env_.pop_state();
         children.push_back(cid);
     }
@@ -381,6 +382,108 @@ double HunlSolver::exploitability() {
             if (valid_[x]) total += own[x] * br[x];
     }
     return joint > kTiny ? total / joint : 0.0;   // chips/hand; → 0 at Nash
+}
+
+std::vector<double> HunlSolver::best_response(int p,
+                                              std::vector<double> opp_reach) {
+    return br_walk(0, p, opp_reach);
+}
+
+double HunlSolver::exploitability_composed(int t_river) {
+    const auto& ct = ComboTable::get();
+    const double n_rem = 52.0 - nb_root_ - 4.0;
+    // composed BR leaf values per (StreetEnd, player), aggregated over cards
+    std::vector<std::array<std::vector<double>, 2>> br_leaf(nodes_.size());
+    for (int L : leaf_ids_) {
+        br_leaf[L][0].assign(kCombos, 0.0);
+        br_leaf[L][1].assign(kCombos, 0.0);
+        std::vector<double> r0, r1;
+        reaches_to(L, /*average=*/true, r0, r1);
+        env_.push_state();
+        for (int a : nodes_[L].path) env_.step(a);
+        for (int c = 0; c < kCards; ++c) {
+            bool on_board = false;
+            for (int b = 0; b < nb_root_; ++b)
+                if (board_[b] == c) on_board = true;
+            if (on_board) continue;
+            std::array<uint8_t, 5> nb = board_;
+            nb[nb_root_] = static_cast<uint8_t>(c);
+            // the agent's deployment rule: re-solve at normalized avg beliefs
+            HunlPBS beta;
+            beta.r0 = r0;
+            beta.r1 = r1;
+            mask_card(beta.r0, static_cast<uint8_t>(c));
+            mask_card(beta.r1, static_cast<uint8_t>(c));
+            HunlSolver rs(env_, beta, nullptr, allowed_, nb.data(),
+                          nb_root_ + 1);
+            for (int t = 1; t <= t_river; ++t) rs.iterate(t);
+            // full-game BR: deviate freely on the river too, opponent pinned
+            // to the composed average; opp reach = UNNORMALIZED turn reach
+            for (int p = 0; p < 2; ++p) {
+                std::vector<double> opp = p == 0 ? r1 : r0;
+                mask_card(opp, static_cast<uint8_t>(c));
+                auto br = rs.best_response(p, std::move(opp));
+                auto& acc = br_leaf[L][p];
+                for (int x = 0; x < kCombos; ++x) {
+                    if (ct.cards[x][0] == c || ct.cards[x][1] == c) continue;
+                    acc[x] += br[x] / n_rem;
+                }
+            }
+        }
+        env_.pop_state();
+    }
+
+    // two-street BR walk: StreetEnd returns the composed river BR values
+    // (the walk's opponent reach at a leaf equals reaches_to(avg) — the
+    // opponent is pinned to the average on both streets)
+    std::function<std::vector<double>(int, int, std::vector<double>&)> rec =
+        [&](int i, int p, std::vector<double>& opp) -> std::vector<double> {
+        Node& nd = nodes_[i];
+        if (nd.kind == Node::StreetEnd) return br_leaf[i][p];
+        if (nd.kind != Node::Decision) {
+            std::vector<double> dummy(kCombos, 0.0);
+            return walk(i, p, 0, /*update=*/false, dummy, opp);
+        }
+        const int A = static_cast<int>(nd.acts.size());
+        std::vector<double> cfv(kCombos, 0.0);
+        if (nd.player == p) {
+            bool first = true;
+            for (int k = 0; k < A; ++k) {
+                auto cv = rec(nd.child[k], p, opp);
+                if (first) {
+                    cfv = cv;
+                    first = false;
+                } else {
+                    for (int x = 0; x < kCombos; ++x)
+                        if (cv[x] > cfv[x]) cfv[x] = cv[x];
+                }
+            }
+            return cfv;
+        }
+        for (int k = 0; k < A; ++k) {
+            std::vector<double> child_opp(kCombos, 0.0);
+            for (int x = 0; x < kCombos; ++x)
+                if (valid_[x] && opp[x] > 0.0)
+                    child_opp[x] =
+                        opp[x] * policy_row(nd, x, /*average=*/true)[k];
+            auto cv = rec(nd.child[k], p, child_opp);
+            for (int x = 0; x < kCombos; ++x) cfv[x] += cv[x];
+        }
+        return cfv;
+    };
+
+    double total = 0.0, joint = 0.0;
+    std::vector<double> mass;
+    compat_mass(root_.r1, valid_, mass);
+    for (int i = 0; i < kCombos; ++i) joint += root_.r0[i] * mass[i];
+    for (int p = 0; p < 2; ++p) {
+        std::vector<double> opp = p == 0 ? root_.r1 : root_.r0;
+        auto br = rec(0, p, opp);
+        const auto& own = p == 0 ? root_.r0 : root_.r1;
+        for (int x = 0; x < kCombos; ++x)
+            if (valid_[x]) total += own[x] * br[x];
+    }
+    return joint > kTiny ? total / joint : 0.0;
 }
 
 void HunlSolver::root_values(std::array<std::vector<double>, 2>& v,

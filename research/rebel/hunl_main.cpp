@@ -68,6 +68,107 @@ int run_kernels() {
     return worst < 1e-9 ? 0 : 1;
 }
 
+// Encoding cross-check: the solver's terminal payoff model (contribs +
+// kernels' winner logic) vs env.terminal_utility for the env's actually
+// dealt hands, across many boards/paths. Closes the "internal BR shares the
+// tree encoding" loophole with ground truth from outside the solver.
+int run_check_terminals(int n_states, int start = 0) {
+    const std::vector<int> allowed = {0, 1, 7, 13};
+    double worst_fold = 0.0, worst_show = 0.0, worst_allin = 0.0;
+    long n_fold = 0, n_show = 0, n_allin = 0;
+    for (int s = start; s < start + n_states; ++s) {
+        if (std::getenv("REBEL_DEBUG"))
+            std::fprintf(stderr, "  [dbg] state %d\n", s);
+        PokerEnvironment env(poker_ppo::kPokerConfig,
+                             poker_ppo::config::kBetConfig, 5000 + s);
+        advance_to_round(env, s % 2 == 0 ? 3 : 2);
+        if (env.is_terminal()) continue;
+        std::mt19937 rng(s);
+        HunlPBS beta;
+        beta.r0 = random_range(rng);
+        beta.r1 = random_range(rng);
+        HunlSolver sol(env, beta, nullptr, allowed);
+        const auto h0 = env.hole_cards(0);
+        const auto h1 = env.hole_cards(1);
+        const auto& ct = ComboTable::get();
+        const int c0 = ct.id[h0[0]][h0[1]];
+        const int c1 = ct.id[h1[0]][h1[1]];
+        for (size_t i = 0; i < sol.nodes().size(); ++i) {
+            const auto& nd = sol.nodes()[i];
+            if (nd.kind == HunlSolver::Node::Decision ||
+                nd.kind == HunlSolver::Node::StreetEnd)
+                continue;
+            if (std::getenv("REBEL_DEBUG")) {
+                std::fprintf(stderr, "  [dbg] node %zu kind %d path:", i,
+                             (int)nd.kind);
+                for (int a : nd.path) std::fprintf(stderr, " %d", a);
+                std::fprintf(stderr, "\n");
+            }
+            env.push_state();
+            double last_reward = 0.0;
+            for (int a : nd.path) last_reward = env.step(a).reward;
+            // terminal_utility returns the REALIZED getUtility — for all-in
+            // terminals that's a bogus incomplete-board showdown; the equity
+            // value only flows through the step reward (P0 frame, scaled by
+            // reward_norm = 10*bb).
+            const double truth =
+                nd.kind == HunlSolver::Node::AllinShowdown
+                    ? last_reward * 10.0 * env.game_config().big_blind
+                    : env.terminal_utility(0);
+            double model = 0.0;
+            if (nd.kind == HunlSolver::Node::Fold) {
+                model = nd.player == 1
+                    ? static_cast<double>(nd.contrib[1])
+                    : -static_cast<double>(nd.contrib[0]);
+                worst_fold = std::max(worst_fold, std::fabs(model - truth));
+                ++n_fold;
+            } else if (nd.kind == HunlSolver::Node::Showdown) {
+                uint8_t b5[5];
+                for (int b = 0; b < 5; ++b)
+                    b5[b] = static_cast<uint8_t>(env.community_card(b));
+                const int r0 = combo_rank(c0, b5), r1 = combo_rank(c1, b5);
+                model = r0 > r1 ? nd.contrib[1]
+                       : r0 < r1 ? -static_cast<double>(nd.contrib[0]) : 0.0;
+                worst_show = std::max(worst_show, std::fabs(model - truth));
+                ++n_show;
+            } else {   // AllinShowdown at the turn: enumerate rivers
+                const auto& bd = sol.board();
+                double ev = 0.0;
+                int cnt = 0;
+                for (int c = 0; c < kCards; ++c) {
+                    bool dead = false;
+                    for (int b = 0; b < sol.board_count(); ++b)
+                        if (bd[b] == c) dead = true;
+                    if (c == h0[0] || c == h0[1] || c == h1[0] || c == h1[1])
+                        dead = true;
+                    if (dead) continue;
+                    std::array<uint8_t, 5> b5{};
+                    for (int b = 0; b < sol.board_count(); ++b) b5[b] = bd[b];
+                    b5[sol.board_count()] = static_cast<uint8_t>(c);
+                    const int r0 = combo_rank(c0, b5.data());
+                    const int r1 = combo_rank(c1, b5.data());
+                    ev += r0 > r1 ? nd.contrib[1]
+                        : r0 < r1 ? -static_cast<double>(nd.contrib[0]) : 0.0;
+                    ++cnt;
+                }
+                model = cnt > 0 ? ev / cnt : 0.0;
+                worst_allin = std::max(worst_allin, std::fabs(model - truth));
+                ++n_allin;
+            }
+            env.pop_state();
+        }
+    }
+    std::printf("terminal payoff model vs env.terminal_utility:\n"
+                "  fold      n=%-6ld max|diff|=%.3f chips\n"
+                "  showdown  n=%-6ld max|diff|=%.3f chips\n"
+                "  allin     n=%-6ld max|diff|=%.3f chips (int rounding + "
+                "equity method)\n",
+                n_fold, worst_fold, n_show, worst_show, n_allin, worst_allin);
+    const bool pass = worst_fold < 0.5 && worst_show < 0.5 && worst_allin < 2.0;
+    std::printf("  %s\n", pass ? "PASS" : "FAIL");
+    return pass ? 0 : 1;
+}
+
 void report(HunlSolver& s, int t, int big_blind) {
     const double e = s.exploitability();
     std::printf("  T=%-6d subgame expl = %10.2f chips/hand  (%.4f bb)\n", t,
@@ -95,6 +196,35 @@ int run_river(int T, bool sparse) {
     for (int t = 1; t <= T; ++t) {
         s.iterate(t);
         if (t == 20 || t == 100 || t == T) report(s, t, bb);
+    }
+    return 0;
+}
+
+// Validate the validator: exact-oracle turn solve, judged by BOTH the
+// leaf-valued internal BR and the TRUE composed two-street BR. Composed
+// should be ≥ internal (the BR gains river freedom) and both should shrink
+// with T — the HUNL analogue of the Leduc exact ladder.
+int run_turn_true(int T_outer, int T_river) {
+    PokerEnvironment env(poker_ppo::kPokerConfig,
+                         poker_ppo::config::kBetConfig, 42);
+    advance_to_round(env, 2);
+    std::mt19937 rng(5);
+    HunlPBS beta;
+    beta.r0 = random_range(rng);
+    beta.r1 = random_range(rng);
+    const std::vector<int> allowed = {0, 1, 7, 13};
+    ExactStreetOracle oracle(T_river / 2, allowed);
+    const int bb = env.game_config().big_blind;
+    for (int T : {T_outer / 2, T_outer}) {
+        HunlSolver s(env, beta, &oracle, allowed);
+        s.refresh_every = 5;
+        for (int t = 1; t <= T; ++t) s.iterate(t);
+        const double internal = s.exploitability();
+        const double composed = s.exploitability_composed(T_river);
+        std::printf("  T=%-4d internal(leaf-valued) = %.4f bb   "
+                    "TRUE composed = %.4f bb\n",
+                    T, internal / bb, composed / bb);
+        std::fflush(stdout);
     }
     return 0;
 }
@@ -130,6 +260,14 @@ int run_turn(int T_outer, int T_inner) {
 int main(int argc, char** argv) {
     const std::string mode = argc > 1 ? argv[1] : "kernels";
     if (mode == "kernels") return run_kernels();
+    if (mode == "check_terminals")
+        return run_check_terminals(argc > 2 ? std::atoi(argv[2]) : 20,
+                                   argc > 3 ? std::atoi(argv[3]) : 0);
+    if (mode == "turn_true") {
+        const int To = argc > 2 ? std::atoi(argv[2]) : 25;
+        const int Tr = argc > 3 ? std::atoi(argv[3]) : 150;
+        return run_turn_true(To, Tr);
+    }
     if (mode == "river") {
         int T = argc > 2 ? std::atoi(argv[2]) : 400;
         const bool sparse =
