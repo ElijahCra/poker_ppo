@@ -143,6 +143,27 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID STREQUAL "Clang
     )
 endif()
 
+# ── ReBeL HUNL stage-2: range kernels + street subgame solver ────────────────
+# Torch is needed only through poker_env's tensor interface; no CUDA paths.
+add_executable(rebel_hunl
+    research/rebel/hunl_kernels.cpp
+    research/rebel/hunl_solver.cpp
+    research/rebel/hunl_main.cpp
+    src/poker_env.cpp
+    src/observation_builder.cpp
+)
+target_include_directories(rebel_hunl PRIVATE research/rebel include)
+target_link_libraries(rebel_hunl PRIVATE "${TORCH_LIBRARIES}" Game)
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+    target_compile_options(rebel_hunl PRIVATE
+        "SHELL:-include ${GLIBC_FEATURES_H}/features.h"
+        "SHELL:-include cstring"
+        "SHELL:-include cstdlib"
+        "SHELL:-include limits"
+        "SHELL:-include mutex"
+    )
+endif()
+
 # ── Tests ─────────────────────────────────────────────────────────────────────
 # Opt-in via -DBUILD_TESTS=ON (default ON). Pulls GoogleTest via
 # FetchContent inside Game/tests/.

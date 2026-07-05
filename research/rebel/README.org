@@ -37,6 +37,32 @@ deviations (no policy-net warm start; unsafe test-time composition).
    (and does) approach the composed floor. Don't use the exact mode as
    the quality bar; it's a mechanics smoke test.
 
+* Stage 2 progress (2026-07-04)
+
+Built and validated on this machine (target =rebel_hunl=):
+- =hunl_kernels=: 1326-combo fold/showdown kernels, exact card removal
+  (inclusion-exclusion + rank-sweep over TwoPlusTwo ranks).
+  =rebel_hunl kernels=: max |fast − brute| = 5.8e-10 over 20 boards. PASS.
+- =hunl_solver=: street-limited public-tree CFR+ where the betting tree is
+  built by push/pop REPLAY of PokerEnvironment (pot math, raise sizes,
+  all-in and legality byte-identical to the deployed abstraction).
+  Internal range-BR exploitability as the judge:
+  - river, sparse {f,c,pot,allin} (51 nodes):  1.33 → 0.20 → 0.033 bb (T=400)
+  - river, full 14 actions (78,327 nodes):     2.66 → 0.54 → 0.28 bb (T=200)
+- turn decomposition (StreetEnd chance leaves → per-river-card PBS values
+  via ExactStreetOracle; all-in-one-card-early terminals enumerated exactly)
+  — the Leduc round-1/round-2 pattern at HUNL scale:
+  sparse turn subgame, exact river leaves (inner T=40, refresh_every=5):
+  1.84 bb @ T=10 → 0.57 bb @ T=25, same profile as the river solves.
+  Cost note: each exact refresh ≈ |leaves|×48 river re-solves — the
+  measured economic case for the value net (one batched forward instead).
+
+Remaining for a playing agent: HUNL value net over (public state, ranges)
+with the Algorithm-1 self-play loop (port of the Leduc Trainer); GPU
+batching of leaf queries + flat-tensor solver for full-action trees; PBS
+tracking during live play (adapt LBR's Belief); LBR evaluation harness for
+the search agent; safe-resolving gadget.
+
 * HUNL port map (stage 2)
 
 - Beliefs/ranges: LBR's =Belief= (src/lbr.cpp) already Bayes-tracks
