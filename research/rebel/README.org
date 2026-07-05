@@ -78,6 +78,13 @@ Built and validated on this machine (target =rebel_hunl=):
   stays LOW — the CFR walks are CPU-bound per-combo recursion; the GPU
   serves leaf forwards + training. Parallel episodes / flat-tensor solver
   are the next scaling steps if CPU saturates.
+- CPU parallel self-play (2026-07-05): episodes fan out over a worker pool
+  (own env + RNG per worker, work-stealing counter, net read-only; torch
+  intra-op pinned to 1; HandRanks pre-warmed before spawn). REBEL_THREADS
+  overrides (default hardware_concurrency). M3/8 workers: ~4.3× epoch
+  throughput. Still sequential: the one-time exact reference probe and the
+  every-5-epoch composed probe (parallelizing exploitability_composed's
+  per-(leaf,card) river solves is the next easy win if probes annoy).
 
 - =hunl_value=: PBS value net (street/board/pot + both 1326-ranges →
   per-combo values both players) + Algorithm-1 endgame self-play

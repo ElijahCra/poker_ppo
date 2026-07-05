@@ -283,6 +283,8 @@ int main(int argc, char** argv) {
         EndgameConfig cfg;
         if (argc > 2) cfg.epochs = std::atoi(argv[2]);
         if (argc > 3) cfg.episodes = std::atoi(argv[3]);
+        if (const char* t = std::getenv("REBEL_THREADS"))
+            cfg.threads = std::atoi(t);
         EndgameTrainer tr(cfg);
         tr.run();
         return 0;

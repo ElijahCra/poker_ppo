@@ -77,6 +77,10 @@ struct EndgameConfig {
     int    replay_cap   = 100000;
     int    probe_k      = 8;     // replay entries re-solved exactly per epoch
     std::vector<int> actions = {0, 1, 7, 13};   // sparse abstraction
+    // self-play worker threads (0 = hardware_concurrency). Episodes are
+    // independent: each worker owns an env + RNG; the net is read-only at
+    // inference. torch intra-op threads are pinned to 1 when workers > 1.
+    int    threads      = 0;
     uint64_t seed       = 0;
 };
 

@@ -1,7 +1,9 @@
 #include "hunl_value.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <thread>
 #include <cmath>
 #include <cstdio>
 
@@ -229,20 +231,22 @@ double EndgameTrainer::train_net() {
 double EndgameTrainer::heldout_mse(const std::vector<Sample>& fresh) {
     if (fresh.empty()) return 0.0;
     torch::NoGradGuard ng;
+    const long N = static_cast<long>(fresh.size());
+    auto X = torch::empty({N, HunlFeaturizer::kDim}, torch::kFloat);
+    for (long r = 0; r < N; ++r)
+        std::copy(fresh[r].feat.begin(), fresh[r].feat.end(),
+                  X.data_ptr<float>() +
+                      static_cast<size_t>(r) * HunlFeaturizer::kDim);
+    auto y = net_->forward(X.to(device_)).to(torch::kCPU).contiguous();
+    auto acc = y.accessor<float, 2>();
     double se = 0.0, cnt = 0.0;
-    for (const Sample& s : fresh) {
-        auto x = torch::from_blob(const_cast<float*>(s.feat.data()),
-                                  {1, HunlFeaturizer::kDim}, torch::kFloat)
-                     .to(device_);
-        auto y = net_->forward(x).squeeze(0).to(torch::kCPU).contiguous();
-        auto acc = y.accessor<float, 1>();
+    for (long r = 0; r < N; ++r)
         for (int j = 0; j < 2 * kCombos; ++j)
-            if (s.mask[j] > 0.5f) {
-                const double e = acc[j] - s.target[j];
+            if (fresh[r].mask[j] > 0.5f) {
+                const double e = acc[r][j] - fresh[r].target[j];
                 se += e * e;
                 cnt += 1.0;
             }
-    }
     return cnt > 0 ? se / cnt : 0.0;
 }
 
@@ -272,10 +276,26 @@ void EndgameTrainer::run() {
                                     cfg_.seed + 99);
     const double bb =
         static_cast<double>(env.game_config().big_blind);
+    int W = cfg_.threads > 0
+        ? cfg_.threads
+        : static_cast<int>(std::thread::hardware_concurrency());
+    W = std::max(1, std::min(W, cfg_.episodes));
+    if (W > 1) torch::set_num_threads(1);   // workers ARE the parallelism
     std::printf("HUNL endgame ReBeL: T_turn=%d T_river=%d episodes=%d "
-                "epochs=%d hidden=%d device=%s\n",
+                "epochs=%d hidden=%d device=%s workers=%d\n",
                 cfg_.t_turn, cfg_.t_river, cfg_.episodes, cfg_.epochs,
-                cfg_.hidden, device_.is_cuda() ? "cuda" : "cpu");
+                cfg_.hidden, device_.is_cuda() ? "cuda" : "cpu", W);
+    // per-worker envs + HandRanks pre-warm (lazy 120MB load isn't racy
+    // only because we touch it before spawning)
+    std::vector<std::unique_ptr<poker_ppo::PokerEnvironment>> envs;
+    for (int w = 0; w < W; ++w)
+        envs.push_back(std::make_unique<poker_ppo::PokerEnvironment>(
+            poker_ppo::kPokerConfig, poker_ppo::config::kBetConfig,
+            cfg_.seed + 1000 + w));
+    {
+        const uint8_t warm[5] = {0, 5, 10, 15, 20};
+        (void)combo_rank(ComboTable::get().id[25][30], warm);
+    }
     // reference: the same probe turn solve with EXACT leaves (slow, once)
     auto t0 = clock::now();
     ExactStreetOracle exact(cfg_.t_river / 2, cfg_.actions);
@@ -287,9 +307,29 @@ void EndgameTrainer::run() {
 
     for (int ep = 1; ep <= cfg_.epochs; ++ep) {
         auto t_sp0 = clock::now();
+        // episodes fan out over the worker pool (work-stealing counter)
+        std::vector<std::vector<Sample>> fresh_w(W);
+        std::atomic<int> next{0};
+        auto work = [&](int w) {
+            std::mt19937 wrng(static_cast<unsigned>(
+                cfg_.seed * 1000003u + ep * 7919u + w * 104729u));
+            while (true) {
+                const int e = next.fetch_add(1);
+                if (e >= cfg_.episodes) break;
+                self_play_episode(*envs[w], wrng, fresh_w[w]);
+            }
+        };
+        if (W == 1) {
+            work(0);
+        } else {
+            std::vector<std::thread> pool;
+            pool.reserve(W);
+            for (int w = 0; w < W; ++w) pool.emplace_back(work, w);
+            for (auto& th : pool) th.join();
+        }
         std::vector<Sample> fresh;
-        for (int e = 0; e < cfg_.episodes; ++e)
-            self_play_episode(env, rng_, fresh);
+        for (auto& fw : fresh_w)
+            for (auto& s : fw) fresh.push_back(std::move(s));
         auto t_sp1 = clock::now();
         // out-of-sample probe BEFORE these rows are trained on
         const double heldout = heldout_mse(fresh);
