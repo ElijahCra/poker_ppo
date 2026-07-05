@@ -92,6 +92,16 @@ public:
     const std::vector<Node>& nodes() const { return nodes_; }
     const std::vector<uint8_t>& valid() const { return valid_; }
     int board_count() const { return nb_root_; }
+    const std::array<uint8_t, 5>& board() const { return board_; }
+
+    // Algorithm 1 SampleLeaf under the current AVERAGE profile (CFR-AVG
+    // pairing): samples compatible private hands from the root ranges, walks
+    // sampled actions (ε-uniform for `explorer`'s decisions), samples the
+    // next card at a StreetEnd. Returns false if the walk hit a terminal
+    // (episode over); else fills leaf node id, card, and the leaf PBS
+    // (avg-policy Bayes posteriors, card-masked, normalized).
+    bool sample_leaf(std::mt19937& rng, double eps, int explorer,
+                     int* leaf_node, uint8_t* card, HunlPBS* beta);
 
 private:
     int build();

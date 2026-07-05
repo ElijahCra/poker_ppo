@@ -57,11 +57,22 @@ Built and validated on this machine (target =rebel_hunl=):
   Cost note: each exact refresh ≈ |leaves|×48 river re-solves — the
   measured economic case for the value net (one batched forward instead).
 
-Remaining for a playing agent: HUNL value net over (public state, ranges)
-with the Algorithm-1 self-play loop (port of the Leduc Trainer); GPU
-batching of leaf queries + flat-tensor solver for full-action trees; PBS
-tracking during live play (adapt LBR's Belief); LBR evaluation harness for
-the search agent; safe-resolving gadget.
+- =hunl_value=: PBS value net (street/board/pot + both 1326-ranges →
+  per-combo values both players) + Algorithm-1 endgame self-play
+  (=rebel_hunl train_turn=): synthetic turn roots (random boards/pots via
+  env prefixes, random ranges), turn solves with NET leaves, t*-sampled
+  leaf continuation with ε-exploration, EXACT river solves as grounded
+  targets. Smoke run (6 epochs × 12 episodes, CPU): pipeline executes
+  end-to-end; net-leaf probe-turn expl 0.66 → 0.47 bb vs 0.275 bb
+  exact-leaf reference on the same root. Smoke-scale caveats: replay ~50
+  samples → vloss/probe are memorization numbers; switch target
+  normalization from stack to POT (paper) before real runs.
+
+Remaining for a playing agent (box-scale work): long =train_turn= runs on
+GPU (net + batched leaf queries; flat-tensor solver for full-action
+trees); then the flop net bootstrapped through turn solves the same way;
+PBS tracking during live play (adapt LBR's Belief); LBR evaluation harness
+for the search agent; safe-resolving gadget.
 
 * HUNL port map (stage 2)
 

@@ -403,6 +403,103 @@ void HunlSolver::root_values(std::array<std::vector<double>, 2>& v,
     }
 }
 
+bool HunlSolver::sample_leaf(std::mt19937& rng, double eps, int explorer,
+                             int* leaf_node, uint8_t* card, HunlPBS* beta) {
+    std::uniform_real_distribution<double> u01(0.0, 1.0);
+    const auto& ct = ComboTable::get();
+    // sample compatible (hero, villain) combos from the root ranges
+    double ws = 0.0;
+    for (int x = 0; x < kCombos; ++x) {
+        if (root_.r0[x] <= 0.0) continue;
+        // marginal weight: r0[x] * compatible r1 mass — cheap enough exactly
+        ws += root_.r0[x];
+    }
+    int h0 = -1, h1 = -1;
+    for (int tries = 0; tries < 1000 && h1 < 0; ++tries) {
+        double r = u01(rng) * ws, acc = 0.0;
+        for (int x = 0; x < kCombos; ++x) {
+            acc += root_.r0[x];
+            if (r <= acc) {
+                h0 = x;
+                break;
+            }
+        }
+        if (h0 < 0) h0 = 0;
+        // rejection-sample villain compatible with hero
+        const int a0 = ct.cards[h0][0], b0 = ct.cards[h0][1];
+        double vs = 0.0;
+        for (int y = 0; y < kCombos; ++y) {
+            if (root_.r1[y] <= 0.0) continue;
+            const int a = ct.cards[y][0], b = ct.cards[y][1];
+            if (a == a0 || a == b0 || b == a0 || b == b0) continue;
+            vs += root_.r1[y];
+        }
+        if (vs <= 0.0) continue;
+        double rv = u01(rng) * vs, av = 0.0;
+        for (int y = 0; y < kCombos; ++y) {
+            if (root_.r1[y] <= 0.0) continue;
+            const int a = ct.cards[y][0], b = ct.cards[y][1];
+            if (a == a0 || a == b0 || b == a0 || b == b0) continue;
+            av += root_.r1[y];
+            if (rv <= av) {
+                h1 = y;
+                break;
+            }
+        }
+    }
+    if (h1 < 0) return false;
+    const int hand[2] = {h0, h1};
+
+    int i = 0;
+    while (true) {
+        const Node& nd = nodes_[i];
+        if (nd.kind == Node::Fold || nd.kind == Node::Showdown ||
+            nd.kind == Node::AllinShowdown)
+            return false;                       // episode ends in-subgame
+        if (nd.kind == Node::StreetEnd) {
+            // sample the next card avoiding board + both sampled hands
+            bool dead[kCards] = {};
+            for (int b = 0; b < nb_root_; ++b) dead[board_[b]] = true;
+            for (int p = 0; p < 2; ++p) {
+                dead[ct.cards[hand[p]][0]] = true;
+                dead[ct.cards[hand[p]][1]] = true;
+            }
+            std::vector<uint8_t> avail;
+            for (int c = 0; c < kCards; ++c)
+                if (!dead[c]) avail.push_back(static_cast<uint8_t>(c));
+            const uint8_t c = avail[rng() % avail.size()];
+            *leaf_node = i;
+            *card = c;
+            reaches_to(i, /*average=*/true, beta->r0, beta->r1);
+            mask_card(beta->r0, c);
+            mask_card(beta->r1, c);
+            // normalize (fallback uniform over live combos if zero mass)
+            std::vector<uint8_t> v2;
+            std::array<uint8_t, 5> nb = board_;
+            nb[nb_root_] = c;
+            board_valid(nb.data(), nb_root_ + 1, v2);
+            normalize_range(beta->r0, v2);
+            normalize_range(beta->r1, v2);
+            return true;
+        }
+        const int A = static_cast<int>(nd.acts.size());
+        const int me = nd.player;
+        int k = 0;
+        if (me == explorer && u01(rng) < eps) {
+            k = static_cast<int>(rng() % A);
+        } else {
+            auto pol = policy_row(nd, hand[me], /*average=*/true);
+            double r = u01(rng), acc = 0.0;
+            for (int j = 0; j < A; ++j) {
+                acc += pol[j];
+                k = j;
+                if (r <= acc) break;
+            }
+        }
+        i = nd.child[k];
+    }
+}
+
 void ExactStreetOracle::value(poker_ppo::PokerEnvironment& env,
                               const uint8_t* board, int nb,
                               const HunlPBS& beta,

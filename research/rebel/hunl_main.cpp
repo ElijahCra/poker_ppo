@@ -14,6 +14,7 @@
 #include "config.h"
 #include "hunl_kernels.h"
 #include "hunl_solver.h"
+#include "hunl_value.h"
 #include "poker_env.h"
 
 using namespace rebel_hunl;
@@ -140,6 +141,14 @@ int main(int argc, char** argv) {
         const int Ti = argc > 3 ? std::atoi(argv[3]) : 100;
         return run_turn(To, Ti);
     }
-    std::fprintf(stderr, "mode must be kernels|river|turn\n");
+    if (mode == "train_turn") {
+        EndgameConfig cfg;
+        if (argc > 2) cfg.epochs = std::atoi(argv[2]);
+        if (argc > 3) cfg.episodes = std::atoi(argv[3]);
+        EndgameTrainer tr(cfg);
+        tr.run();
+        return 0;
+    }
+    std::fprintf(stderr, "mode must be kernels|river|turn|train_turn\n");
     return 1;
 }

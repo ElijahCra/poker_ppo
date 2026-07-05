@@ -148,6 +148,7 @@ endif()
 add_executable(rebel_hunl
     research/rebel/hunl_kernels.cpp
     research/rebel/hunl_solver.cpp
+    research/rebel/hunl_value.cpp
     research/rebel/hunl_main.cpp
     src/poker_env.cpp
     src/observation_builder.cpp
