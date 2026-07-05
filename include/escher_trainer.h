@@ -118,6 +118,27 @@ struct EscherConfig {
     // so the time-average mostly adds stale history — k=2..3 concentrates the
     // average on late σ (confirmed HUNL: cur-σ 2.2 stable vs linear-avg 5.5+).
     float    avg_pow       = 1.0f;
+    // Distillation targets for the avg fit: cross-entropy to σ's full action
+    // distribution (recorded at collection) instead of NLL on the sampled
+    // one-hot — same expectation, strictly less variance.
+    bool     avg_soft      = false;
+    // Theoretically-correct average weighting: collect avg data in per-seat
+    // passes with the OPPONENT ~ uniform (fixed sampler). Joint σ-vs-σ play
+    // weights each infoset's time-mixture by the opponent's reach per
+    // iteration (a bias); a fixed opponent makes that factor constant in t,
+    // so it cancels in the conditional average.
+    bool     avg_fixed_opp = false;
+    // Saturate the avg weight: w = min(t, cap)^k (0 = uncapped). Recency (k>1)
+    // is right while σ improves but wrong once σ oscillates at its floor —
+    // there the variance-optimal average is UNIFORM over the stationary era,
+    // and uncapped t^k chains the average to the late σ creep. Set cap to
+    // roughly where σ reaches its floor (~1000-1200 with the accelerators).
+    int      avg_pow_cap   = 0;
+    // Avg-net hidden dim override (0 = kPPOConfig.hidden_dim). The avg
+    // classifier represents a MIXTURE of σ's — a harder target than any one
+    // σ — but has been the smallest net in the pipeline. Same caveats as
+    // val_hidden (ckpt size compat, init-RNG stream shift).
+    int      avg_hidden    = 0;
     int      eval_every    = 50;     // iterations between LBR evaluations
     int      lbr_hands     = 10000;
     // LBR hand shards run in parallel threads. Hands are independent, so

@@ -184,13 +184,20 @@ EscherTrainer::EscherTrainer(IPokerEnvironmentFactory& factory, EscherConfig cfg
         ac->to(device_);
         return ac;
     };
+    auto make_avg = [&] {     // avg-classifier capacity (cfg_.avg_hidden)
+        if (cfg_.avg_hidden <= 0) return make();
+        ActorCritic ac(obs_dim_, A_, cfg_.avg_hidden, pc.num_layers,
+                       pc.hist, pc.round_summary);
+        ac->to(device_);
+        return ac;
+    };
     // NOTE order: value_/regret_/avg_ FIRST (identical init RNG draws to the
     // pre-value_target_ code at 5c29560), then the auxiliary nets — so adding
     // value_target_/regret_ema_ does NOT shift the core nets' init basin. (The
     // earlier ordering silently moved the σ oscillation into a worse basin.)
     value_  = make_value();
     regret_ = make();
-    avg_    = make();
+    avg_    = make_avg();
     value_target_ = make_value();
     regret_ema_ = make();
     { torch::NoGradGuard ng;  // value_target_ starts == value_; ema starts == regret_
@@ -591,19 +598,46 @@ void EscherTrainer::fit_regret() {
 void EscherTrainer::collect_avg(long t) {
     // Q is only consumed by the predictive-σ variant.
     const bool need_q = cfg_.predictive > 0.f;
-    // t^k iteration weight (k=1 linear CFR; see EscherConfig::avg_pow).
-    const float w_avg = std::pow(static_cast<float>(t), cfg_.avg_pow);
+    // min(t, cap)^k iteration weight (k=1 linear CFR; see EscherConfig).
+    const float t_eff = (cfg_.avg_pow_cap > 0)
+        ? std::min(static_cast<float>(t), static_cast<float>(cfg_.avg_pow_cap))
+        : static_cast<float>(t);
+    const float w_avg = std::pow(t_eff, cfg_.avg_pow);
+    auto finish = [&](int, float) {};
+    ActorCritic& snet = (cfg_.regret_ema > 0.f) ? regret_ema_ : regret_;  // smoothed σ
+
+    if (cfg_.avg_fixed_opp) {
+        // Per-seat passes, opponent ~ uniform: the recorded player's visits
+        // are weighted by own reach × a t-constant opponent factor, which
+        // cancels per-infoset — the CORRECT linear-CFR conditional average
+        // (σ rows stored as soft targets regardless; avg_soft picks the loss).
+        for (int traverser = 0; traverser < 2; ++traverser) {
+            auto act = [&](int i, int player, const float* obs, const float* mk,
+                           const float* lg, const float* qd, const float*) {
+                auto sig = cfg_.predictive > 0.f
+                               ? sigma_pred(lg, qd, mk, cfg_.predictive)
+                               : sigma(lg, mk);
+                if (player != traverser) return sample_uniform(mk, rng_);
+                int a = sample(sig, rng_);
+                avg_buf_->add(obs, sig.data(), a, w_avg);
+                return a;
+            };
+            run_rollout(factory_, bet_cfg_, obs_dim_, A_, device_,
+                        cfg_.rollout_envs, cfg_.avg_traj, snet,
+                        q_nets(&value_), need_q, act, finish);
+        }
+        return;
+    }
+
     auto act = [&](int i, int player, const float* obs, const float* mk,
                    const float* lg, const float* qd, const float* /*cum*/) {
         auto sig = cfg_.predictive > 0.f
                        ? sigma_pred(lg, qd, mk, cfg_.predictive)
                        : sigma(lg, mk);
         int a = sample(sig, rng_);
-        avg_buf_->add(obs, nullptr, a, w_avg);
+        avg_buf_->add(obs, sig.data(), a, w_avg);
         return a;
     };
-    auto finish = [&](int, float) {};
-    ActorCritic& snet = (cfg_.regret_ema > 0.f) ? regret_ema_ : regret_;  // smoothed σ
     run_rollout(factory_, bet_cfg_, obs_dim_, A_, device_, cfg_.rollout_envs,
                 cfg_.avg_traj, snet, q_nets(&value_), need_q, act, finish);
 }
@@ -648,6 +682,11 @@ float EscherTrainer::run_fit(FitKind kind, ActorCritic& net, ForeachAdam& opt,
                     (net->actor_logits(feat) - target).pow(2)).mean();
         case FitKind::Avg: {
             auto logp = torch::log_softmax(net->actor_logits(feat), 1);
+            if (cfg_.avg_soft) {
+                // Distillation: CE to the stored σ row (0 on illegal actions)
+                // — same expectation as sampled-action NLL, less variance.
+                return -(weight * (target * logp).sum(1)).mean();
+            }
             auto nll  = -logp.gather(1, action.unsqueeze(1)).squeeze(1);
             return (weight * nll).mean();
         }
@@ -845,6 +884,11 @@ void EscherTrainer::run_lbr(int iter) {
         if (cbest && !cfg_.ckpt_dir.empty()) {  // deployable σ: RM⁺ readout
             std::filesystem::create_directories(cfg_.ckpt_dir);
             torch::save(played, cfg_.ckpt_dir + "/cur_best.pt");
+            // Iteration-tagged copy too: the argmin over noisy 10k evals is
+            // the MOST noise-selected snapshot (0.95@10k verified 1.48@100k),
+            // so keep every improvement and 100k-verify the top few post-run.
+            torch::save(played, cfg_.ckpt_dir + "/cur_best_" +
+                                    std::to_string(iter) + ".pt");
         }
     }
 }

@@ -183,6 +183,10 @@ int main(int argc, char** argv) {
         ecfg.value_buf_cap = envi("ESCHER_VALUE_BUF_CAP", ecfg.value_buf_cap);
         ecfg.avg_warmup = envi("ESCHER_AVG_WARMUP", ecfg.avg_warmup);
         if (const char* ap = std::getenv("ESCHER_AVG_POW")) ecfg.avg_pow = std::atof(ap);
+        ecfg.avg_soft      = envi("ESCHER_AVG_SOFT", 0) != 0;
+        ecfg.avg_fixed_opp = envi("ESCHER_AVG_FIXED_OPP", 0) != 0;
+        ecfg.avg_pow_cap   = envi("ESCHER_AVG_POW_CAP", ecfg.avg_pow_cap);
+        ecfg.avg_hidden    = envi("ESCHER_AVG_HIDDEN", ecfg.avg_hidden);
         ecfg.regret_buffer = envi("ESCHER_REGRET_BUFFER", 0) != 0;
         if (const char* re = std::getenv("ESCHER_REGRET_EMA")) ecfg.regret_ema = std::atof(re);
         if (const char* pr = std::getenv("ESCHER_PREDICTIVE")) ecfg.predictive = std::atof(pr);
