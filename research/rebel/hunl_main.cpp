@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "config.h"
+#include "hunl_gpu.h"
 #include "hunl_kernels.h"
 #include "hunl_solver.h"
 #include "hunl_value.h"
@@ -169,6 +170,119 @@ int run_check_terminals(int n_states, int start = 0) {
     return pass ? 0 : 1;
 }
 
+// Batched-vs-scalar solver equivalence: B random river situations solved by
+// BatchRiverSolver (fp32 tensors, GPU on the box / CPU torch here) and by
+// the fp64 CPU HunlSolver, comparing per-combo root values in pot units.
+int run_gpu_check(int B, int T) {
+    const std::vector<int> allowed = {0, 1, 7, 13};
+    const torch::Device dev =
+        torch::cuda::is_available() ? torch::kCUDA : torch::kCPU;
+    std::mt19937 rng(11);
+    PokerEnvironment env(poker_ppo::kPokerConfig,
+                         poker_ppo::config::kBetConfig, 77);
+
+    std::vector<RiverSpec> specs;
+    std::vector<std::vector<std::array<std::vector<double>, 2>>> cpu_v;
+    std::vector<std::vector<std::array<std::vector<double>, 2>>> cpu_m;
+    TreeShape shape;
+    bool have_shape = false;
+    double pot0 = 0.0;
+    int tries = 0;
+    while (static_cast<int>(specs.size()) < B && ++tries < 20 * B) {
+        advance_to_round(env, 3);
+        if (env.is_terminal()) continue;
+        RiverSpec sp;
+        for (int i = 0; i < 5; ++i)
+            sp.board[i] = static_cast<uint8_t>(env.community_card(i));
+        sp.r0 = random_range(rng);
+        sp.r1 = random_range(rng);
+        HunlPBS beta;
+        beta.r0 = sp.r0;
+        beta.r1 = sp.r1;
+        HunlSolver cpu(env, beta, nullptr, allowed);
+        auto sh = TreeShape::from(cpu);
+        if (!have_shape) {
+            shape = sh;
+            have_shape = true;
+            pot0 = 2.0 * cpu.nodes()[0].contrib[0];
+        } else if (sh.signature != shape.signature) {
+            continue;   // rare divergent topology → grouped out
+        }
+        for (const auto& nd : cpu.nodes()) {
+            sp.node_contrib0.push_back(nd.contrib[0]);
+            sp.node_contrib1.push_back(nd.contrib[1]);
+        }
+        // CPU reference solve
+        for (int t = 1; t <= T; ++t) cpu.iterate(t);
+        std::vector<std::array<std::vector<double>, 2>> v1(1), m1(1);
+        cpu.root_values(v1[0], m1[0]);
+        cpu_v.push_back(std::move(v1));
+        cpu_m.push_back(std::move(m1));
+        specs.push_back(std::move(sp));
+    }
+    (void)pot0;
+
+    const bool f64 = std::getenv("REBEL_GPU_F64") != nullptr;
+    BatchRiverSolver gpu(shape, specs, dev,
+                         f64 ? torch::kDouble : torch::kFloat);
+    for (int t = 1; t <= T; ++t) gpu.iterate(t);
+    std::vector<std::array<std::vector<double>, 2>> gv, gm;
+    gpu.root_values(gv, gm);
+
+    double worst = 0.0, mean = 0.0;
+    long cnt = 0;
+    size_t wb = 0;
+    int wp = 0, wi = 0;
+    for (size_t b = 0; b < specs.size(); ++b) {
+        const double pot = 2.0 * specs[b].node_contrib0[0];
+        for (int p = 0; p < 2; ++p)
+            for (int i = 0; i < kCombos; ++i) {
+                if (cpu_m[b][0][p][i] < 0.5 || gm[b][p][i] < 0.5) continue;
+                const double d =
+                    std::fabs(cpu_v[b][0][p][i] - gv[b][p][i]) / pot;
+                if (d > worst) {
+                    worst = d;
+                    wb = b;
+                    wp = p;
+                    wi = i;
+                }
+                mean += d;
+                ++cnt;
+            }
+    }
+    mean = cnt > 0 ? mean / cnt : 0.0;
+    // fp64 = exact-equivalence bar; fp32 = accumulation-drift bar (validated
+    // exact under fp64; ~0.5% of pot drift over hundreds of iterations is
+    // far below the value net's error scale)
+    const double bar = f64 ? 1e-3 : 2e-2;
+    {
+        // argmax context: opponent compatible mass at the offending combo
+        std::vector<uint8_t> vb;
+        board_valid(specs[wb].board.data(), 5, vb);
+        const auto& opp = wp == 0 ? specs[wb].r1 : specs[wb].r0;
+        double s = 0.0;
+        for (int i = 0; i < kCombos; ++i)
+            if (vb[i]) s += opp[i];
+        std::vector<double> nrm(kCombos, 0.0);
+        for (int i = 0; i < kCombos; ++i)
+            if (vb[i] && s > 0) nrm[i] = opp[i] / s;
+        std::vector<double> mass;
+        compat_mass(nrm, vb, mass);
+        std::printf("  worst: spec=%zu p=%d combo=%d  cpu=%.5f gpu=%.5f "
+                    "(pot units)  opp-mass=%.3e\n",
+                    wb, wp, wi,
+                    cpu_v[wb][0][wp][wi] / (2.0 * specs[wb].node_contrib0[0]),
+                    gv[wb][wp][wi] / (2.0 * specs[wb].node_contrib0[0]),
+                    mass[wi]);
+    }
+    std::printf("gpu_check: B=%zu T=%d device=%s dtype=%s  |Δv|/pot "
+                "mean=%.3e max=%.3e  %s\n",
+                specs.size(), T, dev.is_cuda() ? "cuda" : "cpu",
+                f64 ? "f64" : "f32", mean, worst,
+                worst < bar ? "PASS" : "FAIL");
+    return worst < bar ? 0 : 1;
+}
+
 void report(HunlSolver& s, int t, int big_blind) {
     const double e = s.exploitability();
     std::printf("  T=%-6d subgame expl = %10.2f chips/hand  (%.4f bb)\n", t,
@@ -260,6 +374,9 @@ int run_turn(int T_outer, int T_inner) {
 int main(int argc, char** argv) {
     const std::string mode = argc > 1 ? argv[1] : "kernels";
     if (mode == "kernels") return run_kernels();
+    if (mode == "gpu_check")
+        return run_gpu_check(argc > 2 ? std::atoi(argv[2]) : 16,
+                             argc > 3 ? std::atoi(argv[3]) : 200);
     if (mode == "check_terminals")
         return run_check_terminals(argc > 2 ? std::atoi(argv[2]) : 20,
                                    argc > 3 ? std::atoi(argv[3]) : 0);
@@ -290,6 +407,8 @@ int main(int argc, char** argv) {
         if (argc > 3) cfg.episodes = std::atoi(argv[3]);
         if (const char* t = std::getenv("REBEL_THREADS"))
             cfg.threads = std::atoi(t);
+        if (const char* g = std::getenv("REBEL_GPU_BATCH"))
+            cfg.gpu_batch = std::atoi(g);
         if (const char* h = std::getenv("REBEL_HARVEST"))
             cfg.harvest = std::atoi(h);
         EndgameTrainer tr(cfg);

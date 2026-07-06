@@ -74,7 +74,7 @@ struct EndgameConfig {
     int    hidden       = 1024;
     double lr           = 1e-3;
     double eps_explore  = 0.25;
-    int    replay_cap   = 100000;
+    int    replay_cap   = 300000;   // ~32KB/sample → ~10GB resident
     int    probe_k      = 8;     // replay entries re-solved exactly per epoch
     std::vector<int> actions = {0, 1, 7, 13};   // sparse abstraction
     // self-play worker threads (0 = hardware_concurrency). Episodes are
@@ -90,6 +90,10 @@ struct EndgameConfig {
     // train_river mode: direct river-situation sampling (DeepStack recipe) —
     // no turn solves at all; `episodes` = river targets per epoch.
     bool   river_only   = false;
+    // >0: solve river targets in GPU lockstep batches of this size
+    // (BatchRiverSolver; equivalence-validated vs the CPU solver). CPU
+    // workers build specs; the device does the solving.
+    int    gpu_batch    = 0;
     // net checkpoint: loaded at start if present, saved each epoch. Lets a
     // train_turn run fine-tune a river-pretrained net (and later serves the
     // play-time solver). Empty = off.
@@ -117,6 +121,11 @@ private:
                          const HunlPBS& beta, std::vector<Sample>& out);
     void direct_river_episode(poker_ppo::PokerEnvironment& env,
                               std::mt19937& rng, std::vector<Sample>& fresh);
+    // GPU path: CPU workers sample specs (board/pot/ranges/tree shape), the
+    // device solves them in lockstep batches; appends `episodes` samples.
+    void gpu_river_epoch(
+        std::vector<std::unique_ptr<poker_ppo::PokerEnvironment>>& envs,
+        int W, int ep, std::vector<Sample>& fresh);
     std::vector<double> random_range(std::mt19937& rng);
     // appends this episode's target (if any) to `fresh` (probed before
     // being merged into the replay)

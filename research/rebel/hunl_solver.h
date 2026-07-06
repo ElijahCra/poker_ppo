@@ -162,6 +162,12 @@ private:
     std::vector<int>     leaf_ids_;
     // StreetEnd leaf values per node per candidate card: [node][card][p][combo]
     std::vector<std::vector<std::array<std::vector<double>, 2>>> leaf_v_;
+    // board-cached showdown evaluators: [0] = root board (river subgames);
+    // per-runout entries for AllinShowdown (keyed by the runout card)
+    std::unique_ptr<RiverEval> river_eval_;
+    std::array<std::unique_ptr<RiverEval>, kCards> runout_eval_;
+    const RiverEval& eval_for_root();
+    const RiverEval& eval_for_runout(uint8_t c);
 };
 
 // Exact next-street oracle for validation: re-solves the next street with

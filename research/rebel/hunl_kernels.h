@@ -53,6 +53,22 @@ void fold_cfv(const std::vector<double>& opp, const std::vector<uint8_t>& valid,
 void showdown_cfv(const std::vector<double>& opp, const uint8_t* board5,
                   double half_pot, std::vector<double>& cfv);
 
+// Board-cached river evaluator: ranks, sort order and tie groups are fixed
+// per board, so build once per solve and run the O(n) sweep per call.
+// (showdown_cfv re-ranks and re-sorts every call — fine for tests, ruinous
+// inside a 200-iteration solve.)
+class RiverEval {
+public:
+    explicit RiverEval(const uint8_t* board5);
+    void cfv(const std::vector<double>& opp, double half_pot,
+             std::vector<double>& out) const;
+
+private:
+    std::vector<uint8_t> valid_;
+    std::vector<int> order_;       // valid combos, rank-ascending
+    std::vector<int> group_end_;   // exclusive end index per tie group
+};
+
 // O(n²) references for the randomized equivalence tests.
 void compat_mass_brute(const std::vector<double>& opp,
                        const std::vector<uint8_t>& valid,

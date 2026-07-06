@@ -113,6 +113,21 @@ int HunlSolver::build(std::vector<int> path) {
     return id;
 }
 
+const RiverEval& HunlSolver::eval_for_root() {
+    if (!river_eval_)
+        river_eval_ = std::make_unique<RiverEval>(board_.data());
+    return *river_eval_;
+}
+
+const RiverEval& HunlSolver::eval_for_runout(uint8_t c) {
+    if (!runout_eval_[c]) {
+        std::array<uint8_t, 5> nb = board_;
+        nb[nb_root_] = c;
+        runout_eval_[c] = std::make_unique<RiverEval>(nb.data());
+    }
+    return *runout_eval_[c];
+}
+
 std::vector<double> HunlSolver::policy_row(const Node& nd, int combo,
                                            bool average) const {
     const int A = static_cast<int>(nd.acts.size());
@@ -222,8 +237,8 @@ std::vector<double> HunlSolver::walk(int i, int upd, int t, bool update,
         return cfv;
     }
     case Node::Showdown: {
-        showdown_cfv(opp_reach, board_.data(),
-                     static_cast<double>(nd.contrib[0]), cfv);
+        eval_for_root().cfv(opp_reach, static_cast<double>(nd.contrib[0]),
+                            cfv);
         return cfv;
     }
     case Node::AllinShowdown: {
@@ -240,12 +255,10 @@ std::vector<double> HunlSolver::walk(int i, int upd, int t, bool update,
             for (int b = 0; b < nb_root_; ++b)
                 if (board_[b] == c) used = true;
             if (used) continue;
-            std::array<uint8_t, 5> nb = board_;
-            nb[nb_root_] = static_cast<uint8_t>(c);
             std::vector<double> opp_c = opp_reach;
             mask_card(opp_c, static_cast<uint8_t>(c));
-            showdown_cfv(opp_c, nb.data(),
-                         static_cast<double>(nd.contrib[0]), part);
+            eval_for_runout(static_cast<uint8_t>(c))
+                .cfv(opp_c, static_cast<double>(nd.contrib[0]), part);
             for (int x = 0; x < kCombos; ++x) {
                 if (!valid_[x]) continue;
                 if (ct.cards[x][0] == c || ct.cards[x][1] == c) continue;
@@ -505,7 +518,9 @@ void HunlSolver::root_values(std::array<std::vector<double>, 2>& v,
         mask[p].assign(kCombos, 0.0);
         const auto& own = p == 0 ? root_.r0 : root_.r1;
         for (int x = 0; x < kCombos; ++x) {
-            if (!valid_[x] || own[x] <= kTiny || m[x] <= kTiny) continue;
+            // mass floor: per-combo values with negligible opponent mass are
+            // numerically meaningless (tiny/tiny) — exclude from targets
+            if (!valid_[x] || own[x] <= kTiny || m[x] <= 1e-6) continue;
             v[p][x] = cfv[x] / m[x];
             mask[p][x] = 1.0;
         }

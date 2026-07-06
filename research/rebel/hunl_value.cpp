@@ -1,5 +1,7 @@
 #include "hunl_value.h"
 
+#include "hunl_gpu.h"
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -7,6 +9,9 @@
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
+#include <functional>
+#include <mutex>
+#include <unordered_map>
 
 #include "config.h"
 
@@ -126,8 +131,13 @@ bool EndgameTrainer::sample_street_root(poker_ppo::PokerEnvironment& env,
     std::uniform_real_distribution<double> u(0.0, 1.0);
     env.reset();
     while (!env.is_terminal() && env.round() < target_round) {
-        // mostly call/check, sometimes pot-raise: varied pots, rare all-ins
-        const int a = u(rng) < 0.25 ? 7 : 1;
+        // mostly call/check, sometimes a raise of varied size: broad pot
+        // coverage (solver leaf pots include multi-raise lines)
+        int a = 1;
+        if (u(rng) < 0.3) {
+            static const int kRaises[] = {4, 7, 10};
+            a = kRaises[rng() % 3];
+        }
         auto mask = env.legal_action_mask();
         auto ma = mask.accessor<float, 1>();
         env.step(ma[a] > 0.5f ? a : 1);
@@ -202,9 +212,146 @@ void EndgameTrainer::direct_river_episode(poker_ppo::PokerEnvironment& env,
     river_sample_at(env, b5, beta, fresh);
 }
 
+void EndgameTrainer::gpu_river_epoch(
+    std::vector<std::unique_ptr<poker_ppo::PokerEnvironment>>& envs, int W,
+    int ep, std::vector<Sample>& fresh) {
+    struct Pending {
+        RiverSpec sp;
+        std::string sig;
+        bool ok = false;
+    };
+    std::vector<Pending> pend(static_cast<size_t>(cfg_.episodes));
+    std::unordered_map<std::string, TreeShape> shapes;
+    std::mutex mtx;
+    std::atomic<int> next{0};
+    auto work = [&](int w) {
+        std::mt19937 wrng(static_cast<unsigned>(
+            cfg_.seed * 1000003u + ep * 7919u + w * 104729u + 17u));
+        while (true) {
+            const int e = next.fetch_add(1);
+            if (e >= cfg_.episodes) break;
+            auto& env = *envs[w];
+            bool root = false;
+            for (int tries = 0; tries < 50 && !root; ++tries)
+                root = sample_street_root(env, wrng, 3);
+            if (!root) continue;
+            Pending& p = pend[static_cast<size_t>(e)];
+            for (int i = 0; i < 5; ++i)
+                p.sp.board[i] = static_cast<uint8_t>(env.community_card(i));
+            p.sp.r0 = random_range(wrng);
+            p.sp.r1 = random_range(wrng);
+            HunlPBS beta;
+            beta.r0 = p.sp.r0;
+            beta.r1 = p.sp.r1;
+            HunlSolver tmp(env, beta, nullptr, cfg_.actions);
+            auto sh = TreeShape::from(tmp);
+            p.sig = sh.signature;
+            for (const auto& nd : tmp.nodes()) {
+                p.sp.node_contrib0.push_back(nd.contrib[0]);
+                p.sp.node_contrib1.push_back(nd.contrib[1]);
+            }
+            {
+                std::lock_guard<std::mutex> lk(mtx);
+                shapes.emplace(p.sig, std::move(sh));
+            }
+            p.ok = true;
+        }
+    };
+    if (W == 1) {
+        work(0);
+    } else {
+        std::vector<std::thread> pool;
+        for (int w = 0; w < W; ++w) pool.emplace_back(work, w);
+        for (auto& th : pool) th.join();
+    }
+
+    // group by topology signature, solve in device batches
+    std::unordered_map<std::string, std::vector<int>> groups;
+    for (size_t e = 0; e < pend.size(); ++e)
+        if (pend[e].ok) groups[pend[e].sig].push_back(static_cast<int>(e));
+    for (auto& [sig, idxs] : groups) {
+        for (size_t off = 0; off < idxs.size();
+             off += static_cast<size_t>(cfg_.gpu_batch)) {
+            const size_t end =
+                std::min(idxs.size(), off + static_cast<size_t>(cfg_.gpu_batch));
+            std::vector<RiverSpec> batch;
+            batch.reserve(end - off);
+            for (size_t k = off; k < end; ++k)
+                batch.push_back(pend[static_cast<size_t>(idxs[k])].sp);
+            BatchRiverSolver bs(shapes[sig], batch, device_, torch::kFloat);
+            for (int t = 1; t <= cfg_.t_river; ++t) bs.iterate(t);
+            std::vector<std::array<std::vector<double>, 2>> v, m;
+            bs.root_values(v, m);
+            for (size_t b = 0; b < batch.size(); ++b) {
+                const RiverSpec& sp = batch[b];
+                const double pot = 2.0 * sp.node_contrib0[0];
+                if (pot <= 0.0) continue;
+                // normalized ranges for the features
+                std::vector<uint8_t> v5;
+                board_valid(sp.board.data(), 5, v5);
+                HunlPBS nb;
+                nb.r0 = sp.r0;
+                nb.r1 = sp.r1;
+                double s0 = 0.0, s1 = 0.0;
+                for (int i = 0; i < kCombos; ++i) {
+                    if (!v5[i]) {
+                        nb.r0[i] = nb.r1[i] = 0.0;
+                        continue;
+                    }
+                    s0 += nb.r0[i];
+                    s1 += nb.r1[i];
+                }
+                if (s0 <= 0.0 || s1 <= 0.0) continue;
+                for (int i = 0; i < kCombos; ++i) {
+                    nb.r0[i] /= s0;
+                    nb.r1[i] /= s1;
+                }
+                Sample smp;
+                smp.feat = HunlFeaturizer::features(3, sp.board.data(), 5,
+                                                    pot, stack_, nb);
+                smp.target.assign(2 * kCombos, 0.0f);
+                smp.mask.assign(2 * kCombos, 0.0f);
+                for (int p = 0; p < 2; ++p)
+                    for (int i = 0; i < kCombos; ++i) {
+                        if (m[b][p][i] < 0.5) continue;
+                        smp.target[p * kCombos + i] =
+                            static_cast<float>(v[b][p][i] / pot);
+                        smp.mask[p * kCombos + i] = 1.0f;
+                    }
+                fresh.push_back(std::move(smp));
+            }
+        }
+    }
+}
+
 std::vector<double> EndgameTrainer::random_range(std::mt19937& rng) {
     std::uniform_real_distribution<double> u(0.0, 1.0);
-    // per-episode sharpness varies coverage of the range simplex
+    // Solver-generated leaf ranges are STRUCTURED (sparse, correlated) —
+    // iid noise ranges train a net that is useless at solver queries
+    // (measured: heldout 0.005 on iid data, 0.15+ on turn-harvest data).
+    // DeepStack's fix, used here 70% of the time: recursive stick-breaking —
+    // random binary partitions of the combo set with U(0,1) mass splits,
+    // yielding realistic sparse/correlated mass patterns.
+    if (u(rng) < 0.7) {
+        std::vector<double> r(kCombos, 0.0);
+        std::vector<int> idx(kCombos);
+        for (int i = 0; i < kCombos; ++i) idx[i] = i;
+        std::shuffle(idx.begin(), idx.end(), rng);
+        std::function<void(int, int, double)> split =
+            [&](int lo, int hi, double mass) {
+            if (hi - lo == 1) {
+                r[idx[static_cast<size_t>(lo)]] = mass;
+                return;
+            }
+            const int mid = lo + (hi - lo) / 2;
+            const double q = u(rng);
+            split(lo, mid, mass * q);
+            split(mid, hi, mass * (1.0 - q));
+        };
+        split(0, kCombos, 1.0);
+        return r;
+    }
+    // iid coverage floor (broad but unstructured)
     const double k = 1.0 + 3.0 * u(rng);
     std::vector<double> r(kCombos);
     for (double& x : r) x = std::pow(u(rng), k);
@@ -417,6 +564,38 @@ void EndgameTrainer::run() {
 
     for (int ep = 1; ep <= cfg_.epochs; ++ep) {
         auto t_sp0 = clock::now();
+        if (cfg_.river_only && cfg_.gpu_batch > 0 && ep == 1 &&
+            !device_.is_cuda())
+            std::fprintf(stderr,
+                         "  [warn] REBEL_GPU_BATCH on a CPU-torch device is "
+                         "~100x SLOWER than the worker path — use it on "
+                         "CUDA only\n");
+        if (cfg_.river_only && cfg_.gpu_batch > 0) {
+            std::vector<Sample> fresh;
+            gpu_river_epoch(envs, W, ep, fresh);
+            auto t_sp1b = clock::now();
+            const double heldout = heldout_mse(fresh);
+            for (Sample& smp : fresh) {
+                ++seen_;
+                if (static_cast<int>(replay_.size()) < cfg_.replay_cap) {
+                    replay_.push_back(std::move(smp));
+                } else {
+                    std::uniform_int_distribution<long> d(0, seen_ - 1);
+                    const long j = d(rng_);
+                    if (j < static_cast<long>(replay_.size()))
+                        replay_[static_cast<size_t>(j)] = std::move(smp);
+                }
+            }
+            auto t_tr0b = clock::now();
+            const double vloss = train_net();
+            std::printf("  epoch %3d  replay=%5zu  vloss=%.3e  heldout=%.3e"
+                        "  [sp %.0fs train %.0fs]\n",
+                        ep, replay_.size(), vloss, heldout,
+                        secs(t_sp0, t_sp1b), secs(t_tr0b, clock::now()));
+            std::fflush(stdout);
+            if (!cfg_.ckpt.empty()) torch::save(net_, cfg_.ckpt);
+            continue;
+        }
         // episodes fan out over the worker pool (work-stealing counter)
         std::vector<std::vector<Sample>> fresh_w(W);
         std::atomic<int> next{0};

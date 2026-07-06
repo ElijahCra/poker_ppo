@@ -131,6 +131,63 @@ void showdown_cfv(const std::vector<double>& opp, const uint8_t* board5,
     }
 }
 
+RiverEval::RiverEval(const uint8_t* board5) {
+    board_valid(board5, 5, valid_);
+    std::vector<int> rank(kCombos, -1);
+    order_.reserve(kCombos);
+    for (int i = 0; i < kCombos; ++i)
+        if (valid_[i]) {
+            rank[i] = combo_rank(i, board5);
+            order_.push_back(i);
+        }
+    std::sort(order_.begin(), order_.end(),
+              [&](int x, int y) { return rank[x] < rank[y]; });
+    for (size_t g = 0; g < order_.size();) {
+        size_t e = g;
+        while (e < order_.size() && rank[order_[e]] == rank[order_[g]]) ++e;
+        group_end_.push_back(static_cast<int>(e));
+        g = e;
+    }
+}
+
+void RiverEval::cfv(const std::vector<double>& opp, double half_pot,
+                    std::vector<double>& out) const {
+    const auto& ct = ComboTable::get();
+    double S = 0.0, Sc[kCards] = {};
+    for (int j : order_) {
+        S += opp[j];
+        Sc[ct.cards[j][0]] += opp[j];
+        Sc[ct.cards[j][1]] += opp[j];
+    }
+    out.assign(kCombos, 0.0);
+    double W = 0.0, Wc[kCards] = {};
+    size_t g = 0;
+    for (int end : group_end_) {
+        double T = 0.0, Tc[kCards] = {};
+        for (size_t k = g; k < static_cast<size_t>(end); ++k) {
+            const int j = order_[k];
+            T += opp[j];
+            Tc[ct.cards[j][0]] += opp[j];
+            Tc[ct.cards[j][1]] += opp[j];
+        }
+        for (size_t k = g; k < static_cast<size_t>(end); ++k) {
+            const int i = order_[k];
+            const int a = ct.cards[i][0], b = ct.cards[i][1];
+            const double win = W - Wc[a] - Wc[b];
+            const double tie = T - Tc[a] - Tc[b] + opp[i];
+            const double tot = S - Sc[a] - Sc[b] + opp[i];
+            out[i] = half_pot * (win - (tot - win - tie));
+        }
+        for (size_t k = g; k < static_cast<size_t>(end); ++k) {
+            const int j = order_[k];
+            W += opp[j];
+            Wc[ct.cards[j][0]] += opp[j];
+            Wc[ct.cards[j][1]] += opp[j];
+        }
+        g = static_cast<size_t>(end);
+    }
+}
+
 void compat_mass_brute(const std::vector<double>& opp,
                        const std::vector<uint8_t>& valid,
                        std::vector<double>& mass) {

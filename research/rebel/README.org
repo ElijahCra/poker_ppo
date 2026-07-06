@@ -91,6 +91,30 @@ Built and validated on this machine (target =rebel_hunl=):
   epoch) for the two-phase workflow: big train_river pretrain → train_turn
   fine-tune on the on-distribution data. seed=0 now draws a random seed
   (printed) — fixed-seed resumes replayed identical "fresh" data.
+- range-distribution fix (2026-07-05): box runs proved the river net
+  learned its OWN distribution well (heldout 0.19→0.0044 over 250k iid
+  samples) but was ~30× worse on the SOLVER's distribution (turn-harvest
+  heldout ~0.15; probe-turn-expl stuck ~10 bb vs ~4.8 exact ref): iid
+  noise ranges ≠ the sparse/correlated ranges CFR generates — the
+  DeepStack problem, fixed the DeepStack way: 70% of direct-sampled
+  ranges now come from recursive stick-breaking over random combo
+  partitions; street-root prefixes also use varied raise sizes {4,7,10}
+  for pot coverage. Retrain from a FRESH ckpt (the old net's
+  distribution is obsolete); success = turn-mode heldout approaching
+  river-mode heldout and probe-turn-expl(net) finally tracking toward
+  the exact-leaf reference.
+- GPU batch river solver (2026-07-05, hunl_gpu.*): B subgames in LOCKSTEP
+  as [B, A, 1326] tensors — matmul fold masses, per-row sorted-cumsum
+  showdown sweep with exact card removal, shared topology grouped by
+  signature, per-spec pots/boards/ranges. =gpu_check= equivalence vs the
+  fp64 CPU solver: f64 max 6.9e-5 of pot (exact); f32 max 5.5e-3 (pure
+  accumulation drift over 200 iterations — negligible vs net error).
+  =REBEL_GPU_BATCH=512= routes train_river target solving through it
+  (CPU workers build specs, device solves). CUDA-only in practice: on
+  CPU-torch the tensor kernels are ~100x slower than the worker path
+  (warned at runtime). Board-cached =RiverEval= also added (~1.75x on all
+  CPU river solves). Next perf steps if needed: overlap spec-building
+  with device solves; batch bigger; fuse showdown gathers.
 - CPU parallel self-play (2026-07-05): episodes fan out over a worker pool
   (own env + RNG per worker, work-stealing counter, net read-only; torch
   intra-op pinned to 1; HandRanks pre-warmed before spawn). REBEL_THREADS
