@@ -42,11 +42,25 @@ struct HunlValueNetImpl : torch::nn::Module {
     // gelu_ln=true switches hidden activations to LayerNorm+GeLU — the
     // ReBeL paper's spec (6×1536, GeLU, LayerNorm). Default stays ReLU so
     // existing checkpoints keep loading (LayerNorm adds parameters).
+    // zero_sum=true appends DeepStack's outer zero-sum step (differentiable,
+    // so training sees it, exactly as the paper trains through it). In OUR
+    // value convention (per-infostate values normalized by opponent
+    // compatible mass) the game-value identity is
+    //   Σ_i r0_i·m0_i·v0_i + Σ_j r1_j·m1_j·v1_j = 0,
+    // m = opponent mass compatible with the combo (card removal); the
+    // violation, split evenly, is subtracted from every value entry.
     torch::nn::Linear l1{nullptr}, l3{nullptr};
     std::vector<torch::nn::Linear> mids;
     std::vector<torch::nn::LayerNorm> lns;
     bool gelu = false;
-    HunlValueNetImpl(int hidden, int layers = 2, bool gelu_ln = false);
+    bool zero_sum = true;
+    // [kCombos, kCards] combo→card membership. Deliberately NOT a
+    // registered buffer: it's a deterministic constant, and serializing it
+    // would break loading pre-zero-sum checkpoints.
+    torch::Tensor zs_M;
+    HunlValueNetImpl(int hidden, int layers = 2, bool gelu_ln = false,
+                     bool zero_sum_on = true);
+    void to(torch::Device device, bool non_blocking = false) override;
     torch::Tensor forward(torch::Tensor x);
 };
 TORCH_MODULE(HunlValueNet);
@@ -82,6 +96,14 @@ struct EndgameConfig {
     int    hidden       = 1024;
     int    layers       = 2;     // hidden layers (2 = the original l1/l2/l3)
     bool   gelu_ln      = false; // LayerNorm+GeLU hiddens (ReBeL spec)
+    bool   zero_sum     = true;  // DeepStack outer zero-sum correction
+    // Replay policy. ReBeL uses a CIRCULAR buffer ("a simple circular
+    // buffer of size 12M and sample uniformly") — a recency window, correct
+    // when the sample distribution tracks the improving net (train_turn).
+    // For stationary river targets, reservoir (uniform over all history)
+    // keeps more diversity. -1 = auto: circular for train_turn, reservoir
+    // for train_river.
+    int    circular     = -1;
     double lr           = 1e-3;
     double lr_final     = 0.0;   // >0: linear lr decay to this over epochs
     // pointwise Huber on pot-unit errors (both papers use Huber): quadratic
@@ -188,8 +210,13 @@ private:
     void load_dataset(const std::string& path);
     void append_dataset(const std::string& path,
                         const std::vector<Sample>& fresh);
-    // reservoir-insert into replay_ (uniform over all samples ever seen)
+    // insert into replay_: circular (overwrite oldest) or reservoir
+    // (uniform over all samples ever seen), per cfg_.circular
     void replay_insert(Sample&& smp);
+    // pot/stack coverage of a sample batch — DeepStack sampled pots
+    // heavy-tailed on purpose; ours are prefix-induced, so verify the
+    // big-pot tail isn't starved
+    void print_pot_hist(const std::vector<Sample>& v, const char* tag);
 
     EndgameConfig cfg_;
     double        stack_;
@@ -201,6 +228,7 @@ private:
     std::vector<Sample> replay_;
     std::vector<Sample> heldout_;   // fixed split from data_in (never trained)
     long                seen_ = 0;
+    bool                circular_ = false;   // resolved from cfg_.circular
 };
 
 }  // namespace rebel_hunl

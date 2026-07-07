@@ -59,8 +59,19 @@ std::vector<float> HunlFeaturizer::features(int street, const uint8_t* board,
     return f;
 }
 
-HunlValueNetImpl::HunlValueNetImpl(int hidden, int layers, bool gelu_ln) {
+HunlValueNetImpl::HunlValueNetImpl(int hidden, int layers, bool gelu_ln,
+                                   bool zero_sum_on) {
     gelu = gelu_ln;
+    zero_sum = zero_sum_on;
+    zs_M = torch::zeros({kCombos, kCards});
+    {
+        auto acc = zs_M.accessor<float, 2>();
+        const auto& ct = ComboTable::get();
+        for (int i = 0; i < kCombos; ++i) {
+            acc[i][ct.cards[i][0]] = 1.0f;
+            acc[i][ct.cards[i][1]] = 1.0f;
+        }
+    }
     l1 = register_module("l1", torch::nn::Linear(HunlFeaturizer::kDim, hidden));
     if (gelu)
         lns.push_back(register_module(
@@ -78,14 +89,37 @@ HunlValueNetImpl::HunlValueNetImpl(int hidden, int layers, bool gelu_ln) {
     l3 = register_module("l3", torch::nn::Linear(hidden, 2 * kCombos));
 }
 
+void HunlValueNetImpl::to(torch::Device device, bool non_blocking) {
+    torch::nn::Module::to(device, non_blocking);
+    if (zs_M.defined()) zs_M = zs_M.to(device);
+}
+
 torch::Tensor HunlValueNetImpl::forward(torch::Tensor x) {
-    x = l1(x);
-    x = gelu ? torch::gelu(lns[0](x)) : torch::relu(x);
+    torch::Tensor h = l1(x);
+    h = gelu ? torch::gelu(lns[0](h)) : torch::relu(h);
     for (size_t k = 0; k < mids.size(); ++k) {
-        x = mids[k](x);
-        x = gelu ? torch::gelu(lns[k + 1](x)) : torch::relu(x);
+        h = mids[k](h);
+        h = gelu ? torch::gelu(lns[k + 1](h)) : torch::relu(h);
     }
-    return l3(x);
+    auto y = l3(h);
+    if (!zero_sum) return y;
+    // DeepStack's outer step: estimate both players' game values from the
+    // input ranges, then subtract half the (should-be-zero) sum from every
+    // value entry. Compatible-mass weights come from inclusion-exclusion:
+    // m0_i = S1 - A1[a_i] - A1[b_i] + r1_i with A1 = per-card mass of r1.
+    // Scale-invariant in the range normalization (s and Z scale together).
+    constexpr int off = 4 + kCards + 1;
+    auto r0 = x.slice(1, off, off + kCombos);
+    auto r1 = x.slice(1, off + kCombos, off + 2 * kCombos);
+    auto A0 = torch::matmul(r0, zs_M);                       // [B, 52]
+    auto A1 = torch::matmul(r1, zs_M);
+    auto m0 = r1.sum(1, true) - torch::matmul(A1, zs_M.t()) + r1;
+    auto m1 = r0.sum(1, true) - torch::matmul(A0, zs_M.t()) + r0;
+    auto w0 = r0 * m0, w1 = r1 * m1;                         // [B, kCombos]
+    auto Z = w0.sum(1, true);                                // = w1 sum
+    auto s = (w0 * y.slice(1, 0, kCombos)).sum(1, true) +
+             (w1 * y.slice(1, kCombos, 2 * kCombos)).sum(1, true);
+    return y - s / (2.0 * Z.clamp_min(1e-9));
 }
 
 void HunlNetOracle::value(poker_ppo::PokerEnvironment& env,
@@ -150,7 +184,9 @@ EndgameTrainer::EndgameTrainer(EndgameConfig cfg)
     }
     rng_.seed(static_cast<unsigned>(cfg_.seed));
     torch::manual_seed(cfg_.seed);
-    net_ = HunlValueNet(cfg_.hidden, cfg_.layers, cfg_.gelu_ln);
+    circular_ = cfg_.circular < 0 ? !cfg_.river_only : cfg_.circular != 0;
+    net_ = HunlValueNet(cfg_.hidden, cfg_.layers, cfg_.gelu_ln,
+                        cfg_.zero_sum);
     if (!cfg_.ckpt.empty() && std::filesystem::exists(cfg_.ckpt)) {
         // torch::load REPLACES parameter tensors, so a foreign-architecture
         // checkpoint loads "successfully" and silently trains the old net.
@@ -546,12 +582,38 @@ void EndgameTrainer::replay_insert(Sample&& smp) {
     ++seen_;
     if (static_cast<int>(replay_.size()) < cfg_.replay_cap) {
         replay_.push_back(std::move(smp));
+    } else if (circular_) {
+        // ReBeL: circular buffer — overwrite the oldest (recency window,
+        // tracks the net's evolving query distribution)
+        replay_[static_cast<size_t>((seen_ - 1) % cfg_.replay_cap)] =
+            std::move(smp);
     } else {
+        // reservoir — uniform over all samples ever seen (stationary data)
         std::uniform_int_distribution<long> d(0, seen_ - 1);
         const long j = d(rng_);
         if (j < static_cast<long>(replay_.size()))
             replay_[static_cast<size_t>(j)] = std::move(smp);
     }
+}
+
+void EndgameTrainer::print_pot_hist(const std::vector<Sample>& v,
+                                    const char* tag) {
+    if (v.empty()) return;
+    // feat[4 + kCards] = pot/stack (see HunlFeaturizer)
+    static const double kEdge[] = {0.05, 0.10, 0.20, 0.40, 0.70};
+    long h[6] = {};
+    for (const Sample& s : v) {
+        const double p = s.feat[4 + kCards];
+        int b = 0;
+        while (b < 5 && p >= kEdge[b]) ++b;
+        ++h[b];
+    }
+    const double n = static_cast<double>(v.size());
+    std::printf("  [%s] pot/stack: <5%%:%.0f%%  5-10:%.0f%%  10-20:%.0f%%  "
+                "20-40:%.0f%%  40-70:%.0f%%  70+:%.0f%%  (n=%zu)\n",
+                tag, 100.0 * h[0] / n, 100.0 * h[1] / n, 100.0 * h[2] / n,
+                100.0 * h[3] / n, 100.0 * h[4] / n, 100.0 * h[5] / n,
+                v.size());
 }
 
 void EndgameTrainer::append_dataset(const std::string& path,
@@ -650,6 +712,53 @@ void EndgameTrainer::load_dataset(const std::string& path) {
     std::printf("  [data] %s: %ld rows -> replay %zu, heldout %zu "
                 "(target var %.3e)\n",
                 path.c_str(), rows, replay_.size(), heldout_.size(), var);
+    // Zero-sum residual of the TARGETS under the same weights the net's
+    // outer correction uses (Σ r0·m0·v0 + Σ r1·m1·v1, per-entry units
+    // s/2Z). Exact solver values satisfy the identity up to CFR
+    // convergence error — a large residual here means the correction
+    // formula is wrong, and it would push the net AWAY from the targets.
+    {
+        const auto& ct = ComboTable::get();
+        const int off = 4 + kCards + 1;
+        double mean_c = 0.0, max_c = 0.0;
+        long n = 0;
+        for (const Sample& smp : heldout_) {
+            const float* r0 = smp.feat.data() + off;
+            const float* r1 = smp.feat.data() + off + kCombos;
+            double a0[kCards] = {}, a1[kCards] = {};
+            for (int i = 0; i < kCombos; ++i) {
+                a0[ct.cards[i][0]] += r0[i];
+                a0[ct.cards[i][1]] += r0[i];
+                a1[ct.cards[i][0]] += r1[i];
+                a1[ct.cards[i][1]] += r1[i];
+            }
+            double S0 = 0.0, S1 = 0.0;
+            for (int i = 0; i < kCombos; ++i) {
+                S0 += r0[i];
+                S1 += r1[i];
+            }
+            double s = 0.0, Z = 0.0;
+            for (int i = 0; i < kCombos; ++i) {
+                const double m0 =
+                    S1 - a1[ct.cards[i][0]] - a1[ct.cards[i][1]] + r1[i];
+                const double m1 =
+                    S0 - a0[ct.cards[i][0]] - a0[ct.cards[i][1]] + r0[i];
+                s += r0[i] * m0 * smp.target[i] +
+                     r1[i] * m1 * smp.target[kCombos + i];
+                Z += r0[i] * m0;
+            }
+            if (Z <= 0.0) continue;
+            const double c = std::fabs(s) / (2.0 * Z);
+            mean_c += c;
+            max_c = std::max(max_c, c);
+            ++n;
+        }
+        if (n > 0)
+            std::printf("  [data] target zero-sum residual |s|/2Z: "
+                        "mean %.2e max %.2e (pot units)\n",
+                        mean_c / n, max_c);
+    }
+    print_pot_hist(replay_, "data");
 }
 
 double EndgameTrainer::train_net() {
@@ -766,6 +875,8 @@ void EndgameTrainer::run() {
         std::printf(" loss=huber(%g)", cfg_.huber_delta);
     else
         std::printf(" loss=mse");
+    std::printf(" buf=%s%s", circular_ ? "circular" : "reservoir",
+                cfg_.zero_sum ? "" : " zero_sum=off");
     std::printf(" harvest=%d device=%s workers=%d\n", cfg_.harvest,
                 device_.is_cuda() ? "cuda" : "cpu", W);
     if (cfg_.episodes == 0)
@@ -815,6 +926,7 @@ void EndgameTrainer::run() {
             std::vector<Sample> fresh;
             gpu_river_epoch(envs, W, ep, fresh);
             auto t_sp1b = clock::now();
+            if (ep == 1) print_pot_hist(fresh, "gen");
             if (!cfg_.data_out.empty()) append_dataset(cfg_.data_out, fresh);
             const double heldout = !heldout_.empty() ? heldout_mse(heldout_)
                                                      : heldout_mse(fresh);
@@ -856,6 +968,7 @@ void EndgameTrainer::run() {
         for (auto& fw : fresh_w)
             for (auto& s : fw) fresh.push_back(std::move(s));
         auto t_sp1 = clock::now();
+        if (ep == 1) print_pot_hist(fresh, "gen");
         if (!cfg_.data_out.empty()) append_dataset(cfg_.data_out, fresh);
         // out-of-sample probe: the persistent split when a dataset was
         // loaded (comparable across configs), else this epoch's fresh rows

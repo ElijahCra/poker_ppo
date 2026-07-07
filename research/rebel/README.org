@@ -192,8 +192,32 @@ Built and validated on this machine (target =rebel_hunl=):
   changed (new exact refs — ~9.7 bb on probe seed 12345). =REBEL_GELU_LN=1=
   adds LayerNorm+GeLU hiddens for the ReBeL-spec screen arm (6×1536) —
   new parameters, needs a fresh REBEL_CKPT (the shape guard catches it).
-  Zero-sum output correction and the circular (recency) buffer are
-  deferred to the train_turn phase.
+- audit adoptions, part 2 (2026-07-06): DeepStack's ZERO-SUM outer step is
+  now a differentiable layer in the net (default ON, =REBEL_ZERO_SUM=0=
+  off): in our value convention the identity is
+  Σ r0·m0·v0 + Σ r1·m1·v1 = 0 (m = opponent compatible mass via
+  inclusion-exclusion, computed from the input ranges with a fixed
+  combo→card matrix — two matmuls); the violation, split evenly (s/2Z per
+  entry, Z = Σ r·m identical for both players), is subtracted from every
+  value. VALIDATED from outside: exact solver targets satisfy the identity
+  to mean 7.8e-10 / max 1.2e-9 pot units (load_dataset now prints this
+  residual — if it ever reads large, the correction formula and the
+  targets disagree and training would fight itself). The combo→card
+  matrix is deliberately NOT a registered buffer (old ckpts keep loading);
+  =to(Device)= is overridden to move it. Replay buffer: ReBeL's CIRCULAR
+  (overwrite-oldest recency window) is now the default for =train_turn=
+  (=REBEL_CIRCULAR= overrides; auto = circular for turn, reservoir for
+  river — river targets are stationary so uniform-over-history keeps more
+  diversity). Pot-coverage check CLOSED: =[gen]=/=[data]= pot/stack
+  histograms added; measured 13/20/20/15/13/19% across
+  {<5,5-10,10-20,20-40,40-70,70+}% bins — the prefix-induced distribution
+  already has DeepStack-grade heavy-tail coverage, no sampling change
+  needed. Note: strength-polarized ranges raise target variance (~3.6e-1
+  heldout target var vs old distribution) — judge heldout against the
+  printed baseline, not old runs. Still pending, tied to the flop-net
+  phase: iterate-averaged root targets ((1/T)Σ_t v^πt) — not applicable
+  until turn-root values become training targets (today all targets are
+  exact river solves); policy-net warm start; safe-resolving gadget.
 - =hunl_value=: PBS value net (street/board/pot + both 1326-ranges →
   per-combo values both players) + Algorithm-1 endgame self-play
   (=rebel_hunl train_turn=): synthetic turn roots (random boards/pots via

@@ -424,6 +424,9 @@ int main(int argc, char** argv) {
             cfg.huber_delta = std::atof(s);
         if (const char* s = std::getenv("REBEL_GELU_LN"))
             cfg.gelu_ln = std::atoi(s) != 0;
+        if (const char* s = std::getenv("REBEL_ZERO_SUM"))
+            cfg.zero_sum = std::atoi(s) != 0;
+        env_int("REBEL_CIRCULAR", cfg.circular);
         if (const char* s = std::getenv("REBEL_CKPT")) cfg.ckpt = s;
         if (const char* s = std::getenv("REBEL_DATA_IN")) cfg.data_in = s;
         if (const char* s = std::getenv("REBEL_DATA_OUT")) cfg.data_out = s;
