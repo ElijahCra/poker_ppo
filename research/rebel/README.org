@@ -235,6 +235,33 @@ trees); then the flop net bootstrapped through turn solves the same way;
 PBS tracking during live play (adapt LBR's Belief); LBR evaluation harness
 for the search agent; safe-resolving gadget.
 
+* Phase B′ design — play harness + LBR (2026-07-07, implementation next)
+
+Judge stays =src/lbr.cpp= byte-for-byte in algorithm — same judge as the
+PPO 1.85 / ESCHER 1.256 numbers. Integration:
+1. =lbr.h=: extract an =ITargetPolicy= interface (probs for a set of
+   counterfactual holdings at the current env node + act-for-real);
+   existing =ActorCritic= path becomes a thin adapter (behavior
+   unchanged). LBR's Bayes updates map naturally onto re-solving: one
+   solve yields the policy for ALL 1326 combos at once.
+2. =research/rebel/hunl_play=: PBS tracker (both ranges Bayes-updated by
+   the solve's own average policy — the ReBeL self-play model; board
+   masking on street transitions) + act-by-re-solving agent: solve at the
+   CURRENT node with tracked ranges on every query (handles LBR's
+   off-abstraction raises via re-rooting; off-tree opponent actions leave
+   the opponent range unchanged — standard continual-resolving fallback),
+   cache the last solve keyed by state signature (acting + the belief
+   update read the same solve). River = exact solve; turn = net leaves
+   (rebel_turn.pt / rebel_hs_turn.pt).
+3. Hybrid deployment (Libratus-style) until flop/preflop nets exist:
+   preflop+flop policy from the PPO checkpoint via the ActorCritic
+   adapter; PBS tracked under that policy across the boundary; ReBeL
+   re-solving from the turn.
+4. Run config: LBR analytic mode (rollout_mode=0, river-only raises) —
+   rollout modes would trigger a solve per MC sample across streets;
+   fold_probe off for turn nodes (a turn solve per probe). Sharded
+   evaluate (~10s/hand/shard, 20 shards → ~5k hands/h).
+
 * HUNL port map (stage 2)
 
 - Beliefs/ranges: LBR's =Belief= (src/lbr.cpp) already Bayes-tracks
