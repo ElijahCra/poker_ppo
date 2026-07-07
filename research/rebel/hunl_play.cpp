@@ -1,0 +1,232 @@
+#include "hunl_play.h"
+
+#include <algorithm>
+#include <cstdio>
+
+namespace rebel_hunl {
+
+using poker_ppo::PokerEnvironment;
+
+// ── CheckCallTarget ───────────────────────────────────────────────────────
+
+torch::Tensor CheckCallTarget::probs_for_holes(
+    PokerEnvironment& env, const torch::Tensor& mask,
+    const std::vector<std::array<uint8_t, 2>>& holes) {
+    (void)env;
+    const long n = static_cast<long>(holes.size());
+    const long A = mask.size(0);
+    auto m = mask.accessor<float, 1>();
+    const int a = m[1] > 0.5f ? 1 : 0;
+    auto P = torch::zeros({n, A}, torch::kFloat);
+    P.index_put_({torch::indexing::Slice(), a}, 1.0f);
+    return P;
+}
+
+int CheckCallTarget::act(PokerEnvironment& env, const torch::Tensor& mask) {
+    (void)env;
+    auto m = mask.accessor<float, 1>();
+    return m[1] > 0.5f ? 1 : 0;
+}
+
+// ── RebelTarget ───────────────────────────────────────────────────────────
+
+RebelTarget::RebelTarget(HunlValueNet net, double stack,
+                         torch::Device device, RebelPlayConfig cfg,
+                         poker_ppo::ILBRTarget* blueprint)
+    : net_(net), stack_(stack), device_(device), cfg_(std::move(cfg)),
+      blueprint_(blueprint),
+      oracle_(std::make_unique<HunlNetOracle>(net_, stack_, device_)),
+      rng_(static_cast<unsigned>(cfg_.seed ? cfg_.seed
+                                           : std::random_device{}())) {
+    pbs_.r0.assign(kCombos, 1.0 / kCombos);
+    pbs_.r1.assign(kCombos, 1.0 / kCombos);
+}
+
+void RebelTarget::on_hand_start(PokerEnvironment& env) {
+    pbs_.r0.assign(kCombos, 1.0 / kCombos);
+    pbs_.r1.assign(kCombos, 1.0 / kCombos);
+    board_seen_ = 0;
+    cache_.clear();
+    cache_round_ = -1;
+    sync_public(env);
+}
+
+void RebelTarget::sync_public(PokerEnvironment& env) {
+    const int nb = env.community_count();
+    if (nb < board_seen_) {   // defensive: hand restarted without the hook
+        on_hand_start(env);
+        return;
+    }
+    if (nb > board_seen_) {
+        const auto& ct = ComboTable::get();
+        for (int b = board_seen_; b < nb; ++b) {
+            const auto c = static_cast<uint8_t>(env.community_card(b));
+            for (int i = 0; i < kCombos; ++i)
+                if (ct.cards[i][0] == c || ct.cards[i][1] == c)
+                    pbs_.r0[i] = pbs_.r1[i] = 0.0;
+        }
+        for (auto* r : {&pbs_.r0, &pbs_.r1}) {
+            double s = 0.0;
+            for (double w : *r) s += w;
+            if (s > 0.0)
+                for (double& w : *r) w /= s;
+        }
+        board_seen_ = nb;
+    }
+}
+
+std::pair<HunlSolver*, int> RebelTarget::solve_at(PokerEnvironment& env) {
+    // cache management is per street (public state changed = new trees)
+    if (env.round() != cache_round_) {
+        cache_.clear();
+        cache_round_ = env.round();
+    }
+    const auto& log = env.action_log();
+    for (auto& sv : cache_) {
+        if (sv.log_at_root.size() > log.size() ||
+            !std::equal(sv.log_at_root.begin(), sv.log_at_root.end(),
+                        log.begin()))
+            continue;
+        HunlSolver& s = *sv.solver;
+        int node = 0;
+        bool ok = true;
+        for (size_t i = sv.log_at_root.size(); i < log.size() && ok; ++i) {
+            const auto& nd = s.nodes()[static_cast<size_t>(node)];
+            if (nd.kind != HunlSolver::Node::Decision) {
+                ok = false;
+                break;
+            }
+            int k = -1;
+            for (size_t j = 0; j < nd.acts.size(); ++j)
+                if (nd.acts[j] == log[i]) {
+                    k = static_cast<int>(j);
+                    break;
+                }
+            if (k < 0) ok = false;
+            else       node = nd.child[static_cast<size_t>(k)];
+        }
+        if (ok &&
+            s.nodes()[static_cast<size_t>(node)].kind ==
+                HunlSolver::Node::Decision)
+            return {&s, node};
+    }
+    // fresh solve rooted at the current node with the tracked PBS (the
+    // solver masks/normalizes its own copy against the env's board)
+    const bool river = env.round() >= 3;
+    auto solver = std::make_unique<HunlSolver>(
+        env, pbs_, river ? nullptr : oracle_.get(), cfg_.actions);
+    solver->refresh_every = cfg_.refresh_every;
+    const int T = river ? cfg_.t_river : cfg_.t_turn;
+    for (int t = 1; t <= T; ++t) solver->iterate(t);
+    cache_.push_back(Solve{log, std::move(solver)});
+    return {cache_.back().solver.get(), 0};
+}
+
+void RebelTarget::apply_range_update(int seat,
+                                     const std::vector<double>& col) {
+    std::vector<double>& r = seat == 0 ? pbs_.r0 : pbs_.r1;
+    double s = 0.0;
+    for (int i = 0; i < kCombos; ++i) s += r[i] * col[i];
+    if (s <= 1e-300) return;   // model gave the action zero mass: keep range
+    for (int i = 0; i < kCombos; ++i) r[i] = r[i] * col[i] / s;
+}
+
+torch::Tensor RebelTarget::probs_for_holes(
+    PokerEnvironment& env, const torch::Tensor& mask,
+    const std::vector<std::array<uint8_t, 2>>& holes) {
+    if (env.round() < 2 && blueprint_)
+        return blueprint_->probs_for_holes(env, mask, holes);
+    if (env.round() < 2) {
+        CheckCallTarget stub;
+        return stub.probs_for_holes(env, mask, holes);
+    }
+    auto [s, node] = solve_at(env);
+    const auto& nd = s->nodes()[static_cast<size_t>(node)];
+    const auto& ct = ComboTable::get();
+    const long n = static_cast<long>(holes.size());
+    const long A = mask.size(0);
+    auto P = torch::zeros({n, A}, torch::kFloat);
+    auto acc = P.accessor<float, 2>();
+    for (long r = 0; r < n; ++r) {
+        const int combo =
+            ct.id[holes[static_cast<size_t>(r)][0]]
+                 [holes[static_cast<size_t>(r)][1]];
+        auto pol = s->avg_policy(node, combo);
+        for (size_t k = 0; k < nd.acts.size(); ++k)
+            acc[r][nd.acts[k]] = static_cast<float>(pol[k]);
+    }
+    return P;
+}
+
+int RebelTarget::act(PokerEnvironment& env, const torch::Tensor& mask) {
+    sync_public(env);
+    if (env.round() < 2) {
+        if (blueprint_) return blueprint_->act(env, mask);
+        CheckCallTarget stub;
+        return stub.act(env, mask);
+    }
+    auto [s, node] = solve_at(env);
+    const auto& nd = s->nodes()[static_cast<size_t>(node)];
+    const auto h = env.hole_cards(env.current_player());
+    const int combo = ComboTable::get().id[h[0]][h[1]];
+    auto pol = s->avg_policy(node, combo);
+    double sum = 0.0;
+    for (double p : pol) sum += p;
+    if (sum <= 0.0) {   // degenerate: check/call
+        auto m = mask.accessor<float, 1>();
+        return m[1] > 0.5f ? 1 : 0;
+    }
+    std::uniform_real_distribution<double> u(0.0, sum);
+    double x = u(rng_);
+    for (size_t k = 0; k < pol.size(); ++k) {
+        x -= pol[k];
+        if (x <= 0.0) return nd.acts[k];
+    }
+    return nd.acts.back();
+}
+
+void RebelTarget::note_action(PokerEnvironment& env, int action) {
+    sync_public(env);
+    const int seat = env.current_player();
+    if (env.round() < 2) {
+        if (!blueprint_) return;   // check/call stub: uninformative update
+        // blueprint model for the acting seat's range (all live combos)
+        const std::vector<double>& r = seat == 0 ? pbs_.r0 : pbs_.r1;
+        const auto& ct = ComboTable::get();
+        std::vector<std::array<uint8_t, 2>> holes;
+        std::vector<int> idx;
+        holes.reserve(kCombos);
+        idx.reserve(kCombos);
+        for (int i = 0; i < kCombos; ++i) {
+            if (r[i] <= 0.0) continue;
+            holes.push_back(ct.cards[i]);
+            idx.push_back(i);
+        }
+        if (holes.empty()) return;
+        auto P = blueprint_->probs_for_holes(env, env.legal_action_mask(),
+                                             holes);
+        auto acc = P.accessor<float, 2>();
+        std::vector<double> col(kCombos, 0.0);
+        for (size_t k = 0; k < idx.size(); ++k)
+            col[static_cast<size_t>(idx[k])] =
+                static_cast<double>(acc[static_cast<long>(k)][action]);
+        apply_range_update(seat, col);
+        return;
+    }
+    auto [s, node] = solve_at(env);
+    const auto& nd = s->nodes()[static_cast<size_t>(node)];
+    int k = -1;
+    for (size_t j = 0; j < nd.acts.size(); ++j)
+        if (nd.acts[j] == action) {
+            k = static_cast<int>(j);
+            break;
+        }
+    if (k < 0) return;   // off-abstraction (LBR raise size): keep range
+    std::vector<double> col(kCombos, 0.0);
+    for (int i = 0; i < kCombos; ++i)
+        col[static_cast<size_t>(i)] =
+            s->avg_policy(node, i)[static_cast<size_t>(k)];
+    apply_range_update(seat, col);
+}
+
+}  // namespace rebel_hunl

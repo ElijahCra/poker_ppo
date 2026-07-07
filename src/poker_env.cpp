@@ -137,6 +137,7 @@ StepResult PokerEnvironment::reset() {
 StepLite PokerEnvironment::reset_into(float* obs_dst, float* mask_dst) {
     game_->reInitialize();
     bet_history_.clear();
+    action_log_.clear();
     auto_advance_chance();
     rebuild_action_table();
     write_obs_into(obs_dst);
@@ -186,6 +187,7 @@ StepLite PokerEnvironment::step_into(int action_idx,
 
         bet_history_.push_back(e);
     }
+    action_log_.push_back(action_idx);
 
     game_->transition(*action_table_[action_idx]);
 
@@ -242,7 +244,7 @@ void PokerEnvironment::observation_for_hole(int h0, int h1, float* dst) const {
 
 void PokerEnvironment::push_state() {
     state_stack_.push_back(Snapshot{
-        game_->snapshotState(), bet_history_, action_table_});
+        game_->snapshotState(), bet_history_, action_log_, action_table_});
 }
 
 void PokerEnvironment::pop_state() {
@@ -250,6 +252,7 @@ void PokerEnvironment::pop_state() {
     auto& s = state_stack_.back();
     game_->restoreState(s.game);
     bet_history_  = std::move(s.hist);
+    action_log_   = std::move(s.alog);
     action_table_ = std::move(s.table);
     state_stack_.pop_back();
 }

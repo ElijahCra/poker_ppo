@@ -24,14 +24,50 @@
 
 #include <torch/torch.h>
 
+#include <array>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <random>
 #include <string>
+#include <vector>
 
 namespace poker_ppo {
 
 class PokerEnvironment;
+
+// ── Target-policy abstraction ────────────────────────────────────────────
+// LBR attacks anything that can (1) act at the current node and (2) report
+// its action distribution for counterfactual holdings (the Bayes update
+// and raise-response pricing). The ActorCritic path wraps nets (adapter in
+// lbr.cpp, same tensor ops as before the interface existed); the ReBeL
+// path re-solves subgames (research/rebel/hunl_play) — one solve yields
+// the policy for all 1326 combos at once.
+struct ILBRTarget {
+    virtual ~ILBRTarget() = default;
+    // [n, A] CPU float probs of the target's policy at env's CURRENT
+    // decision node, row r = target holding holes[r] counterfactually.
+    // Deployment filtering (temper/min-p) included — LBR attacks the
+    // policy as deployed. Must be side-effect free: LBR calls this at
+    // hypothetical push_state nodes (raise probes).
+    virtual torch::Tensor probs_for_holes(
+        PokerEnvironment& env, const torch::Tensor& mask,
+        const std::vector<std::array<uint8_t, 2>>& holes) = 0;
+    // Sample the target's action for the cards actually in the state.
+    // Called both on the real line and inside rollouts — must also be
+    // side-effect free.
+    virtual int act(PokerEnvironment& env, const torch::Tensor& mask) = 0;
+    // REAL-game lifecycle only (never called around hypothetical
+    // push_state probes or rollouts): stateful targets (a ReBeL PBS
+    // tracker) maintain their beliefs here. note_action fires at the
+    // pre-action node, before env.step(action), for BOTH seats' actions.
+    virtual void on_hand_start(PokerEnvironment& env) { (void)env; }
+    virtual void note_action(PokerEnvironment& env, int action) {
+        (void)env; (void)action;
+    }
+};
+
+struct LBRConfig;
 
 struct LBRConfig {
     int      num_hands         = 20000;
@@ -81,6 +117,14 @@ struct LBRConfig {
     uint64_t seed              = 0;
 };
 
+// The net adapter used by the classic evaluate(ActorCritic&) path,
+// exposed so hybrid targets (ReBeL turn/river + blueprint early streets)
+// can reuse it for the blueprint side. Applies the cfg deployment filter
+// (temper/min-p) and rm_plus readout; calls net->eval() once.
+std::unique_ptr<ILBRTarget> make_actor_critic_target(
+    ActorCritic& net, const LBRConfig& cfg, torch::Device device,
+    int obs_dim, int action_count);
+
 class LBREvaluator {
 public:
     LBREvaluator(IPokerEnvironmentFactory& factory,
@@ -99,6 +143,8 @@ public:
     // Play cfg.num_hands of LBR vs target (alternating seats). target is
     // attacked as-is (raw policy, no deployment filter).
     Result evaluate(ActorCritic& target);
+    // Same judge for any ILBRTarget (re-solving agents etc.).
+    Result evaluate_target(ILBRTarget& target);
 
     // Shard cfg.num_hands across `threads` parallel evaluators (each owns its
     // env + RNG stream; hands are independent, so the merged bound is the
@@ -111,6 +157,13 @@ public:
                                    torch::Device             device,
                                    ActorCritic&              target,
                                    int                       threads);
+    // Sharded over stateful targets: make_target(shard) builds one target
+    // per shard (each owns its tracker/solver state).
+    static Result evaluate_sharded_target(
+        IPokerEnvironmentFactory& factory, const BetConfig& bet_cfg,
+        const LBRConfig& cfg, torch::Device device,
+        const std::function<std::unique_ptr<ILBRTarget>(int)>& make_target,
+        int threads);
 
 private:
     IPokerEnvironmentFactory&          factory_;

@@ -124,7 +124,93 @@ int pot_raise_index(const PokerEnvironment& env, const torch::Tensor& mask) {
     return best;
 }
 
+// The pre-interface net path, verbatim: deployment filter (temper → drop
+// <min_p → renormalise), rm_plus regret readout, counterfactual-hole
+// batching. Behavior-identical to the old in-evaluate lambdas.
+class ActorCriticTarget final : public ILBRTarget {
+public:
+    ActorCriticTarget(ActorCritic& net, const LBRConfig& cfg,
+                      torch::Device device, int obs_dim, int action_count)
+        : net_(net), device_(device), D_(obs_dim), A_(action_count),
+          min_p_(cfg.play_min_p),
+          temp_(cfg.play_temp > 0.0f ? cfg.play_temp : 1.0f),
+          rm_plus_(cfg.rm_plus) {
+        net_->eval();
+    }
+
+    torch::Tensor probs_for_holes(
+        PokerEnvironment& env, const torch::Tensor& mask,
+        const std::vector<std::array<uint8_t, 2>>& holes) override {
+        torch::NoGradGuard ng;
+        const long n = static_cast<long>(holes.size());
+        auto f_cpu = torch::TensorOptions()
+                         .dtype(torch::kFloat32).device(torch::kCPU);
+        auto obs = torch::empty({n, D_}, f_cpu);
+        float* base = obs.data_ptr<float>();
+        for (long r = 0; r < n; ++r)
+            env.observation_for_hole(holes[static_cast<size_t>(r)][0],
+                                     holes[static_cast<size_t>(r)][1],
+                                     base + r * D_);
+        auto obs_dev = obs.to(device_);
+        auto mb_dev  = mask.unsqueeze(0).expand({n, A_}).to(device_);
+        auto logp    = target_logp(obs_dev, mb_dev);
+        return apply_filter(logp).to(torch::kCPU).contiguous();  // [n, A]
+    }
+
+    int act(PokerEnvironment& env, const torch::Tensor& mask) override {
+        torch::NoGradGuard ng;
+        auto obs = env.observation().unsqueeze(0).to(device_);
+        auto md  = mask.unsqueeze(0).to(device_);
+        auto p   = apply_filter(target_logp(obs, md));
+        return static_cast<int>(p.multinomial(1).item<int64_t>());
+    }
+
+private:
+    torch::Tensor target_logp(const torch::Tensor& obs,
+                              const torch::Tensor& mask) {
+        if (!rm_plus_) return net_->masked_log_probs(obs, mask);
+        auto logits = net_->actor_logits(obs);
+        auto pos = torch::clamp(logits, /*min=*/0.0) * mask;
+        auto s   = pos.sum(-1, /*keepdim=*/true);
+        auto cnt = mask.sum(-1, /*keepdim=*/true).clamp_min(1.0);
+        auto probs =
+            torch::where(s > 1e-12, pos / s.clamp_min(1e-12), mask / cnt);
+        return probs.clamp_min(1e-12).log();
+    }
+
+    torch::Tensor apply_filter(const torch::Tensor& logp) {
+        const bool filtering = (min_p_ > 0.0f) || (temp_ != 1.0f);
+        if (!filtering) return logp.exp();
+        auto p = torch::softmax(logp / temp_, -1);
+        if (min_p_ <= 0.0f) return p;
+        auto kept = p * (p >= min_p_).to(torch::kFloat32);
+        auto z    = kept.sum(-1, /*keepdim=*/true);
+        auto safe = torch::where(z > 0, kept / z, torch::zeros_like(kept));
+        auto allzero = (z.squeeze(-1) <= 0);
+        if (allzero.any().item<bool>()) {  // all filtered → keep argmax
+            auto am   = std::get<1>(p.max(-1));
+            auto oneh = torch::zeros_like(p).scatter_(
+                -1, am.unsqueeze(-1), 1.0);
+            safe = torch::where(allzero.unsqueeze(-1), oneh, safe);
+        }
+        return safe;
+    }
+
+    ActorCritic&  net_;
+    torch::Device device_;
+    long          D_, A_;
+    float         min_p_, temp_;
+    bool          rm_plus_;
+};
+
 }  // namespace
+
+std::unique_ptr<ILBRTarget> make_actor_critic_target(
+    ActorCritic& net, const LBRConfig& cfg, torch::Device device,
+    int obs_dim, int action_count) {
+    return std::make_unique<ActorCriticTarget>(net, cfg, device, obs_dim,
+                                               action_count);
+}
 
 LBREvaluator::Result
 LBREvaluator::evaluate_sharded(IPokerEnvironmentFactory& factory,
@@ -133,6 +219,22 @@ LBREvaluator::evaluate_sharded(IPokerEnvironmentFactory& factory,
                                torch::Device             device,
                                ActorCritic&              target,
                                int                       threads) {
+    auto scratch = factory.create(bet_cfg);
+    const int D = scratch->obs_dim();
+    const int A = bet_cfg.action_count();
+    return evaluate_sharded_target(
+        factory, bet_cfg, cfg, device,
+        [&](int) {
+            return make_actor_critic_target(target, cfg, device, D, A);
+        },
+        threads);
+}
+
+LBREvaluator::Result LBREvaluator::evaluate_sharded_target(
+    IPokerEnvironmentFactory& factory, const BetConfig& bet_cfg,
+    const LBRConfig& cfg, torch::Device device,
+    const std::function<std::unique_ptr<ILBRTarget>(int)>& make_target,
+    int threads) {
     const int T = std::max(1, std::min(threads, cfg.num_hands));
     std::vector<Result> shard(T);
     auto run_shard = [&](int t) {
@@ -143,7 +245,8 @@ LBREvaluator::evaluate_sharded(IPokerEnvironmentFactory& factory,
         if (t != 0 && !lc.log_path.empty())
             lc.log_path += "." + std::to_string(t);
         LBREvaluator ev(factory, bet_cfg, lc, device);
-        shard[t] = ev.evaluate(target);
+        auto tgt = make_target(t);
+        shard[t] = ev.evaluate_target(*tgt);
     };
     if (T == 1) { run_shard(0); return shard[0]; }
     std::vector<std::thread> ws;
@@ -167,52 +270,14 @@ LBREvaluator::evaluate_sharded(IPokerEnvironmentFactory& factory,
 }
 
 LBREvaluator::Result LBREvaluator::evaluate(ActorCritic& target) {
+    ActorCriticTarget t(target, cfg_, device_, env_->obs_dim(),
+                        bet_cfg_.action_count());
+    return evaluate_target(t);
+}
+
+LBREvaluator::Result LBREvaluator::evaluate_target(ILBRTarget& target) {
     using clock = std::chrono::steady_clock;
     const auto t0 = clock::now();
-
-    target->eval();
-    torch::NoGradGuard ng;
-
-    const int D = env_->obs_dim();
-    const int A = bet_cfg_.action_count();
-    auto f_cpu = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
-
-    // Deployment filter (temper → drop <min_p → renormalise), matching play
-    // mode. When off (min_p 0, temp 1) it's the raw policy. Applied to every
-    // target query so LBR attacks the policy AS DEPLOYED.
-    const float min_p = cfg_.play_min_p;
-    const float temp  = cfg_.play_temp > 0.0f ? cfg_.play_temp : 1.0f;
-    const bool  filtering = (min_p > 0.0f) || (temp != 1.0f);
-    auto apply_filter = [&](const torch::Tensor& logp) -> torch::Tensor {
-        if (!filtering) return logp.exp();
-        auto p = torch::softmax(logp / temp, -1);
-        if (min_p <= 0.0f) return p;
-        auto kept = p * (p >= min_p).to(torch::kFloat32);
-        auto z    = kept.sum(-1, /*keepdim=*/true);
-        auto safe = torch::where(z > 0, kept / z, torch::zeros_like(kept));
-        auto allzero = (z.squeeze(-1) <= 0);
-        if (allzero.any().item<bool>()) {  // all filtered → keep argmax
-            auto am   = std::get<1>(p.max(-1));
-            auto oneh = torch::zeros_like(p).scatter_(
-                -1, am.unsqueeze(-1), 1.0);
-            safe = torch::where(allzero.unsqueeze(-1), oneh, safe);
-        }
-        return safe;
-    };
-
-    // Target policy log-probs at obs/mask. Default = masked log-softmax of the
-    // actor; with cfg_.rm_plus = RM⁺ on the raw actor logits (clamp≥0,
-    // normalise over legal) so LBR can attack the CURRENT σ (ESCHER regret net).
-    auto target_logp = [&](const torch::Tensor& obs,
-                           const torch::Tensor& mask) -> torch::Tensor {
-        if (!cfg_.rm_plus) return target->masked_log_probs(obs, mask);
-        auto logits = target->actor_logits(obs);
-        auto pos = torch::clamp(logits, /*min=*/0.0) * mask;
-        auto s   = pos.sum(-1, /*keepdim=*/true);
-        auto cnt = mask.sum(-1, /*keepdim=*/true).clamp_min(1.0);
-        auto probs = torch::where(s > 1e-12, pos / s.clamp_min(1e-12), mask / cnt);
-        return probs.clamp_min(1e-12).log();
-    };
 
     // Filtered target policy probs at the CURRENT node for each active combo,
     // holding it counterfactually: [n_active, A] on CPU. mask is the public
@@ -220,17 +285,10 @@ LBREvaluator::Result LBREvaluator::evaluate(ActorCritic& target) {
     // villain's fold/call response to a candidate LBR raise.
     auto active_probs = [&](const Belief& b, const std::vector<int>& active,
                             const torch::Tensor& mask) -> torch::Tensor {
-        const long n = static_cast<long>(active.size());
-        auto obs = torch::empty({n, D}, f_cpu);
-        float* base = obs.data_ptr<float>();
-        for (long r = 0; r < n; ++r) {
-            const auto& c = b.combos[active[r]];
-            env_->observation_for_hole(c[0], c[1], base + r * D);
-        }
-        auto obs_dev = obs.to(device_);
-        auto mb_dev  = mask.unsqueeze(0).expand({n, A}).to(device_);
-        auto logp    = target_logp(obs_dev, mb_dev);
-        return apply_filter(logp).to(torch::kCPU).contiguous();  // [n, A]
+        std::vector<std::array<uint8_t, 2>> holes(active.size());
+        for (size_t r = 0; r < active.size(); ++r)
+            holes[r] = b.combos[static_cast<size_t>(active[r])];
+        return target.probs_for_holes(*env_, mask, holes);
     };
 
     auto active_of = [](const Belief& b) {
@@ -241,14 +299,10 @@ LBREvaluator::Result LBREvaluator::evaluate(ActorCritic& target) {
         return active;
     };
 
-    // Sample the villain's action at the current node from the (filtered)
-    // target policy, reading whatever cards are currently in the state
-    // (real, or injected during a rollout).
+    // Sample the villain's action at the current node, reading whatever
+    // cards are currently in the state (real, or injected during a rollout).
     auto sample_villain_action = [&](const torch::Tensor& mask) -> int {
-        auto obs = env_->observation().unsqueeze(0).to(device_);
-        auto md  = mask.unsqueeze(0).to(device_);
-        auto p   = apply_filter(target_logp(obs, md));
-        return static_cast<int>(p.multinomial(1).item<int64_t>());
+        return target.act(*env_, mask);
     };
 
     // Monte-Carlo EV (absolute terminal utility, LBR seat) of LBR raising
@@ -311,6 +365,7 @@ LBREvaluator::Result LBREvaluator::evaluate(ActorCritic& target) {
     for (int hand = 0; hand < cfg_.num_hands; ++hand) {
         const int lbr_seat = hand % 2;
         env_->reset();
+        target.on_hand_start(*env_);
         mark_dead(dead, *env_, lbr_seat);
         belief.init(dead);
 
@@ -346,6 +401,7 @@ LBREvaluator::Result LBREvaluator::evaluate(ActorCritic& target) {
                             static_cast<double>(pa[static_cast<long>(r)]);
                     belief.renormalize();
                 }
+                target.note_action(*env_, a);
                 env_->step(a);
                 continue;
             }
@@ -353,7 +409,11 @@ LBREvaluator::Result LBREvaluator::evaluate(ActorCritic& target) {
             // ── LBR acts ──────────────────────────────────────────────────
             auto mask = env_->legal_action_mask();
             // Committed (post-raise): call/check to showdown, never fold.
-            if (committed) { env_->step(1); continue; }
+            if (committed) {
+                target.note_action(*env_, 1);
+                env_->step(1);
+                continue;
+            }
             const auto h  = env_->hole_cards(lbr_seat);
             const int  nb = env_->community_count();
             uint8_t board[5];
@@ -467,6 +527,7 @@ LBREvaluator::Result LBREvaluator::evaluate(ActorCritic& target) {
 
             if (best_action >= 2) { committed = true; lbr_raised = true; }
             if (best_action == 0) lbr_folded = true;
+            target.note_action(*env_, best_action);
             env_->step(best_action);
         }
 

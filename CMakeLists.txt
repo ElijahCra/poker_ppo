@@ -150,9 +150,12 @@ add_executable(rebel_hunl
     research/rebel/hunl_solver.cpp
     research/rebel/hunl_gpu.cpp
     research/rebel/hunl_value.cpp
+    research/rebel/hunl_play.cpp
     research/rebel/hunl_main.cpp
     src/poker_env.cpp
     src/observation_builder.cpp
+    src/lbr.cpp
+    src/network.cpp
 )
 target_include_directories(rebel_hunl PRIVATE research/rebel include)
 target_link_libraries(rebel_hunl PRIVATE "${TORCH_LIBRARIES}" Game)

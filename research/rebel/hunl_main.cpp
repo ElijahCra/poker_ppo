@@ -14,9 +14,14 @@
 #include "config.h"
 #include "hunl_gpu.h"
 #include "hunl_kernels.h"
+#include "hunl_play.h"
 #include "hunl_solver.h"
 #include "hunl_value.h"
+#include "lbr.h"
+#include "network.h"
 #include "poker_env.h"
+
+#include <unordered_map>
 
 using namespace rebel_hunl;
 using poker_ppo::PokerEnvironment;
@@ -395,6 +400,119 @@ int main(int argc, char** argv) {
         const int To = argc > 2 ? std::atoi(argv[2]) : 100;
         const int Ti = argc > 3 ? std::atoi(argv[3]) : 100;
         return run_turn(To, Ti);
+    }
+    // Phase B′: LBR judges the re-solving agent — the same judge (and
+    // config) the PPO 1.85 / ESCHER 1.256 numbers came from.
+    //   rebel_hunl lbr <hands> <threads>
+    //   REBEL_CKPT       hand-strength value net (default rebel_hs_turn.pt)
+    //   REBEL_HIDDEN/LAYERS/GELU_LN/ZERO_SUM   net architecture
+    //   REBEL_BLUEPRINT  PPO ActorCritic .pt for preflop/flop (hybrid);
+    //                    empty → check/call stub (pipeline smoke ONLY)
+    //   REBEL_T_TURN / REBEL_T_RIVER   play-time solve iterations
+    if (mode == "lbr") {
+        const int hands   = argc > 2 ? std::atoi(argv[2]) : 200;
+        const int threads = argc > 3 ? std::atoi(argv[3]) : 1;
+        const torch::Device device =
+            torch::cuda::is_available() ? torch::kCUDA : torch::kCPU;
+        auto env_i = [](const char* n, int d) {
+            const char* s = std::getenv(n);
+            return s ? std::atoi(s) : d;
+        };
+        const int hidden  = env_i("REBEL_HIDDEN", 1024);
+        const int layers  = env_i("REBEL_LAYERS", 2);
+        const bool gelu   = env_i("REBEL_GELU_LN", 0) != 0;
+        const bool zs     = env_i("REBEL_ZERO_SUM", 1) != 0;
+        const char* ce    = std::getenv("REBEL_CKPT");
+        const std::string ckpt = ce ? ce : "rebel_hs_turn.pt";
+
+        HunlValueNet net(hidden, layers, gelu, zs);
+        {   // shape-guarded load (torch::load replaces tensors silently)
+            std::unordered_map<std::string, std::vector<int64_t>> want;
+            for (const auto& p : net->named_parameters())
+                want[p.key()] = p.value().sizes().vec();
+            bool ok = true;
+            try {
+                torch::load(net, ckpt);
+                for (const auto& p : net->named_parameters())
+                    if (want.at(p.key()) != p.value().sizes().vec())
+                        ok = false;
+            } catch (const std::exception&) { ok = false; }
+            if (!ok) {
+                std::fprintf(stderr, "lbr: %s does not fit hidden=%d "
+                             "layers=%d gelu_ln=%d\n", ckpt.c_str(), hidden,
+                             layers, gelu ? 1 : 0);
+                return 1;
+            }
+        }
+        net->to(device);
+        net->eval();
+
+        poker_ppo::PokerEnvironmentFactory factory(poker_ppo::kPokerConfig);
+        const auto& bet_cfg = poker_ppo::config::kBetConfig;
+        auto probe_env = factory.create(bet_cfg);
+        const int D = probe_env->obs_dim();
+        const int A = bet_cfg.action_count();
+
+        poker_ppo::LBRConfig lc;   // analytic mode, raises on: the
+        lc.num_hands = hands;      // trustworthy-bound defaults
+        if (const char* s = std::getenv("REBEL_SEED"))
+            lc.seed = std::strtoull(s, nullptr, 10);
+
+        poker_ppo::ActorCritic bp{nullptr};
+        std::unique_ptr<poker_ppo::ILBRTarget> bp_target;
+        if (const char* b = std::getenv("REBEL_BLUEPRINT")) {
+            bp = poker_ppo::ActorCritic(
+                D, A, poker_ppo::config::kPPOConfig.hidden_dim,
+                poker_ppo::config::kPPOConfig.num_layers,
+                poker_ppo::config::kPPOConfig.hist,
+                poker_ppo::config::kPPOConfig.round_summary);
+            try {
+                torch::load(bp, b);
+            } catch (const std::exception& e) {
+                std::fprintf(stderr, "lbr: cannot load blueprint %s (%s)\n",
+                             b, e.what());
+                return 1;
+            }
+            bp->to(device);
+            bp_target = poker_ppo::make_actor_critic_target(bp, lc, device,
+                                                            D, A);
+            std::printf("lbr: blueprint %s (preflop/flop)\n", b);
+        } else {
+            std::fprintf(stderr,
+                         "lbr: [warn] no REBEL_BLUEPRINT — preflop/flop is a "
+                         "check/call stub; the bound measures that toy "
+                         "hybrid, not ReBeL\n");
+        }
+
+        RebelPlayConfig pc;
+        pc.t_turn  = env_i("REBEL_T_TURN", 120);
+        pc.t_river = env_i("REBEL_T_RIVER", 200);
+        const double stack = static_cast<double>(
+            poker_ppo::kPokerConfig.game.initial_stack);
+        std::printf("lbr: hands=%d threads=%d net=%s (%dx%d%s) T=%d/%d "
+                    "device=%s\n", hands, threads, ckpt.c_str(), hidden,
+                    layers, gelu ? " gelu+ln" : "", pc.t_turn, pc.t_river,
+                    device.is_cuda() ? "cuda" : "cpu");
+        {   // HandRanks pre-warm: lazy load isn't thread-safe
+            const uint8_t warm[5] = {0, 5, 10, 15, 20};
+            (void)combo_rank(ComboTable::get().id[25][30], warm);
+        }
+        if (threads > 1) torch::set_num_threads(1);
+
+        const auto res = poker_ppo::LBREvaluator::evaluate_sharded_target(
+            factory, bet_cfg, lc, device,
+            [&](int t) -> std::unique_ptr<poker_ppo::ILBRTarget> {
+                RebelPlayConfig c = pc;
+                c.seed = lc.seed + 104729u * static_cast<uint64_t>(t) + 13u;
+                return std::make_unique<RebelTarget>(net, stack, device, c,
+                                                     bp_target.get());
+            },
+            threads);
+        std::printf("\nLBR vs ReBeL agent: %.4f bb/hand over %d hands "
+                    "(LBR win rate %.3f, %.0fs)\n",
+                    res.bb_per_hand, res.num_hands, res.lbr_win_rate,
+                    res.wall_ms / 1000.0);
+        return 0;
     }
     if (mode == "convert_data") {
         if (argc < 4) {

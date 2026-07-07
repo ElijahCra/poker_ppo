@@ -74,6 +74,12 @@ public:
     void push_state();
     void pop_state();
 
+    // Every action index stepped this hand, in order (cleared on reset,
+    // snapshot-consistent across push/pop). A re-solving target (ReBeL)
+    // keys its subgame cache on this: after a hypothetical push+step the
+    // log names the hypothetical node; after pop it names the real one.
+    const std::vector<int>& action_log() const { return action_log_; }
+
     // LBR rollout: overwrite the villain's hole with (h0,h1) and resample
     // the UNREVEALED board consistently (excluding LBR's cards, the
     // revealed board, and h) so the counterfactual hand has no card
@@ -114,11 +120,13 @@ private:
     std::vector<std::optional<::Game::Action>> action_table_;
 
     std::vector<BetHistoryEntry> bet_history_;
+    std::vector<int>             action_log_;
 
     // LIFO snapshots for push_state/pop_state (LBR counterfactual lookahead).
     struct Snapshot {
         ::Game::DiscreteGame::StateSnapshot         game;
         std::vector<BetHistoryEntry>                hist;
+        std::vector<int>                            alog;
         std::vector<std::optional<::Game::Action>>  table;
     };
     std::vector<Snapshot> state_stack_;
