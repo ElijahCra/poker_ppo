@@ -44,9 +44,42 @@ bool check_data_header(const std::string& path, int n_out) {
 }
 }  // namespace
 
+namespace {
+// eq[i] = (win − lose mass of combo i vs opp) / compatible mass ∈ [−1,1].
+// Scale-invariant in opp's normalization — consistent between training
+// rows (normalized ranges) and solver queries (solver-scaled beliefs).
+void equity_vs_range(const RiverEval& ev, const std::vector<double>& opp,
+                     std::vector<double>& eq) {
+    std::vector<double> num, den;
+    ev.cfv(opp, 1.0, num);
+    compat_mass(opp, ev.valid(), den);
+    eq.assign(kCombos, 0.0);
+    for (int i = 0; i < kCombos; ++i)
+        if (den[i] > 0.0) eq[i] = num[i] / den[i];
+}
+}  // namespace
+
 std::vector<float> HunlFeaturizer::features(int street, const uint8_t* board,
                                             int nb, double pot, double stack,
                                             const HunlPBS& beta) {
+    static const std::vector<double> kZero(kCombos, 0.0);
+    if (nb != 5)
+        return features(street, board, nb, pot, stack, beta, kZero, kZero,
+                        kZero);
+    RiverEval ev(board);
+    std::vector<double> pct, eq0, eq1;
+    ev.percentile(pct);
+    equity_vs_range(ev, beta.r1, eq0);
+    equity_vs_range(ev, beta.r0, eq1);
+    return features(street, board, nb, pot, stack, beta, pct, eq0, eq1);
+}
+
+std::vector<float> HunlFeaturizer::features(int street, const uint8_t* board,
+                                            int nb, double pot, double stack,
+                                            const HunlPBS& beta,
+                                            const std::vector<double>& pct,
+                                            const std::vector<double>& eq0,
+                                            const std::vector<double>& eq1) {
     std::vector<float> f(kDim, 0.0f);
     f[street] = 1.0f;
     for (int i = 0; i < nb; ++i) f[4 + board[i]] = 1.0f;
@@ -55,6 +88,9 @@ std::vector<float> HunlFeaturizer::features(int street, const uint8_t* board,
     for (int i = 0; i < kCombos; ++i) {
         f[off + i] = static_cast<float>(beta.r0[i]);
         f[off + kCombos + i] = static_cast<float>(beta.r1[i]);
+        f[off + 2 * kCombos + i] = static_cast<float>(pct[i]);
+        f[off + 3 * kCombos + i] = static_cast<float>(eq0[i]);
+        f[off + 4 * kCombos + i] = static_cast<float>(eq1[i]);
     }
     return f;
 }
@@ -146,11 +182,34 @@ void HunlNetOracle::value_batch(
     auto X = torch::empty({N, HunlFeaturizer::kDim}, torch::kFloat);
     std::array<uint8_t, 5> b{};
     for (int i = 0; i < nb_base; ++i) b[i] = base_board[i];
+    // new base board (new solve) → drop the per-card strength contexts
+    if (ctx_nb_ != nb_base ||
+        !std::equal(b.begin(), b.begin() + nb_base, ctx_board_.begin())) {
+        for (auto& c : ctx_) c = CardCtx{};
+        ctx_board_ = b;
+        ctx_nb_ = nb_base;
+    }
+    std::vector<double> eq0, eq1;
     for (long r = 0; r < N; ++r) {
-        b[nb_base] = cards[static_cast<size_t>(r)];
-        auto f = HunlFeaturizer::features(street_of(nb_base + 1), b.data(),
-                                          nb_base + 1, pot, stack_,
-                                          betas[static_cast<size_t>(r)]);
+        const uint8_t card = cards[static_cast<size_t>(r)];
+        b[nb_base] = card;
+        std::vector<float> f;
+        if (nb_base + 1 == 5) {
+            CardCtx& cc = ctx_[card];
+            if (!cc.ev) {
+                cc.ev = std::make_unique<RiverEval>(b.data());
+                cc.ev->percentile(cc.pct);
+            }
+            const HunlPBS& beta = betas[static_cast<size_t>(r)];
+            equity_vs_range(*cc.ev, beta.r1, eq0);
+            equity_vs_range(*cc.ev, beta.r0, eq1);
+            f = HunlFeaturizer::features(street_of(5), b.data(), 5, pot,
+                                         stack_, beta, cc.pct, eq0, eq1);
+        } else {
+            f = HunlFeaturizer::features(street_of(nb_base + 1), b.data(),
+                                         nb_base + 1, pot, stack_,
+                                         betas[static_cast<size_t>(r)]);
+        }
         std::copy(f.begin(), f.end(),
                   X.data_ptr<float>() +
                       static_cast<size_t>(r) * HunlFeaturizer::kDim);
@@ -166,6 +225,77 @@ void HunlNetOracle::value_batch(
             for (int i = 0; i < kCombos; ++i)
                 o[i] = static_cast<double>(acc[r][p * kCombos + i]) * pot;
         }
+}
+
+int convert_dataset(const std::string& in, const std::string& out) {
+    constexpr int kOldDim = 4 + kCards + 1 + 2 * kCombos;   // 2709
+    const int n_out = 2 * kCombos;
+    const double stack =
+        static_cast<double>(poker_ppo::kPokerConfig.game.initial_stack);
+    std::ifstream fi(in, std::ios::binary);
+    if (!fi) {
+        std::fprintf(stderr, "convert: cannot open %s\n", in.c_str());
+        return 1;
+    }
+    uint32_t hdr[4];
+    if (!fi.read(reinterpret_cast<char*>(hdr), sizeof hdr) ||
+        hdr[0] != kDataMagic || hdr[1] != kDataVersion ||
+        hdr[2] != static_cast<uint32_t>(kOldDim) ||
+        hdr[3] != static_cast<uint32_t>(n_out)) {
+        std::fprintf(stderr,
+                     "convert: %s is not a kdim=%d dataset (already "
+                     "converted?)\n", in.c_str(), kOldDim);
+        return 1;
+    }
+    std::ofstream fo(out, std::ios::binary | std::ios::trunc);
+    if (!fo) {
+        std::fprintf(stderr, "convert: cannot open %s\n", out.c_str());
+        return 1;
+    }
+    const uint32_t nhdr[4] = {kDataMagic, kDataVersion,
+                              static_cast<uint32_t>(HunlFeaturizer::kDim),
+                              static_cast<uint32_t>(n_out)};
+    fo.write(reinterpret_cast<const char*>(nhdr), sizeof nhdr);
+
+    std::vector<float> feat(kOldDim), target(static_cast<size_t>(n_out));
+    std::vector<uint8_t> mask(static_cast<size_t>(n_out));
+    long rows = 0;
+    while (fi.read(reinterpret_cast<char*>(feat.data()),
+                   sizeof(float) * kOldDim) &&
+           fi.read(reinterpret_cast<char*>(target.data()),
+                   sizeof(float) * static_cast<size_t>(n_out)) &&
+           fi.read(reinterpret_cast<char*>(mask.data()), n_out)) {
+        int street = 0;
+        for (int s = 1; s < 4; ++s)
+            if (feat[s] > feat[street]) street = s;
+        uint8_t board[5];
+        int nb = 0;
+        for (int c = 0; c < kCards && nb < 5; ++c)
+            if (feat[4 + c] > 0.5f) board[nb++] = static_cast<uint8_t>(c);
+        const double pot = static_cast<double>(feat[4 + kCards]) * stack;
+        HunlPBS beta;
+        beta.r0.resize(kCombos);
+        beta.r1.resize(kCombos);
+        const int off = 4 + kCards + 1;
+        for (int i = 0; i < kCombos; ++i) {
+            beta.r0[i] = static_cast<double>(feat[off + i]);
+            beta.r1[i] = static_cast<double>(feat[off + kCombos + i]);
+        }
+        auto nf = HunlFeaturizer::features(street, board, nb, pot, stack,
+                                           beta);
+        fo.write(reinterpret_cast<const char*>(nf.data()),
+                 sizeof(float) * HunlFeaturizer::kDim);
+        fo.write(reinterpret_cast<const char*>(target.data()),
+                 sizeof(float) * static_cast<size_t>(n_out));
+        fo.write(reinterpret_cast<const char*>(mask.data()), n_out);
+        if (++rows % 100000 == 0) {
+            std::printf("  convert: %ld rows\n", rows);
+            std::fflush(stdout);
+        }
+    }
+    std::printf("convert: %s -> %s  %ld rows (kdim %d -> %d)\n", in.c_str(),
+                out.c_str(), rows, kOldDim, HunlFeaturizer::kDim);
+    return 0;
 }
 
 EndgameTrainer::EndgameTrainer(EndgameConfig cfg)

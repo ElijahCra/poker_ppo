@@ -150,6 +150,21 @@ RiverEval::RiverEval(const uint8_t* board5) {
     }
 }
 
+void RiverEval::percentile(std::vector<double>& out) const {
+    out.assign(kCombos, 0.0);
+    const int V = static_cast<int>(order_.size());
+    if (V <= 1) return;
+    int start = 0;
+    for (int end : group_end_) {
+        const int ties = end - start;
+        const double p =
+            (start + 0.5 * (ties - 1)) / static_cast<double>(V - 1);
+        for (int k = start; k < end; ++k)
+            out[static_cast<size_t>(order_[static_cast<size_t>(k)])] = p;
+        start = end;
+    }
+}
+
 void RiverEval::cfv(const std::vector<double>& opp, double half_pot,
                     std::vector<double>& out) const {
     const auto& ct = ComboTable::get();

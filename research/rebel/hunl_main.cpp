@@ -396,6 +396,13 @@ int main(int argc, char** argv) {
         const int Ti = argc > 3 ? std::atoi(argv[3]) : 100;
         return run_turn(To, Ti);
     }
+    if (mode == "convert_data") {
+        if (argc < 4) {
+            std::fprintf(stderr, "usage: rebel_hunl convert_data <in> <out>\n");
+            return 1;
+        }
+        return convert_dataset(argv[2], argv[3]);
+    }
     if (mode == "train_turn" || mode == "train_river") {
         EndgameConfig cfg;
         cfg.river_only = (mode == "train_river");

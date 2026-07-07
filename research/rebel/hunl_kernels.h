@@ -62,6 +62,11 @@ public:
     explicit RiverEval(const uint8_t* board5);
     void cfv(const std::vector<double>& opp, double half_pot,
              std::vector<double>& out) const;
+    // pct[i] = (#weaker valid combos + 0.5·(#rank-ties − 1)) / (V − 1)
+    // ∈ [0,1], 0 for invalid combos. Uniform-range strength anchor (no
+    // card removal — the exact interaction lives in the equity features).
+    void percentile(std::vector<double>& out) const;
+    const std::vector<uint8_t>& valid() const { return valid_; }
 
 private:
     std::vector<uint8_t> valid_;

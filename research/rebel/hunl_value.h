@@ -29,11 +29,32 @@ namespace rebel_hunl {
 
 class HunlFeaturizer {
 public:
-    static constexpr int kDim = 4 + kCards + 1 + 2 * kCombos;
+    // [street(4) | board(52) | pot/stack | r0 | r1 | pct | eq0 | eq1]
+    // pct/eq blocks are the hand-strength features (2026-07-07): raw card
+    // one-hots force the net to learn hand evaluation implicitly — the
+    // measured error floor after capacity (screen) and distribution
+    // (train_turn) were ruled out. pct = board-strength percentile
+    // (range-independent anchor); eq_p = per-combo equity of player p's
+    // hands against the OPPONENT'S RANGE (win−lose mass / compatible mass,
+    // exact card removal ∈ [−1,1]) — the board×range interaction, computed
+    // by the same kernels the exact solver uses. Ranges stay at the same
+    // offsets: the zero-sum layer's slices are unchanged.
+    static constexpr int kDim = 4 + kCards + 1 + 5 * kCombos;
     // contribs equal at a street root; pot = 2*contrib.
+    // Computes strength features internally (exact for nb==5; zero for
+    // nb<5 — the net is only ever queried at river roots today; Phase C's
+    // turn-root queries need the E-over-river-card version).
     static std::vector<float> features(int street, const uint8_t* board,
                                        int nb, double pot, double stack,
                                        const HunlPBS& beta);
+    // precomputed-strength variant (solver leaf queries: the per-card
+    // rank/sort context is cached across refreshes, see HunlNetOracle)
+    static std::vector<float> features(int street, const uint8_t* board,
+                                       int nb, double pot, double stack,
+                                       const HunlPBS& beta,
+                                       const std::vector<double>& pct,
+                                       const std::vector<double>& eq0,
+                                       const std::vector<double>& eq1);
 };
 
 struct HunlValueNetImpl : torch::nn::Module {
@@ -69,6 +90,14 @@ class HunlNetOracle : public HunlValueOracle {
 public:
     HunlNetOracle(HunlValueNet net, double stack, torch::Device device)
         : net_(net), stack_(stack), device_(device) {}
+    // per-river-card strength context, cached across leaf refreshes (the
+    // 48 candidate boards repeat every refresh; ranking+sorting per query
+    // would dominate solve time). Keyed by card; guarded by a base-board
+    // signature. One oracle per solve/episode — no locking needed.
+    struct CardCtx {
+        std::unique_ptr<RiverEval> ev;
+        std::vector<double> pct;
+    };
     void value(poker_ppo::PokerEnvironment& env, const uint8_t* board, int nb,
                const HunlPBS& beta,
                std::array<std::vector<double>, 2>& out) override;
@@ -84,7 +113,18 @@ private:
     HunlValueNet net_;
     double stack_;
     torch::Device device_;
+    std::array<CardCtx, kCards> ctx_{};
+    std::array<uint8_t, 5> ctx_board_{255, 255, 255, 255, 255};
+    int ctx_nb_ = -1;
 };
+
+// Migrate a dataset file written by the pre-hand-strength featurizer
+// (kdim 2709) to the current layout: decode the raw situation from the
+// stored feat (board multi-hot, pot/stack, both ranges), recompute the
+// strength blocks, keep target/mask byte-identical. The exact solver
+// targets cost ~0.2 core-seconds each — never regenerate what a
+// featurizer change can convert.
+int convert_dataset(const std::string& in, const std::string& out);
 
 struct EndgameConfig {
     int    t_turn       = 120;   // CFR iterations per turn self-play solve
