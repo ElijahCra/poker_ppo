@@ -37,8 +37,16 @@ public:
 };
 
 struct HunlValueNetImpl : torch::nn::Module {
-    torch::nn::Linear l1{nullptr}, l2{nullptr}, l3{nullptr};
-    HunlValueNetImpl(int hidden);
+    // `layers` = hidden layers. layers=2 registers exactly {l1,l2,l3} —
+    // checkpoint-compatible with every net trained before the knob existed.
+    // gelu_ln=true switches hidden activations to LayerNorm+GeLU — the
+    // ReBeL paper's spec (6×1536, GeLU, LayerNorm). Default stays ReLU so
+    // existing checkpoints keep loading (LayerNorm adds parameters).
+    torch::nn::Linear l1{nullptr}, l3{nullptr};
+    std::vector<torch::nn::Linear> mids;
+    std::vector<torch::nn::LayerNorm> lns;
+    bool gelu = false;
+    HunlValueNetImpl(int hidden, int layers = 2, bool gelu_ln = false);
     torch::Tensor forward(torch::Tensor x);
 };
 TORCH_MODULE(HunlValueNet);
@@ -72,10 +80,22 @@ struct EndgameConfig {
     int    sgd_steps    = 300;
     int    batch        = 128;
     int    hidden       = 1024;
+    int    layers       = 2;     // hidden layers (2 = the original l1/l2/l3)
+    bool   gelu_ln      = false; // LayerNorm+GeLU hiddens (ReBeL spec)
     double lr           = 1e-3;
+    double lr_final     = 0.0;   // >0: linear lr decay to this over epochs
+    // pointwise Huber on pot-unit errors (both papers use Huber): quadratic
+    // below delta, linear above — caps the gradient of the rare huge-error
+    // rows (small-pot all-in situations where |target| can reach stack/pot).
+    // <=0 falls back to plain MSE (A/B escape hatch; note vloss scale:
+    // Huber = MSE/2 in the quadratic regime).
+    double huber_delta  = 1.0;
     double eps_explore  = 0.25;
     int    replay_cap   = 300000;   // ~32KB/sample → ~10GB resident
-    int    probe_k      = 8;     // replay entries re-solved exactly per epoch
+    // turn probes are single-situation BR bounds — noisy. probe_k averages
+    // over K fixed situations (K exact references solved once at startup);
+    // 0 skips probes entirely (offline screens that only need heldout).
+    int    probe_k      = 1;
     std::vector<int> actions = {0, 1, 7, 13};   // sparse abstraction
     // self-play worker threads (0 = hardware_concurrency). Episodes are
     // independent: each worker owns an env + RNG; the net is read-only at
@@ -98,6 +118,16 @@ struct EndgameConfig {
     // train_turn run fine-tune a river-pretrained net (and later serves the
     // play-time solver). Empty = off.
     std::string ckpt    = "rebel_value.pt";
+    // Sample persistence. Every solver target costs ~0.2 core-seconds of
+    // exact CFR; without a dataset file the whole stream dies with the
+    // process and every architecture experiment re-pays the solves.
+    //   data_out: append every fresh sample (net-independent exact targets)
+    //   data_in:  load at startup — a fixed 2% slice (row % 50, cap 8192)
+    //             becomes a persistent heldout set (comparable across
+    //             configs), the rest reservoir-fills the replay.
+    // data_in + episodes=0 = offline training: no sampling, epochs are
+    // pure SGD on the loaded replay, judged on the fixed heldout split.
+    std::string data_in, data_out;
     uint64_t seed       = 0;
 };
 
@@ -126,7 +156,13 @@ private:
     void gpu_river_epoch(
         std::vector<std::unique_ptr<poker_ppo::PokerEnvironment>>& envs,
         int W, int ep, std::vector<Sample>& fresh);
-    std::vector<double> random_range(std::mt19937& rng);
+    // Random training range for the situation's board (nb=5 river, nb=4
+    // turn). 70% DeepStack R(S,p): recursive mass splits over the valid
+    // combos ORDERED BY HAND STRENGTH (weaker half / stronger half) —
+    // CFR ranges are strength-polarized, and a net trained on shuffled
+    // partitions never sees that structure. 30% iid coverage floor.
+    std::vector<double> random_range(std::mt19937& rng, const uint8_t* board,
+                                     int nb);
     // appends this episode's target (if any) to `fresh` (probed before
     // being merged into the replay)
     void self_play_episode(poker_ppo::PokerEnvironment& env, std::mt19937& rng,
@@ -137,10 +173,23 @@ private:
     // generalization probe (in-replay MSE is memorization at small scale).
     double heldout_mse(const std::vector<Sample>& fresh);
     // Internal exploitability of a turn solve on a FIXED probe situation
-    // with the given oracle — comparing net leaves vs exact leaves on the
-    // same root is the cross-validation of the trained net.
-    double probe_turn_expl(poker_ppo::PokerEnvironment& env,
-                           HunlValueOracle* oracle, int T, int refresh_every);
+    // (one per seed) with the given oracle — comparing net leaves vs exact
+    // leaves on the same root is the cross-validation of the trained net.
+    // Builds its own env from the seed: a shared env's deal RNG advances
+    // across resets, which silently made every probe a DIFFERENT board
+    // (the old log's probe scatter was situation variance, not just net
+    // drift, and the exact reference was a different situation entirely).
+    double probe_turn_expl(HunlValueOracle* oracle, int T, int refresh_every,
+                           uint32_t situation_seed);
+    // dataset file: [magic|version|kdim|nout] header, then fixed-size rows
+    // of feat f32[kdim] | target f32[nout] | mask u8[nout]. feat embeds the
+    // raw situation (street/board one-hots, pot/stack, both normalized
+    // ranges) so a future featurizer can re-derive its inputs from it.
+    void load_dataset(const std::string& path);
+    void append_dataset(const std::string& path,
+                        const std::vector<Sample>& fresh);
+    // reservoir-insert into replay_ (uniform over all samples ever seen)
+    void replay_insert(Sample&& smp);
 
     EndgameConfig cfg_;
     double        stack_;
@@ -150,6 +199,7 @@ private:
     std::mt19937  rng_;
 
     std::vector<Sample> replay_;
+    std::vector<Sample> heldout_;   // fixed split from data_in (never trained)
     long                seen_ = 0;
 };
 

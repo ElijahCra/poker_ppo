@@ -405,12 +405,30 @@ int main(int argc, char** argv) {
         }
         if (argc > 2) cfg.epochs = std::atoi(argv[2]);
         if (argc > 3) cfg.episodes = std::atoi(argv[3]);
-        if (const char* t = std::getenv("REBEL_THREADS"))
-            cfg.threads = std::atoi(t);
-        if (const char* g = std::getenv("REBEL_GPU_BATCH"))
-            cfg.gpu_batch = std::atoi(g);
-        if (const char* h = std::getenv("REBEL_HARVEST"))
-            cfg.harvest = std::atoi(h);
+        auto env_int = [](const char* name, int& v) {
+            if (const char* s = std::getenv(name)) v = std::atoi(s);
+        };
+        env_int("REBEL_THREADS", cfg.threads);
+        env_int("REBEL_GPU_BATCH", cfg.gpu_batch);
+        env_int("REBEL_HARVEST", cfg.harvest);
+        env_int("REBEL_HIDDEN", cfg.hidden);
+        env_int("REBEL_LAYERS", cfg.layers);
+        env_int("REBEL_SGD_STEPS", cfg.sgd_steps);
+        env_int("REBEL_BATCH", cfg.batch);
+        env_int("REBEL_PROBE_K", cfg.probe_k);
+        env_int("REBEL_REPLAY_CAP", cfg.replay_cap);
+        if (const char* s = std::getenv("REBEL_LR")) cfg.lr = std::atof(s);
+        if (const char* s = std::getenv("REBEL_LR_FINAL"))
+            cfg.lr_final = std::atof(s);
+        if (const char* s = std::getenv("REBEL_HUBER_DELTA"))
+            cfg.huber_delta = std::atof(s);
+        if (const char* s = std::getenv("REBEL_GELU_LN"))
+            cfg.gelu_ln = std::atoi(s) != 0;
+        if (const char* s = std::getenv("REBEL_CKPT")) cfg.ckpt = s;
+        if (const char* s = std::getenv("REBEL_DATA_IN")) cfg.data_in = s;
+        if (const char* s = std::getenv("REBEL_DATA_OUT")) cfg.data_out = s;
+        if (const char* s = std::getenv("REBEL_SEED"))
+            cfg.seed = std::strtoull(s, nullptr, 10);
         EndgameTrainer tr(cfg);
         tr.run();
         return 0;

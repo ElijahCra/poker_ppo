@@ -123,6 +123,77 @@ Built and validated on this machine (target =rebel_hunl=):
   every-5-epoch composed probe (parallelizing exploitability_composed's
   per-(leaf,card) river solves is the next easy win if probes annoy).
 
+- river-pretrain verdict + screening infra (2026-07-06): 200-epoch
+  =train_river= (4k targets/epoch, ~800k sampled, replay cap 300k):
+  heldout 2.5e-2 → ~1.05e-2 pot-units MSE, FLAT from ~epoch 120 while
+  unique data nearly doubled — capacity/feature-bound, not data-bound
+  (vloss/heldout gap only ~1.8×; train 2s vs sampling 36s per epoch, so
+  net growth is free). Probe gotcha found while instrumenting: the shared
+  probe env's deal RNG advances across resets, so every probe solved a
+  DIFFERENT board (the exact-leaf "reference" too) — the probe column's
+  scatter was situation variance. =probe_turn_expl= now builds its env
+  from the situation seed (truly fixed) and =REBEL_PROBE_K= averages K
+  situations with matching exact references (0 = skip probes).
+  Sample persistence: =REBEL_DATA_OUT= appends every fresh target to a
+  dataset file (targets are net-independent exact solves — reusable
+  forever; ~24KB/row); =REBEL_DATA_IN= loads one (fixed row%50 heldout
+  split ≤8192 rows, comparable across configs; target-variance baseline
+  printed); =episodes=0= = offline mode — pure SGD epochs on the loaded
+  data, so architecture screens run at train-speed, not resample-speed.
+  New knobs: =REBEL_HIDDEN=, =REBEL_LAYERS= (2 = ckpt-compatible l1/l2/l3),
+  =REBEL_SGD_STEPS=, =REBEL_BATCH=, =REBEL_LR=, =REBEL_LR_FINAL= (linear
+  decay), =REBEL_REPLAY_CAP=, =REBEL_CKPT=, =REBEL_SEED=. Trap closed:
+  torch::load REPLACES parameter tensors, silently loading a
+  foreign-architecture checkpoint — explicit shape check aborts instead.
+- paper-fidelity audit (2026-07-06, vs ReBeL arXiv:2007.13544 + DeepStack
+  arXiv:1701.01724, both re-read): VERIFIED faithful — ε=25% with one
+  randomly chosen explorer (paper: "one agent samples random actions with
+  probability ε... we set ε=25%"); t*~unif iteration sampling; CFR-AVG
+  next-root beliefs under the average policy (paper: "In CFR-AVG and FP
+  β'_r = β_z^π̄t" — sample_leaf matches); per-infostate values normalized
+  by opponent mass; raw 1326 beliefs as net input (ReBeL; DeepStack's
+  1000-bucket encoding is the fallback if features cap out); pot-unit
+  values (DeepStack: "fractions of the pot size"; ReBeL doesn't specify).
+  GAPS worth adopting, all paper-grounded: (1) loss — both papers use
+  HUBER, we use MSE; (2) DeepStack's zero-sum output correction (subtract
+  half the range-weighted value-sum violation from each player's values);
+  (3) range generation — DeepStack's R(S,p) recursion splits by HAND
+  STRENGTH ordering, ours splits a random shuffle: mass sparsity matches,
+  strength correlation is missing (real CFR ranges are polarized — likely
+  part of the residual net-vs-solver distribution gap); (4) ReBeL's buffer
+  is CIRCULAR 12M + uniform sampling (recency window) — our
+  reservoir-over-history is equivalent for stationary river targets but
+  wrong for train_turn, where the query distribution tracks the net;
+  (5) paper net specs: ReBeL 6×1536 GeLU+LayerNorm, Huber, Adam 3e-4,
+  batch 1024, lr halved / 800 epochs; DeepStack 7×500 PReLU — ours
+  (2×1024 ReLU, MSE, 1e-3, 128) is smaller than both; the capacity screen
+  should top out at the ReBeL spec (net builder needs GeLU+LayerNorm).
+  Known deliberate deviations (documented, staged back toward the paper):
+  DeepStack-style synthetic situations for endgame pretraining (ReBeL
+  itself is "purely from self play without any additional heuristics
+  guiding which PBSs are sampled" — train_turn is the ReBeL-proper phase);
+  exact river solves as targets instead of the paper's (1/T)Σ_t v^πt
+  iterate average (ground truth on rivers; use the iterate average when
+  bootstrapped turn-root targets arrive for the flop net); no policy-net
+  warm start (paper Appendix J, optional); unsafe resolving (gadget
+  pending). Non-issues: the paper's "bet occurred this round" input flag
+  is constant-false at street roots (our only query points); DeepStack's
+  heavy-tailed pot-interval sampling vs our prefix-induced pots — worth a
+  histogram check of big-pot coverage, not a correctness gap.
+- audit adoptions (2026-07-06, same day): Huber loss is now the DEFAULT
+  (=REBEL_HUBER_DELTA=, delta=1.0 pot units; 0 = plain MSE. vloss prints
+  Huber — reads ~half of MSE in the quadratic regime; heldout stays MSE
+  for cross-run comparability). R(S,p) is now STRENGTH-ORDERED (exact
+  combo_rank on the river, expected rank over river cards on the turn;
+  invalid combos excluded from the recursion). Consequences: the target
+  distribution changed — REGENERATE data and re-baseline heldout (the
+  target-var line at data load is the new "predict the mean" baseline;
+  the old run's 1.05e-2 is not comparable), and probe situations' ranges
+  changed (new exact refs — ~9.7 bb on probe seed 12345). =REBEL_GELU_LN=1=
+  adds LayerNorm+GeLU hiddens for the ReBeL-spec screen arm (6×1536) —
+  new parameters, needs a fresh REBEL_CKPT (the shape guard catches it).
+  Zero-sum output correction and the circular (recency) buffer are
+  deferred to the train_turn phase.
 - =hunl_value=: PBS value net (street/board/pot + both 1326-ranges →
   per-combo values both players) + Algorithm-1 endgame self-play
   (=rebel_hunl train_turn=): synthetic turn roots (random boards/pots via
