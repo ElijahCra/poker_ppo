@@ -589,7 +589,12 @@ int main(int argc, char** argv) {
         RebelPlayConfig pc;
         pc.t_turn  = env_i("REBEL_T_TURN", 120);
         pc.t_river = env_i("REBEL_T_RIVER", 200);
-        pc.gadget  = env_i("REBEL_GADGET", 1) != 0;
+        // default OFF: paired 20k A/B measured a wash (1.909 off vs 1.963
+        // on, seed 1234) with a worse fold profile — the net-priced
+        // alternatives run generous, combos terminate, the follow-range
+        // skews strong and the solve over-folds. Sound machinery
+        // (gadget_check converges), needs alt calibration to earn ON.
+        pc.gadget  = env_i("REBEL_GADGET", 0) != 0;
         std::printf("lbr: river gadget %s\n", pc.gadget ? "ON" : "off");
         const double stack = static_cast<double>(
             poker_ppo::kPokerConfig.game.initial_stack);
