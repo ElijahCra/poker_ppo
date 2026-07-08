@@ -167,11 +167,14 @@ std::pair<HunlSolver*, int> RebelTarget::solve_at(PokerEnvironment& env) {
     }
     // fresh solve rooted at the current node with the tracked PBS (the
     // solver masks/normalizes its own copy against the env's board)
-    const bool river = env.round() >= 3;
+    const int round = env.round();
+    const bool river = round >= 3;
     auto solver = std::make_unique<HunlSolver>(
         env, pbs_, river ? nullptr : oracle_.get(),
-        river ? cfg_.actions_river : cfg_.actions);
-    solver->refresh_every = cfg_.refresh_every;
+        river ? cfg_.actions_river
+              : round == 1 ? cfg_.actions_flop : cfg_.actions);
+    solver->refresh_every =
+        round == 1 ? cfg_.refresh_flop : cfg_.refresh_every;
     if (river && cfg_.gadget && seat_ >= 0) {
         // a mid-street fresh solve (off-tree action) inherits alternatives
         // from the deepest in-tree node of a previous river solve — the
@@ -205,7 +208,8 @@ std::pair<HunlSolver*, int> RebelTarget::solve_at(PokerEnvironment& env) {
             solver->enable_gadget(1 - seat_, alt_[static_cast<size_t>(
                                       1 - seat_)], cfg_.gadget_mix);
     }
-    const int T = river ? cfg_.t_river : cfg_.t_turn;
+    const int T = river ? cfg_.t_river
+                : round == 2 ? cfg_.t_turn : cfg_.t_flop;
     for (int t = 1; t <= T; ++t) solver->iterate(t);
     cache_.push_back(Solve{log, std::move(solver)});
     return {cache_.back().solver.get(), 0};
@@ -224,9 +228,9 @@ torch::Tensor RebelTarget::probs_for_holes(
     PokerEnvironment& env, const torch::Tensor& mask,
     const std::vector<std::array<uint8_t, 2>>& holes) {
     seat_ = env.current_player();   // policy queries are about OUR node
-    if (env.round() < 2 && blueprint_)
+    if (env.round() < 1 && blueprint_)
         return blueprint_->probs_for_holes(env, mask, holes);
-    if (env.round() < 2) {
+    if (env.round() < 1) {
         CheckCallTarget stub;
         return stub.probs_for_holes(env, mask, holes);
     }
@@ -251,7 +255,7 @@ torch::Tensor RebelTarget::probs_for_holes(
 int RebelTarget::act(PokerEnvironment& env, const torch::Tensor& mask) {
     sync_public(env);
     seat_ = env.current_player();
-    if (env.round() < 2) {
+    if (env.round() < 1) {
         if (blueprint_) return blueprint_->act(env, mask);
         CheckCallTarget stub;
         return stub.act(env, mask);
@@ -279,7 +283,7 @@ int RebelTarget::act(PokerEnvironment& env, const torch::Tensor& mask) {
 void RebelTarget::note_action(PokerEnvironment& env, int action) {
     sync_public(env);
     const int seat = env.current_player();
-    if (env.round() < 2) {
+    if (env.round() < 1) {
         if (!blueprint_) return;   // check/call stub: uninformative update
         // blueprint model for the acting seat's range (all live combos)
         const std::vector<double>& r = seat == 0 ? pbs_.r0 : pbs_.r1;

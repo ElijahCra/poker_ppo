@@ -237,6 +237,7 @@ void HunlNetOracle::value_batch(
         ctx_board_ = b;
         ctx_nb_ = nb_base;
     }
+    const auto& ct = ComboTable::get();
     std::vector<double> eq0, eq1;
     for (long r = 0; r < N; ++r) {
         const uint8_t card = cards[static_cast<size_t>(r)];
@@ -252,6 +253,63 @@ void HunlNetOracle::value_batch(
             equity_vs_range(*cc.ev, beta.r1, eq0);
             equity_vs_range(*cc.ev, beta.r0, eq1);
             f = HunlFeaturizer::features(street_of(5), b.data(), 5, pot,
+                                         stack_, beta, cc.pct, eq0, eq1);
+        } else if (nb_base + 1 == 4) {
+            // turn-root query (flop solve leaf): E-over-river strength
+            // blocks from the cached per-runout evaluators — building
+            // rank/sort contexts per query would dominate the solve
+            CardCtx& cc = ctx_[card];
+            if (cc.pct.empty()) {
+                cc.pct.assign(kCombos, 0.0);
+                std::vector<double> nrun(kCombos, 0.0), pc;
+                std::array<uint8_t, 5> b5{};
+                for (int i = 0; i < 4; ++i) b5[i] = b[i];
+                for (int c = 0; c < kCards; ++c) {
+                    bool dead = false;
+                    for (int i = 0; i < 4; ++i)
+                        if (b[i] == c) dead = true;
+                    if (dead) continue;
+                    b5[4] = static_cast<uint8_t>(c);
+                    cc.runout[c] = std::make_unique<RiverEval>(b5.data());
+                    cc.runout[c]->percentile(pc);
+                    for (int x = 0; x < kCombos; ++x) {
+                        if (!cc.runout[c]->valid()[x]) continue;
+                        cc.pct[x] += pc[x];
+                        nrun[x] += 1.0;
+                    }
+                }
+                for (int x = 0; x < kCombos; ++x)
+                    if (nrun[x] > 0.0) cc.pct[x] /= nrun[x];
+            }
+            const HunlPBS& beta = betas[static_cast<size_t>(r)];
+            eq0.assign(kCombos, 0.0);
+            eq1.assign(kCombos, 0.0);
+            std::vector<double> nrun(kCombos, 0.0), e, opp;
+            for (int c = 0; c < kCards; ++c) {
+                if (!cc.runout[c]) continue;
+                const RiverEval& ev = *cc.runout[c];
+                for (int side = 0; side < 2; ++side) {
+                    opp = side == 0 ? beta.r1 : beta.r0;
+                    for (int i = 0; i < kCombos; ++i)
+                        if (ct.cards[i][0] == c || ct.cards[i][1] == c)
+                            opp[i] = 0.0;
+                    equity_vs_range(ev, opp, e);
+                    auto& acc = side == 0 ? eq0 : eq1;
+                    for (int x = 0; x < kCombos; ++x) {
+                        if (!ev.valid()[x] || ct.cards[x][0] == c ||
+                            ct.cards[x][1] == c)
+                            continue;
+                        acc[x] += e[x];
+                        if (side == 0) nrun[x] += 1.0;
+                    }
+                }
+            }
+            for (int x = 0; x < kCombos; ++x)
+                if (nrun[x] > 0.0) {
+                    eq0[x] /= nrun[x];
+                    eq1[x] /= nrun[x];
+                }
+            f = HunlFeaturizer::features(street_of(4), b.data(), 4, pot,
                                          stack_, beta, cc.pct, eq0, eq1);
         } else {
             f = HunlFeaturizer::features(street_of(nb_base + 1), b.data(),

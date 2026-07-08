@@ -91,6 +91,34 @@ int HunlSolver::build(std::vector<int> path) {
         acts.push_back(a);
     }
     if (acts.empty()) acts.push_back(1);   // call is always legal
+    // Multi-street subgames (flop and earlier): prune RAISE lines whose
+    // call would end the hand as an all-in with >1 card to come — beyond
+    // the exact runout enumeration (walk's abort remains the backstop for
+    // call-created ones after an off-tree real shove). Pruning must be at
+    // the raise, never the call: dropping the call would teach the model
+    // that shoves force folds. Inert for turn/river roots.
+    if (nb_root_ + 1 < 5) {
+        std::vector<int> kept;
+        kept.reserve(acts.size());
+        for (int a : acts) {
+            bool bad = false;
+            if (a >= 2) {
+                env_.push_state();
+                env_.step(a);
+                if (!env_.is_terminal()) {
+                    env_.push_state();
+                    env_.step(1);
+                    bad = env_.is_terminal() &&
+                          !env_.terminal_was_fold() &&
+                          env_.community_count() < 5;
+                    env_.pop_state();
+                }
+                env_.pop_state();
+            }
+            if (!bad) kept.push_back(a);
+        }
+        if (!kept.empty()) acts = std::move(kept);
+    }
     std::vector<int> children;
     children.reserve(acts.size());
     for (int a : acts) {

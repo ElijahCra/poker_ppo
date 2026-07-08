@@ -40,7 +40,9 @@ namespace rebel_hunl {
 struct RebelPlayConfig {
     int t_turn        = 120;   // CFR iterations, turn solves (net leaves)
     int t_river       = 200;   // river solves (exact)
+    int t_flop        = 60;    // flop solves (net turn-root leaves)
     int refresh_every = 5;     // CFR-AVG leaf refresh cadence (turn)
+    int refresh_flop  = 10;    // flop refreshes cost 49 turn-root queries
     // Turn keeps the training abstraction (the net's leaf values assume
     // it). River solves are exact to terminal — no net consistency to
     // preserve — so the river set adds 0.5-pot (action 4): LBR's analytic
@@ -49,6 +51,12 @@ struct RebelPlayConfig {
     // ALL residual LBR profit was river-ending hands).
     std::vector<int> actions       = {0, 1, 7, 13};
     std::vector<int> actions_river = {0, 1, 4, 7, 13};
+    // Flop trees exclude all-in: a called shove 2 cards early is a
+    // multi-street AllinShowdown the solver deliberately guards (later
+    // stage); LBR never raises pre-river in analytic mode, so no real
+    // line reaches one. Pot-raise chains that would exceed the stack are
+    // masked illegal by the env, so none sneak back in.
+    std::vector<int> actions_flop  = {0, 1, 7};
     // Safe re-solving (Burch et al.) on river solves: the opponent's
     // alternatives come from the turn solve's net-priced leaf (street
     // entry) or the previous river solve's values_at (deeper re-solves);

@@ -90,13 +90,16 @@ class HunlNetOracle : public HunlValueOracle {
 public:
     HunlNetOracle(HunlValueNet net, double stack, torch::Device device)
         : net_(net), stack_(stack), device_(device) {}
-    // per-river-card strength context, cached across leaf refreshes (the
-    // 48 candidate boards repeat every refresh; ranking+sorting per query
-    // would dominate solve time). Keyed by card; guarded by a base-board
-    // signature. One oracle per solve/episode — no locking needed.
+    // per-candidate-card strength context, cached across leaf refreshes
+    // (the ~48 candidate boards repeat every refresh; ranking+sorting per
+    // query would dominate solve time). Keyed by card; guarded by a
+    // base-board signature. One oracle per solve/episode — no locking.
+    // River queries (base=4 cards) use `ev`; turn-root queries (base=3,
+    // flop solves) use the per-runout array + precomputed E[percentile].
     struct CardCtx {
         std::unique_ptr<RiverEval> ev;
         std::vector<double> pct;
+        std::array<std::unique_ptr<RiverEval>, kCards> runout;
     };
     void value(poker_ppo::PokerEnvironment& env, const uint8_t* board, int nb,
                const HunlPBS& beta,

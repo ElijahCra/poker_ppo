@@ -589,6 +589,7 @@ int main(int argc, char** argv) {
         RebelPlayConfig pc;
         pc.t_turn  = env_i("REBEL_T_TURN", 120);
         pc.t_river = env_i("REBEL_T_RIVER", 200);
+        pc.t_flop  = env_i("REBEL_T_FLOP", 60);
         // default OFF: paired 20k A/B measured a wash (1.909 off vs 1.963
         // on, seed 1234) with a worse fold profile — the net-priced
         // alternatives run generous, combos terminate, the follow-range
