@@ -41,7 +41,20 @@ struct RebelPlayConfig {
     int t_turn        = 120;   // CFR iterations, turn solves (net leaves)
     int t_river       = 200;   // river solves (exact)
     int refresh_every = 5;     // CFR-AVG leaf refresh cadence (turn)
-    std::vector<int> actions = {0, 1, 7, 13};   // sparse abstraction
+    // Turn keeps the training abstraction (the net's leaf values assume
+    // it). River solves are exact to terminal — no net consistency to
+    // preserve — so the river set adds 0.5-pot (action 4): LBR's analytic
+    // raise menu is {~0.5-pot, ~pot, all-in}, and an off-tree raise both
+    // skips the belief update and leaves the response unpriced (measured:
+    // ALL residual LBR profit was river-ending hands).
+    std::vector<int> actions       = {0, 1, 7, 13};
+    std::vector<int> actions_river = {0, 1, 4, 7, 13};
+    // Safe re-solving (Burch et al.) on river solves: the opponent's
+    // alternatives come from the turn solve's net-priced leaf (street
+    // entry) or the previous river solve's values_at (deeper re-solves);
+    // turn solves stay model-based until flop-entry alternatives exist.
+    bool   gadget     = true;
+    double gadget_mix = 0.1;
     uint64_t seed     = 0;
 };
 
@@ -80,6 +93,10 @@ private:
     // mask newly revealed board cards out of both ranges; clear the solve
     // cache on street changes
     void sync_public(poker_ppo::PokerEnvironment& env);
+    // opponent per-combo alternatives for the river gadget, priced by the
+    // net at the turn solve's StreetEnd (CFR-AVG beliefs, dealt card).
+    // Called on the 2→3 street transition, before the turn cache drops.
+    void alt_from_turn_leaf(poker_ppo::PokerEnvironment& env);
     // solver + node id for the env's CURRENT node: cached solve whose
     // log_at_root prefixes the current action_log and whose tree contains
     // the suffix walk, else a fresh solve rooted here.
@@ -100,6 +117,13 @@ private:
     int     board_seen_  = 0;
     int     cache_round_ = -1;
     std::vector<Solve> cache_;
+    // the target's seat this hand (set at its first policy query; -1 =
+    // unknown → gadget skipped defensively) and the opponent's
+    // alternative values for gadgeted river solves, both players' sides
+    // kept so the seat can be selected at enable time
+    int  seat_ = -1;
+    bool have_alt_ = false;
+    std::array<std::vector<double>, 2> alt_;
 };
 
 }  // namespace rebel_hunl

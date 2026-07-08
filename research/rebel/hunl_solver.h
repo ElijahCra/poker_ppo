@@ -118,6 +118,35 @@ public:
                      std::array<std::vector<double>, 2>& mask);
 
     std::vector<double> avg_policy(int node, int combo) const;
+
+    // ── Safe re-solving gadget (Burch et al. 2014) ─────────────────────
+    // Replaces player `opp`'s fixed root range with a per-combo
+    // Terminate/Follow decision, regret-matched across iterations:
+    // Terminate takes alt[combo] (that holding's per-combo value estimate
+    // from the PRIOR solve — normalized convention, chips); Follow enters
+    // the subgame. The re-solved average strategy then concedes no
+    // holding more than its alternative — safety against opponents who
+    // deviate from the tracked range (measured: LBR farmed exactly that
+    // on the river). The tracked range remains only the entry PRIOR,
+    // floored by `mix` uniform over valid combos so EVERY holding keeps
+    // entry mass. Call after construction, before the first iterate().
+    // Intended for leafless (river) solves; root_values/exploitability
+    // afterwards read the entry prior, not the tracked range.
+    void enable_gadget(int opp, const std::vector<double>& alt,
+                       double mix = 0.1);
+
+    // Per-combo values of BOTH players at an interior node under the
+    // final average profile (gadget entry averaged in), normalized by the
+    // opposing compatible reach mass — the alt-value source when
+    // re-solving further down the line of play. mask = well-defined.
+    void values_at(int node, std::array<std::vector<double>, 2>& v,
+                   std::array<std::vector<double>, 2>& mask);
+
+    // Average-profile reaches to a node (gadget entry averaged in) — the
+    // CFR-AVG beliefs a deployed agent carries across a street boundary.
+    void beliefs_at(int node, std::vector<double>& r0,
+                    std::vector<double>& r1) const;
+
     const std::vector<Node>& nodes() const { return nodes_; }
     const std::vector<uint8_t>& valid() const { return valid_; }
     int board_count() const { return nb_root_; }
@@ -154,6 +183,12 @@ private:
     HunlPBS              root_;
     HunlValueOracle*     oracle_;
     std::vector<int>     allowed_;
+    // gadget state: per-combo T/F regrets (RM⁺), current & cumulative
+    // Follow probability (linear-weighted like cum_strat), and the
+    // mass-weighted alternative payoffs (alt · our compatible reach)
+    int                  gadget_opp_ = -1;
+    std::vector<double>  gd_alt_w_, gd_rT_, gd_rF_, gd_pF_, gd_cumF_;
+    double               gd_cumW_ = 0.0;
     int                  root_round_ = 0;
     int                  nb_root_ = 0;
     std::array<uint8_t, 5> board_{};

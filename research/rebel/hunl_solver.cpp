@@ -342,13 +342,107 @@ std::vector<double> HunlSolver::walk(int i, int upd, int t, bool update,
     return cfv;
 }
 
+void HunlSolver::enable_gadget(int opp, const std::vector<double>& alt,
+                               double mix) {
+    gadget_opp_ = opp;
+    // entry prior: tracked (already normalized) range floored with uniform
+    std::vector<double>& r = opp == 0 ? root_.r0 : root_.r1;
+    int nvalid = 0;
+    for (int i = 0; i < kCombos; ++i)
+        if (valid_[i]) ++nvalid;
+    for (int i = 0; i < kCombos; ++i)
+        r[i] = valid_[i]
+            ? (1.0 - mix) * r[i] + mix / std::max(1, nvalid)
+            : 0.0;
+    // Regrets compare mass-weighted (counterfactual) payoffs: entering
+    // yields the walk's unnormalized CFV (weighted by OUR compatible
+    // reach); Terminate must be weighted identically. Our root range is
+    // fixed across iterations, so the weights are too.
+    const std::vector<double>& us = opp == 0 ? root_.r1 : root_.r0;
+    std::vector<double> m;
+    compat_mass(us, valid_, m);
+    gd_alt_w_.assign(kCombos, 0.0);
+    for (int i = 0; i < kCombos; ++i)
+        if (valid_[i]) gd_alt_w_[i] = alt[i] * m[i];
+    gd_rT_.assign(kCombos, 0.0);
+    gd_rF_.assign(kCombos, 0.0);
+    gd_pF_.assign(kCombos, 1.0);   // optimistic: enter until told otherwise
+    gd_cumF_.assign(kCombos, 0.0);
+    gd_cumW_ = 0.0;
+}
+
 void HunlSolver::iterate(int t) {
     if (t == 1 || refresh_every <= 1 || t % refresh_every == 0)
         refresh_leaves();
+    if (gadget_opp_ < 0) {
+        for (int upd = 0; upd < 2; ++upd) {
+            std::vector<double> mine = upd == 0 ? root_.r0 : root_.r1;
+            std::vector<double> opp = upd == 0 ? root_.r1 : root_.r0;
+            walk(0, upd, t, /*update=*/true, mine, opp);
+        }
+        return;
+    }
+    // gadgeted: the opponent's reach into the subgame is prior · pF (this
+    // iteration's Follow probability), for BOTH update passes; after the
+    // opponent's own pass, regret-match T vs F per combo on its CFVs.
     for (int upd = 0; upd < 2; ++upd) {
         std::vector<double> mine = upd == 0 ? root_.r0 : root_.r1;
         std::vector<double> opp = upd == 0 ? root_.r1 : root_.r0;
-        walk(0, upd, t, /*update=*/true, mine, opp);
+        auto& gadget_side = upd == gadget_opp_ ? mine : opp;
+        for (int i = 0; i < kCombos; ++i) gadget_side[i] *= gd_pF_[i];
+        auto cfv = walk(0, upd, t, /*update=*/true, mine, opp);
+        if (upd != gadget_opp_) continue;
+        for (int j = 0; j < kCombos; ++j) {
+            if (!valid_[j]) continue;
+            const double vF = cfv[j];                 // enter (mass-weighted)
+            const double vT = gd_alt_w_[j];           // terminate
+            const double v  = gd_pF_[j] * vF + (1.0 - gd_pF_[j]) * vT;
+            gd_rF_[j] = std::max(0.0, gd_rF_[j] + vF - v);   // RM⁺
+            gd_rT_[j] = std::max(0.0, gd_rT_[j] + vT - v);
+            gd_cumF_[j] += static_cast<double>(t) * gd_pF_[j];
+        }
+        gd_cumW_ += static_cast<double>(t);
+        for (int j = 0; j < kCombos; ++j) {
+            if (!valid_[j]) continue;
+            const double s = gd_rF_[j] + gd_rT_[j];
+            gd_pF_[j] = s > 0.0 ? gd_rF_[j] / s : 1.0;
+        }
+    }
+}
+
+void HunlSolver::beliefs_at(int node, std::vector<double>& r0,
+                            std::vector<double>& r1) const {
+    reaches_to(node, /*average=*/true, r0, r1);
+    if (gadget_opp_ >= 0 && gd_cumW_ > 0.0) {
+        std::vector<double>& g = gadget_opp_ == 0 ? r0 : r1;
+        for (int i = 0; i < kCombos; ++i)
+            g[i] *= gd_cumF_[i] / gd_cumW_;
+    }
+}
+
+void HunlSolver::values_at(int node, std::array<std::vector<double>, 2>& v,
+                           std::array<std::vector<double>, 2>& mask) {
+    std::vector<double> r0, r1;
+    beliefs_at(node, r0, r1);
+    for (int p = 0; p < 2; ++p) {
+        std::vector<double> mine = p == 0 ? r0 : r1;
+        std::vector<double> opp = p == 0 ? r1 : r0;
+        auto cfv = walk(node, p, /*t=*/0, /*update=*/false, mine, opp);
+        std::vector<double> m;
+        compat_mass(opp, valid_, m);
+        // normalize opposing mass so per-combo values are conditional
+        // expectations (same convention as root_values / the net)
+        double s = 0.0;
+        for (int i = 0; i < kCombos; ++i)
+            if (valid_[i]) s += opp[i];
+        v[p].assign(kCombos, 0.0);
+        mask[p].assign(kCombos, 0.0);
+        if (s <= kTiny) continue;
+        for (int x = 0; x < kCombos; ++x) {
+            if (!valid_[x] || m[x] / s <= 1e-6) continue;
+            v[p][x] = cfv[x] / m[x];
+            mask[p][x] = 1.0;
+        }
     }
 }
 

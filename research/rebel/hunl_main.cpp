@@ -374,11 +374,86 @@ int run_turn(int T_outer, int T_inner) {
     return 0;
 }
 
+// Gadget guarantee, judged from outside the gadget: after a gadgeted
+// solve, the opponent's per-combo best-response value against the
+// DEPLOYED (average) strategy must not exceed its alternative. alt comes
+// from a plain solve of the same situation (the play-time recipe). A
+// violation means the safety property doesn't hold and play-time use is
+// unsound.
+int run_gadget_check(int T) {
+    PokerEnvironment env(poker_ppo::kPokerConfig,
+                         poker_ppo::config::kBetConfig, 42);
+    const int bb = env.game_config().big_blind;
+    const std::vector<int> allowed = {0, 1, 4, 7, 13};
+    double worst = 0.0, mean = 0.0;
+    long cnt = 0;
+    for (int trial = 0; trial < 5; ++trial) {
+        advance_to_round(env, 3);
+        if (env.is_terminal()) continue;
+        std::mt19937 rng(100 + trial);
+        HunlPBS beta;
+        beta.r0 = random_range(rng);
+        beta.r1 = random_range(rng);
+
+        HunlSolver plain(env, beta, nullptr, allowed);
+        for (int t = 1; t <= T; ++t) plain.iterate(t);
+        std::array<std::vector<double>, 2> v, m;
+        plain.values_at(0, v, m);
+        const int opp = trial % 2;
+
+        HunlSolver gd(env, beta, nullptr, allowed);
+        gd.enable_gadget(opp, v[static_cast<size_t>(opp)], 0.1);
+        for (int t = 1; t <= T; ++t) gd.iterate(t);
+
+        // opponent best-responds to the gadgeted average strategy
+        std::vector<double> us = opp == 0 ? beta.r1 : beta.r0;
+        {   // normalize over valid (mirror the solver's own convention)
+            std::vector<uint8_t> vmask;
+            uint8_t b5[5];
+            for (int i = 0; i < 5; ++i)
+                b5[i] = static_cast<uint8_t>(env.community_card(i));
+            board_valid(b5, 5, vmask);
+            double s = 0.0;
+            for (int i = 0; i < kCombos; ++i) {
+                if (!vmask[i]) us[i] = 0.0;
+                s += us[i];
+            }
+            for (double& x : us) x /= s > 0 ? s : 1.0;
+            auto br = gd.best_response(opp, us);
+            std::vector<double> mass;
+            compat_mass(us, vmask, mass);
+            for (int j = 0; j < kCombos; ++j) {
+                if (!vmask[j] || mass[j] <= 1e-6 ||
+                    m[static_cast<size_t>(opp)][j] < 0.5)
+                    continue;
+                const double viol =
+                    br[j] / mass[j] - v[static_cast<size_t>(opp)][j];
+                if (viol > worst) worst = viol;
+                mean += std::max(0.0, viol);
+                ++cnt;
+            }
+        }
+    }
+    mean = cnt > 0 ? mean / cnt : 0.0;
+    // Finite-T CFR leaves margin slack that shrinks with T (measured:
+    // max 0.68 bb @T=100, 0.154 @400, 0.034 @1600 — clean convergence to
+    // the guarantee). The bar tracks that curve with ~2× headroom; a real
+    // implementation bug shows up as O(pot) violations that do NOT shrink.
+    const double bar = 8.0 * bb / std::sqrt(static_cast<double>(T));
+    std::printf("gadget_check: T=%d combos=%ld  BR-over-alt violation "
+                "mean=%.4f bb  max=%.4f bb  %s\n",
+                T, cnt, mean / bb, worst / bb,
+                worst < bar ? "PASS" : "FAIL");
+    return worst < bar ? 0 : 1;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     const std::string mode = argc > 1 ? argv[1] : "kernels";
     if (mode == "kernels") return run_kernels();
+    if (mode == "gadget_check")
+        return run_gadget_check(argc > 2 ? std::atoi(argv[2]) : 400);
     if (mode == "gpu_check")
         return run_gpu_check(argc > 2 ? std::atoi(argv[2]) : 16,
                              argc > 3 ? std::atoi(argv[3]) : 200);
@@ -514,6 +589,8 @@ int main(int argc, char** argv) {
         RebelPlayConfig pc;
         pc.t_turn  = env_i("REBEL_T_TURN", 120);
         pc.t_river = env_i("REBEL_T_RIVER", 200);
+        pc.gadget  = env_i("REBEL_GADGET", 1) != 0;
+        std::printf("lbr: river gadget %s\n", pc.gadget ? "ON" : "off");
         const double stack = static_cast<double>(
             poker_ppo::kPokerConfig.game.initial_stack);
         std::printf("lbr: hands=%d threads=%d net=%s (%dx%d%s) T=%d/%d "
