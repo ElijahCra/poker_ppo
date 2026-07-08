@@ -457,6 +457,9 @@ int main(int argc, char** argv) {
         lc.num_hands = hands;      // trustworthy-bound defaults
         if (const char* s = std::getenv("REBEL_SEED"))
             lc.seed = std::strtoull(s, nullptr, 10);
+        // per-hand CSV (shards suffix .N) — aggregate attribution across
+        // ALL shards, not just shard 0's printed table
+        if (const char* s = std::getenv("REBEL_LBR_LOG")) lc.log_path = s;
 
         poker_ppo::ActorCritic bp{nullptr};
         std::unique_ptr<poker_ppo::ILBRTarget> bp_target;
