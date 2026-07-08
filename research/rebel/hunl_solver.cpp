@@ -378,7 +378,12 @@ void HunlSolver::iterate(int t) {
         for (int upd = 0; upd < 2; ++upd) {
             std::vector<double> mine = upd == 0 ? root_.r0 : root_.r1;
             std::vector<double> opp = upd == 0 ? root_.r1 : root_.r0;
-            walk(0, upd, t, /*update=*/true, mine, opp);
+            auto cfv = walk(0, upd, t, /*update=*/true, mine, opp);
+            if (track_root_) {
+                if (rv_sum_[upd].empty()) rv_sum_[upd].assign(kCombos, 0.0);
+                for (int x = 0; x < kCombos; ++x) rv_sum_[upd][x] += cfv[x];
+                if (upd == 1) ++rv_n_;
+            }
         }
         return;
     }
@@ -408,6 +413,27 @@ void HunlSolver::iterate(int t) {
             gd_pF_[j] = s > 0.0 ? gd_rF_[j] / s : 1.0;
         }
     }
+}
+
+bool HunlSolver::avg_root_values(std::array<std::vector<double>, 2>& v,
+                                 std::array<std::vector<double>, 2>& mask)
+    const {
+    if (!track_root_ || rv_n_ <= 0) return false;
+    for (int p = 0; p < 2; ++p) {
+        if (rv_sum_[p].empty()) return false;
+        const auto& opp = p == 0 ? root_.r1 : root_.r0;
+        const auto& own = p == 0 ? root_.r0 : root_.r1;
+        std::vector<double> m;
+        compat_mass(opp, valid_, m);
+        v[p].assign(kCombos, 0.0);
+        mask[p].assign(kCombos, 0.0);
+        for (int x = 0; x < kCombos; ++x) {
+            if (!valid_[x] || own[x] <= kTiny || m[x] <= 1e-6) continue;
+            v[p][x] = rv_sum_[p][x] / static_cast<double>(rv_n_) / m[x];
+            mask[p][x] = 1.0;
+        }
+    }
+    return true;
 }
 
 void HunlSolver::beliefs_at(int node, std::vector<double>& r0,

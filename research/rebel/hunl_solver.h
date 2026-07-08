@@ -117,6 +117,16 @@ public:
     void root_values(std::array<std::vector<double>, 2>& v,
                      std::array<std::vector<double>, 2>& mask);
 
+    // ── Iterate-averaged root values (ReBeL's value target) ────────────
+    // The paper trains v̂ on (1/T)·Σ_t v^{π^t}(β_r) — the running average
+    // of CURRENT-iterate root values, not the final average profile's
+    // value. Call track_root_values() before the first iterate();
+    // avg_root_values() returns per-combo values in the root_values
+    // normalization, or false if nothing was tracked.
+    void track_root_values() { track_root_ = true; }
+    bool avg_root_values(std::array<std::vector<double>, 2>& v,
+                         std::array<std::vector<double>, 2>& mask) const;
+
     std::vector<double> avg_policy(int node, int combo) const;
 
     // ── Safe re-solving gadget (Burch et al. 2014) ─────────────────────
@@ -189,6 +199,9 @@ private:
     int                  gadget_opp_ = -1;
     std::vector<double>  gd_alt_w_, gd_rT_, gd_rF_, gd_pF_, gd_cumF_;
     double               gd_cumW_ = 0.0;
+    bool                 track_root_ = false;
+    std::array<std::vector<double>, 2> rv_sum_;
+    long                 rv_n_ = 0;
     int                  root_round_ = 0;
     int                  nb_root_ = 0;
     std::array<uint8_t, 5> board_{};

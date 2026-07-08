@@ -63,15 +63,63 @@ std::vector<float> HunlFeaturizer::features(int street, const uint8_t* board,
                                             int nb, double pot, double stack,
                                             const HunlPBS& beta) {
     static const std::vector<double> kZero(kCombos, 0.0);
-    if (nb != 5)
-        return features(street, board, nb, pot, stack, beta, kZero, kZero,
-                        kZero);
-    RiverEval ev(board);
-    std::vector<double> pct, eq0, eq1;
-    ev.percentile(pct);
-    equity_vs_range(ev, beta.r1, eq0);
-    equity_vs_range(ev, beta.r0, eq1);
-    return features(street, board, nb, pot, stack, beta, pct, eq0, eq1);
+    if (nb == 5) {
+        RiverEval ev(board);
+        std::vector<double> pct, eq0, eq1;
+        ev.percentile(pct);
+        equity_vs_range(ev, beta.r1, eq0);
+        equity_vs_range(ev, beta.r0, eq1);
+        return features(street, board, nb, pot, stack, beta, pct, eq0, eq1);
+    }
+    if (nb == 4) {
+        // Turn-root rows (Phase C): expectation of the river strength
+        // blocks over runout cards the combo survives — DeepStack's E[HS]
+        // one street early. ~48 river evals per call; turn-root targets
+        // are built once per solve, so the cost is training-time only.
+        const auto& ct = ComboTable::get();
+        std::vector<double> pct(kCombos, 0.0), eq0(kCombos, 0.0),
+            eq1(kCombos, 0.0), n(kCombos, 0.0);
+        std::array<uint8_t, 5> b5{};
+        for (int b = 0; b < 4; ++b) b5[b] = board[b];
+        std::vector<double> pc, e0, e1, opp;
+        for (int c = 0; c < kCards; ++c) {
+            bool dead = false;
+            for (int b = 0; b < 4; ++b)
+                if (board[b] == c) dead = true;
+            if (dead) continue;
+            b5[4] = static_cast<uint8_t>(c);
+            RiverEval ev(b5.data());
+            ev.percentile(pc);
+            auto masked = [&](const std::vector<double>& r) {
+                opp = r;
+                for (int i = 0; i < kCombos; ++i)
+                    if (ct.cards[i][0] == c || ct.cards[i][1] == c)
+                        opp[i] = 0.0;
+                return &opp;
+            };
+            equity_vs_range(ev, *masked(beta.r1), e0);
+            std::vector<double> e0copy = e0;
+            equity_vs_range(ev, *masked(beta.r0), e1);
+            for (int x = 0; x < kCombos; ++x) {
+                if (ct.cards[x][0] == c || ct.cards[x][1] == c) continue;
+                if (!ev.valid()[x]) continue;
+                pct[x] += pc[x];
+                eq0[x] += e0copy[x];
+                eq1[x] += e1[x];
+                n[x] += 1.0;
+            }
+        }
+        for (int x = 0; x < kCombos; ++x)
+            if (n[x] > 0.0) {
+                pct[x] /= n[x];
+                eq0[x] /= n[x];
+                eq1[x] /= n[x];
+            }
+        return features(street, board, nb, pot, stack, beta, pct, eq0, eq1);
+    }
+    // flop/preflop roots: strength blocks pending (two-street expectation)
+    return features(street, board, nb, pot, stack, beta, kZero, kZero,
+                    kZero);
 }
 
 std::vector<float> HunlFeaturizer::features(int street, const uint8_t* board,
@@ -628,6 +676,7 @@ void EndgameTrainer::self_play_episode(poker_ppo::PokerEnvironment& env,
     HunlNetOracle oracle(net_, stack_, device_);
     HunlSolver s(env, beta, &oracle, cfg_.actions);
     s.refresh_every = 5;
+    s.track_root_values();
 
     std::uniform_int_distribution<int> dt(1, cfg_.t_turn);
     const int tstar = dt(rng);
@@ -641,6 +690,53 @@ void EndgameTrainer::self_play_episode(poker_ppo::PokerEnvironment& env,
         if (t == tstar)
             have = s.sample_leaf(rng, cfg_.eps_explore, explorer, &leaf,
                                  &card, &leaf_beta);
+    }
+
+    // Phase C: ReBeL's own value target for the solved subgame root —
+    // (1/T)·Σ_t v^{π^t}(β_root), bootstrapped through the net's river
+    // leaves. Street-2 rows teach the net TURN-ROOT values, the
+    // prerequisite for flop solves with net leaves.
+    {
+        std::array<std::vector<double>, 2> rv, rm;
+        const double contrib =
+            static_cast<double>(env.game_config().initial_stack) -
+            env.stack(0);
+        if (contrib > 0.0 && s.avg_root_values(rv, rm)) {
+            HunlPBS nb = beta;
+            std::vector<uint8_t> v4;
+            board_valid(b4, 4, v4);
+            double s0 = 0.0, s1 = 0.0;
+            for (int i = 0; i < kCombos; ++i) {
+                if (!v4[i]) {
+                    nb.r0[i] = nb.r1[i] = 0.0;
+                    continue;
+                }
+                s0 += nb.r0[i];
+                s1 += nb.r1[i];
+            }
+            if (s0 > 0.0 && s1 > 0.0) {
+                for (int i = 0; i < kCombos; ++i) {
+                    nb.r0[i] /= s0;
+                    nb.r1[i] /= s1;
+                }
+                const double pot_root = 2.0 * contrib;
+                Sample smp;
+                smp.feat = HunlFeaturizer::features(2, b4, 4, pot_root,
+                                                    stack_, nb);
+                smp.target.assign(2 * kCombos, 0.0f);
+                smp.mask.assign(2 * kCombos, 0.0f);
+                for (int p = 0; p < 2; ++p) {
+                    const auto& own = p == 0 ? nb.r0 : nb.r1;
+                    for (int i = 0; i < kCombos; ++i) {
+                        if (rm[p][i] < 0.5 || own[i] <= 0.0) continue;
+                        smp.target[p * kCombos + i] =
+                            static_cast<float>(rv[p][i] / pot_root);
+                        smp.mask[p * kCombos + i] = 1.0f;
+                    }
+                }
+                fresh.push_back(std::move(smp));
+            }
+        }
     }
 
     // Algorithm 1's t*-sampled continuation leaf (ε-explored coverage)
