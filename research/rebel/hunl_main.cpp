@@ -487,6 +487,30 @@ int main(int argc, char** argv) {
                          "hybrid, not ReBeL\n");
         }
 
+        // paired baseline: judge the BLUEPRINT alone under the exact same
+        // binary/config/seed — the only comparison that isolates what the
+        // re-solving layer adds (historical numbers may differ in config)
+        if (env_i("REBEL_BLUEPRINT_ONLY", 0) != 0) {
+            if (!bp_target) {
+                std::fprintf(stderr, "lbr: BLUEPRINT_ONLY needs "
+                             "REBEL_BLUEPRINT\n");
+                return 1;
+            }
+            std::printf("lbr: judging the BLUEPRINT ALONE (no re-solving)\n");
+            const auto res = poker_ppo::LBREvaluator::evaluate_sharded_target(
+                factory, bet_cfg, lc, device,
+                [&](int) {
+                    return poker_ppo::make_actor_critic_target(bp, lc,
+                                                               device, D, A);
+                },
+                threads);
+            std::printf("\nLBR vs blueprint alone: %.4f bb/hand over %d "
+                        "hands (LBR win rate %.3f, %.0fs)\n",
+                        res.bb_per_hand, res.num_hands, res.lbr_win_rate,
+                        res.wall_ms / 1000.0);
+            return 0;
+        }
+
         RebelPlayConfig pc;
         pc.t_turn  = env_i("REBEL_T_TURN", 120);
         pc.t_river = env_i("REBEL_T_RIVER", 200);

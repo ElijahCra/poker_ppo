@@ -262,6 +262,34 @@ PPO 1.85 / ESCHER 1.256 numbers. Integration:
    fold_probe off for turn nodes (a turn solve per probe). Sharded
    evaluate (~10s/hand/shard, 20 shards → ~5k hands/h).
 
+* Phase B′ first results (2026-07-07)
+
+Hand-strength features broke the net-quality ceiling (probe 6.4 → ~2.0 bb
+vs 5.39 exact refs — BELOW the exact-leaf oracle, the Leduc
+self-consistency finding at HUNL scale). Final net: =rebel_hs_turn.pt=
+(river pretrain + harvest fine-tune, harvest heldout 9.4e-2).
+
+LBR vs the hybrid agent (PPO blueprint preflop/flop + ReBeL re-solving
+turn/river). Statistics lesson first: per-hand sd ≈ 30 bb (all-in tails) —
+5k hands ⇒ ±0.42, 20k ⇒ ±0.21; and historical numbers (PPO 1.85, ESCHER
+1.256) were measured under OTHER configs (deployment filter) — only
+PAIRED runs count. Paired, identical judge/seed/binary, 20k hands:
+| blueprint alone (=REBEL_BLUEPRINT_ONLY=1=) | 3.451 ± 0.24 |
+| hybrid (+ ReBeL turn/river)                | 2.221 ± 0.21 |
+→ the re-solving layer removes 1.23 bb/hand, −36%, ~4σ.
+
+Aggregate attribution (=REBEL_LBR_LOG= per-hand CSVs, all 20 shards):
+ALL residual LBR profit is river-ending hands (+2.29 bb/hand of 2.22;
+bot_fold 33% of hands at +4.4 bb/when, plus big river showdown losses;
+LBR raised in 39% of hands — analytic river raises are its whole weapon).
+Turn-ending hands LBR LOSES (−0.18); preflop/flop ≈ 0. Diagnosis: UNSAFE
+RE-SOLVING against a deviating adversary — the tracked opponent range is
+the agent's own equilibrium/blueprint model, which LBR does not play, and
+LBR's off-abstraction raise sizes skip the belief update entirely. The
+safe-resolving gadget (Burch et al.) moves to the top of the queue;
+secondary levers: denser river abstraction (0.5-pot in-tree so LBR's
+raises stay on-tree), higher play-time T.
+
 * HUNL port map (stage 2)
 
 - Beliefs/ranges: LBR's =Belief= (src/lbr.cpp) already Bayes-tracks
