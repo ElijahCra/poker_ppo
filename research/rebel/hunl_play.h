@@ -63,6 +63,12 @@ struct RebelPlayConfig {
     // turn solves stay model-based until flop-entry alternatives exist.
     bool   gadget     = true;
     double gadget_mix = 0.1;
+    // false → blueprint plays the flop too (re-solving starts at the
+    // turn). Measured 2026-07-09: flop solves at T=150 on the current
+    // street-2 net ERASED the high-T gain (1.424 → 1.953; river share
+    // 1.60 → 3.41) — the Leduc oracle-sharpening effect: iterations
+    // amplify a thin net's bias. Re-enable as street-2 data grows.
+    bool   flop_solve = true;
     uint64_t seed     = 0;
 };
 
@@ -98,6 +104,9 @@ private:
         std::unique_ptr<HunlSolver> solver;
     };
 
+    // first street the agent re-solves; earlier streets play/track under
+    // the blueprint
+    int solve_from() const { return cfg_.flop_solve ? 1 : 2; }
     // mask newly revealed board cards out of both ranges; clear the solve
     // cache on street changes
     void sync_public(poker_ppo::PokerEnvironment& env);

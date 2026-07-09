@@ -228,9 +228,9 @@ torch::Tensor RebelTarget::probs_for_holes(
     PokerEnvironment& env, const torch::Tensor& mask,
     const std::vector<std::array<uint8_t, 2>>& holes) {
     seat_ = env.current_player();   // policy queries are about OUR node
-    if (env.round() < 1 && blueprint_)
+    if (env.round() < solve_from() && blueprint_)
         return blueprint_->probs_for_holes(env, mask, holes);
-    if (env.round() < 1) {
+    if (env.round() < solve_from()) {
         CheckCallTarget stub;
         return stub.probs_for_holes(env, mask, holes);
     }
@@ -255,7 +255,7 @@ torch::Tensor RebelTarget::probs_for_holes(
 int RebelTarget::act(PokerEnvironment& env, const torch::Tensor& mask) {
     sync_public(env);
     seat_ = env.current_player();
-    if (env.round() < 1) {
+    if (env.round() < solve_from()) {
         if (blueprint_) return blueprint_->act(env, mask);
         CheckCallTarget stub;
         return stub.act(env, mask);
@@ -283,7 +283,7 @@ int RebelTarget::act(PokerEnvironment& env, const torch::Tensor& mask) {
 void RebelTarget::note_action(PokerEnvironment& env, int action) {
     sync_public(env);
     const int seat = env.current_player();
-    if (env.round() < 1) {
+    if (env.round() < solve_from()) {
         if (!blueprint_) return;   // check/call stub: uninformative update
         // blueprint model for the acting seat's range (all live combos)
         const std::vector<double>& r = seat == 0 ? pbs_.r0 : pbs_.r1;
