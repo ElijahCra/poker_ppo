@@ -47,20 +47,33 @@ struct Api {
 
 Api load_api() {
     Api a;
-    void* nv = dlopen("libnvrtc.so.12", RTLD_NOW | RTLD_GLOBAL);
-    if (!nv && std::getenv("REBEL_NVRTC"))
+    // torch's bundled nvrtc soname tracks its CUDA major (cu130 → .so.13,
+    // cu128 → .so.12); pip layouts keep it in the nvidia/ sibling package
+    // NEXT TO wherever libtorch loaded from — derive that via dladdr
+    // instead of guessing python paths. REBEL_NVRTC overrides everything.
+    void* nv = nullptr;
+    if (std::getenv("REBEL_NVRTC"))
         nv = dlopen(std::getenv("REBEL_NVRTC"), RTLD_NOW | RTLD_GLOBAL);
+    static const char* kSonames[] = {"libnvrtc.so.13", "libnvrtc.so.12",
+                                     "libnvrtc.so"};
+    for (const char* s : kSonames)
+        if (!nv) nv = dlopen(s, RTLD_NOW | RTLD_GLOBAL);
     if (!nv) {
-        // pip-installed torch keeps nvrtc in the nvidia/ sibling package
-        void* h = dlopen("libtorch_cuda.so", RTLD_NOW | RTLD_NOLOAD);
-        (void)h;
-        const char* home = std::getenv("HOME");
-        if (home) {
-            const std::string p =
-                std::string(home) +
-                "/.local/lib/python3.10/site-packages/nvidia/cuda_nvrtc/"
-                "lib/libnvrtc.so.12";
-            nv = dlopen(p.c_str(), RTLD_NOW | RTLD_GLOBAL);
+        Dl_info info{};
+        // anchor: cudaGetDevice lives in torch's bundled libcudart under
+        // <site-packages>/torch/lib — the nvidia/ tree is its sibling
+        if (dladdr(reinterpret_cast<void*>(&cudaGetDevice), &info) &&
+            info.dli_fname) {
+            std::string dir(info.dli_fname);
+            const auto cut = dir.rfind("/torch/");
+            if (cut != std::string::npos) {
+                const std::string base =
+                    dir.substr(0, cut) + "/nvidia/cuda_nvrtc/lib/";
+                for (const char* s : kSonames)
+                    if (!nv)
+                        nv = dlopen((base + s).c_str(),
+                                    RTLD_NOW | RTLD_GLOBAL);
+            }
         }
     }
     void* cu = dlopen("libcuda.so.1", RTLD_NOW | RTLD_GLOBAL);
