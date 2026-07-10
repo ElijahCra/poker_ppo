@@ -24,10 +24,15 @@
 
 #include <array>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
 #include "hunl_solver.h"
+
+namespace at::cuda {
+struct CUDAGraph;   // avoid pulling CUDA headers into every consumer
+}
 
 namespace rebel_hunl {
 
@@ -59,8 +64,19 @@ public:
     BatchRiverSolver(TreeShape shape, std::vector<RiverSpec> specs,
                      torch::Device device,
                      torch::Dtype dtype = torch::kFloat);
+    ~BatchRiverSolver();
 
     void iterate(int t);
+    // Full solve with the launch-overhead fix: the two-pass iteration is
+    // captured ONCE as a CUDA graph and replayed T times (per iteration:
+    // one fill_ of the averaging weight + one graph launch, instead of
+    // ~2k kernel launches — the measured reason this solver lost to CPU
+    // workers). State updates are in-place on stable storage, so replays
+    // accumulate exactly like eager iterates; `gpu_check` verifies the
+    // graphed path against both the eager path and the fp64 CPU solver.
+    // Falls back to eager iterates off-CUDA, for tiny T, or if capture
+    // fails (REBEL_NO_CUDA_GRAPH=1 forces eager).
+    void solve(int T);
     // per-spec root values of the average profile, normalized per combo by
     // opponent compatible mass (CPU doubles) + masks — training targets.
     void root_values(
@@ -88,11 +104,25 @@ private:
     torch::Tensor valid_;      // [B, n] float
     torch::Tensor r0_, r1_;    // [B, n] normalized root ranges
     torch::Tensor perm_, prev_end1_, seg_end_;   // [B, n] long (showdown)
-    torch::Tensor a_sorted_, b_sorted_;          // [B, n] long
-    torch::Tensor card_sorted_;                  // [B, n, 52] float (const)
+    // Sparse per-card showdown structure: each card appears in exactly 51
+    // combos, so card-restricted prefix masses live in [B, 52, 51] instead
+    // of the old dense [B, n, 52] cumsum (~26× wasted memory traffic —
+    // measured kernel-bound at 11 targets/s vs CPU's 81). pos_card_:
+    // sorted positions of card c's combos, ascending. idx_*: CONSTANT
+    // flattened (card·52 + count-below-boundary) indices into the
+    // zero-padded per-card prefix table [B, 52·52] — boundaries are fixed
+    // per spec, so the counts precompute on CPU.
+    torch::Tensor pos_card_;                     // [B, 52*51] long
+    torch::Tensor idx_lowA_, idx_lowB_;          // [B, n] long
+    torch::Tensor idx_endA_, idx_endB_;          // [B, n] long
+    torch::Tensor idx_totA_, idx_totB_;          // [B, n] long
     torch::Tensor c0_, c1_;    // [B, nodes] float contribs
     // per decision node learning state, [B, A, n]
     std::vector<torch::Tensor> regret_, cum_;
+    // linear-averaging weight as a device scalar: filled before each
+    // eager iterate / graph replay, read inside the (captured) walk
+    torch::Tensor t_dev_;
+    std::unique_ptr<at::cuda::CUDAGraph> graph_;
 };
 
 }  // namespace rebel_hunl

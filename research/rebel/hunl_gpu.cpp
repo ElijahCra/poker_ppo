@@ -1,13 +1,20 @@
 #include "hunl_gpu.h"
 
+#include <ATen/cuda/CUDAContext.h>
+#include <ATen/cuda/CUDAGraph.h>
+#include <c10/cuda/CUDAGuard.h>
+
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 
 namespace rebel_hunl {
 
 namespace {
 constexpr double kTiny = 1e-12;
 }
+
+BatchRiverSolver::~BatchRiverSolver() = default;
 
 TreeShape TreeShape::from(const HunlSolver& s) {
     TreeShape sh;
@@ -59,8 +66,13 @@ BatchRiverSolver::BatchRiverSolver(TreeShape shape,
     auto perm = torch::zeros({B_, n}, l);
     auto prev1 = torch::zeros({B_, n}, l);
     auto segend = torch::zeros({B_, n}, l);
-    auto asort = torch::zeros({B_, n}, l);
-    auto bsort = torch::zeros({B_, n}, l);
+    auto poscard = torch::zeros({B_, kCards * 51}, l);
+    auto ilowA = torch::zeros({B_, n}, l);
+    auto ilowB = torch::zeros({B_, n}, l);
+    auto iendA = torch::zeros({B_, n}, l);
+    auto iendB = torch::zeros({B_, n}, l);
+    auto itotA = torch::zeros({B_, n}, l);
+    auto itotB = torch::zeros({B_, n}, l);
     const int M = static_cast<int>(shape_.nodes.size());
     auto c0 = torch::zeros({B_, M}, f);
     auto c1 = torch::zeros({B_, M}, f);
@@ -92,8 +104,6 @@ BatchRiverSolver::BatchRiverSolver(TreeShape shape,
         auto pp = perm.accessor<int64_t, 2>();
         auto pe = prev1.accessor<int64_t, 2>();
         auto se = segend.accessor<int64_t, 2>();
-        auto as = asort.accessor<int64_t, 2>();
-        auto bs = bsort.accessor<int64_t, 2>();
         for (int i = 0; i < n; ++i) {
             va[b][i] = vb[i] ? 1.0f : 0.0f;
             if (vb[i]) {
@@ -103,21 +113,11 @@ BatchRiverSolver::BatchRiverSolver(TreeShape shape,
                                       : static_cast<float>(1.0 / nv);
             }
         }
+        for (int pos = 0; pos < n; ++pos)
+            pp[b][pos] = order[static_cast<size_t>(pos)];
         // segment boundaries over the sorted VALID prefix; pads form one
         // trailing zero-mass segment.
         int gstart = 0;
-        for (int pos = 0; pos < n; ++pos) {
-            const int cmb = order[static_cast<size_t>(pos)];
-            pp[b][pos] = cmb;
-            as[b][pos] = ct.cards[cmb][0];
-            bs[b][pos] = ct.cards[cmb][1];
-            const bool last_of_group =
-                pos + 1 >= nv || pos + 1 >= n ||
-                (pos + 1 < nv &&
-                 rank[order[static_cast<size_t>(pos + 1)]] != rank[cmb]);
-            (void)last_of_group;
-        }
-        // second pass for group indices (clearer than fusing above)
         int pos = 0;
         while (pos < nv) {
             int e = pos;
@@ -135,6 +135,45 @@ BatchRiverSolver::BatchRiverSolver(TreeShape shape,
         for (int k = nv; k < n; ++k) {   // pad segment
             pe[b][k] = nv;
             se[b][k] = n;
+        }
+        // sparse per-card structure: ascending positions per card (each
+        // card is in exactly 51 combos, pads included with zero mass) and
+        // constant boundary counts per row (boundaries are per-spec
+        // constants, so lower_bound resolves them here on CPU once)
+        {
+            std::array<std::vector<int>, kCards> posc;
+            for (auto& v : posc) v.reserve(51);
+            for (int p = 0; p < n; ++p) {
+                const int cmb = order[static_cast<size_t>(p)];
+                posc[ct.cards[cmb][0]].push_back(p);
+                posc[ct.cards[cmb][1]].push_back(p);
+            }
+            auto pc = poscard.accessor<int64_t, 2>();
+            for (int c = 0; c < kCards; ++c)
+                for (int j = 0; j < 51; ++j)
+                    pc[b][c * 51 + j] = posc[c][static_cast<size_t>(j)];
+            auto la = ilowA.accessor<int64_t, 2>();
+            auto lb2 = ilowB.accessor<int64_t, 2>();
+            auto ea = iendA.accessor<int64_t, 2>();
+            auto eb = iendB.accessor<int64_t, 2>();
+            auto ta = itotA.accessor<int64_t, 2>();
+            auto tb = itotB.accessor<int64_t, 2>();
+            auto count_below = [&](int c, int64_t q) -> int64_t {
+                const auto& v = posc[c];
+                return std::lower_bound(v.begin(), v.end(),
+                                        static_cast<int>(q)) -
+                       v.begin();
+            };
+            for (int p = 0; p < n; ++p) {
+                const int cmb = order[static_cast<size_t>(p)];
+                const int A = ct.cards[cmb][0], Bc = ct.cards[cmb][1];
+                la[b][p] = A * 52 + count_below(A, pe[b][p]);
+                lb2[b][p] = Bc * 52 + count_below(Bc, pe[b][p]);
+                ea[b][p] = A * 52 + count_below(A, se[b][p]);
+                eb[b][p] = Bc * 52 + count_below(Bc, se[b][p]);
+                ta[b][p] = A * 52 + 51;
+                tb[b][p] = Bc * 52 + 51;
+            }
         }
 
         auto cc0 = c0.accessor<float, 2>();
@@ -154,10 +193,13 @@ BatchRiverSolver::BatchRiverSolver(TreeShape shape,
     perm_ = perm.to(dev_);
     prev_end1_ = prev1.to(dev_);
     seg_end_ = segend.to(dev_);
-    a_sorted_ = asort.to(dev_);
-    b_sorted_ = bsort.to(dev_);
-    card_sorted_ = inc_.index_select(0, perm_.reshape({-1}))
-                       .reshape({B_, n, kCards});
+    pos_card_ = poscard.to(dev_);
+    idx_lowA_ = ilowA.to(dev_);
+    idx_lowB_ = ilowB.to(dev_);
+    idx_endA_ = iendA.to(dev_);
+    idx_endB_ = iendB.to(dev_);
+    idx_totA_ = itotA.to(dev_);
+    idx_totB_ = itotB.to(dev_);
     c0_ = c0.to(dev_).to(dt_);
     c1_ = c1.to(dev_).to(dt_);
 
@@ -171,6 +213,7 @@ BatchRiverSolver::BatchRiverSolver(TreeShape shape,
             torch::TensorOptions().dtype(dt_).device(dev_));
         cum_[m] = torch::zeros_like(regret_[m]);
     }
+    t_dev_ = torch::ones({}, torch::TensorOptions().dtype(dt_).device(dev_));
 }
 
 torch::Tensor BatchRiverSolver::policies(int node, bool average) {
@@ -203,34 +246,28 @@ torch::Tensor BatchRiverSolver::showdown_cfv_t(int node,
     auto ws = opp.gather(1, perm_);                         // [B, n]
     auto cs = ws.cumsum(1);
     auto cs0 = torch::cat({torch::zeros({B_, 1}, ws.options()), cs}, 1);
-    // per-card cumulative masses along the sorted order
-    auto wc = (ws.unsqueeze(2) * card_sorted_).cumsum(1);
-    auto wc0 = torch::cat(
-        {torch::zeros({B_, 1, kCards}, ws.options()), wc}, 1);
+    // card-restricted prefix masses over each card's own 51 positions —
+    // [B, 52, 52] zero-padded table; boundary lookups are the precomputed
+    // constant (card·52 + count) indices
+    auto wsc = ws.gather(1, pos_card_).reshape({B_, kCards, 51});
+    auto csc = wsc.cumsum(2);
+    auto csc0 = torch::cat(
+        {torch::zeros({B_, kCards, 1}, ws.options()), csc}, 2)
+                    .reshape({B_, kCards * 52});
 
-    auto gather_tot = [&](const torch::Tensor& idx) {       // [B,n] from cs0
-        return cs0.gather(1, idx);
-    };
-    auto gather_card = [&](const torch::Tensor& idx,
-                           const torch::Tensor& cards) {    // [B,n]
-        auto t = wc0.gather(
-            1, idx.unsqueeze(2).expand({B_, n, kCards}));   // [B,n,52]
-        return t.gather(2, cards.unsqueeze(2)).squeeze(2);
-    };
-
-    auto lowT = gather_tot(prev_end1_);
-    auto lowA = gather_card(prev_end1_, a_sorted_);
-    auto lowB = gather_card(prev_end1_, b_sorted_);
+    auto lowT = cs0.gather(1, prev_end1_);
+    auto lowA = csc0.gather(1, idx_lowA_);
+    auto lowB = csc0.gather(1, idx_lowB_);
     auto win = lowT - lowA - lowB;
 
-    auto endT = gather_tot(seg_end_);
-    auto endA = gather_card(seg_end_, a_sorted_);
-    auto endB = gather_card(seg_end_, b_sorted_);
+    auto endT = cs0.gather(1, seg_end_);
+    auto endA = csc0.gather(1, idx_endA_);
+    auto endB = csc0.gather(1, idx_endB_);
     auto tie = (endT - lowT) - (endA - lowA) - (endB - lowB) + ws;
 
     auto S = cs.select(1, n - 1).unsqueeze(1);              // [B,1]
-    auto ScA = gather_card(torch::full_like(prev_end1_, n), a_sorted_);
-    auto ScB = gather_card(torch::full_like(prev_end1_, n), b_sorted_);
+    auto ScA = csc0.gather(1, idx_totA_);
+    auto ScB = csc0.gather(1, idx_totB_);
     auto tot = S - ScA - ScB + ws;
 
     auto half_pot = c0_.select(1, node).unsqueeze(1);       // contribs equal
@@ -266,11 +303,16 @@ torch::Tensor BatchRiverSolver::walk(int node, int upd, int t, bool update,
         auto stacked = torch::stack(cfv_a, 1);              // [B, A, n]
         auto v = (sig * stacked).sum(1);                    // [B, n]
         if (update) {
-            regret_[node] =
-                torch::clamp_min(regret_[node] + stacked - v.unsqueeze(1),
-                                 0.0f);
-            cum_[node] = cum_[node] +
-                static_cast<float>(t) * my_reach.unsqueeze(1) * sig;
+            // strictly IN-PLACE on stable storage: a captured graph replays
+            // exactly these reads/writes, so the recurrence (iteration N+1
+            // reads what N wrote) only holds if the buffers never rebind.
+            // add_/sub_ split keeps the ORIGINAL association ((r+s)−v):
+            // RM⁺'s clamp is discontinuous, so a rounding-order change
+            // flips clamp decisions and lands on a different (equally
+            // valid) equilibrium selection — f64 equivalence vs the CPU
+            // solver is only bitwise-stable with the original order.
+            regret_[node].add_(stacked).sub_(v.unsqueeze(1)).clamp_min_(0.0);
+            cum_[node].add_((t_dev_ * my_reach.unsqueeze(1)) * sig);
         }
         return v;
     }
@@ -285,9 +327,49 @@ torch::Tensor BatchRiverSolver::walk(int node, int upd, int t, bool update,
 
 void BatchRiverSolver::iterate(int t) {
     torch::NoGradGuard ng;
+    t_dev_.fill_(static_cast<double>(t));
     for (int upd = 0; upd < 2; ++upd)
         walk(0, upd, t, /*update=*/true, upd == 0 ? r0_ : r1_,
              upd == 0 ? r1_ : r0_);
+}
+
+void BatchRiverSolver::solve(int T) {
+    torch::NoGradGuard ng;
+    const bool no_graph = std::getenv("REBEL_NO_CUDA_GRAPH") != nullptr;
+    if (!dev_.is_cuda() || T < 8 || no_graph) {
+        for (int t = 1; t <= T; ++t) iterate(t);
+        return;
+    }
+    // warmup (allocator + kernel caches settle), then capture the whole
+    // two-pass iteration; per remaining iteration: one fill_ + one replay
+    try {
+        auto stream = at::cuda::getStreamFromPool();
+        {
+            c10::cuda::CUDAStreamGuard guard(stream);
+            for (int t = 1; t <= 3; ++t) iterate(t);
+            at::cuda::getCurrentCUDAStream().synchronize();
+            graph_ = std::make_unique<at::cuda::CUDAGraph>();
+            graph_->capture_begin();
+            for (int upd = 0; upd < 2; ++upd)
+                walk(0, upd, /*t=*/0, /*update=*/true,
+                     upd == 0 ? r0_ : r1_, upd == 0 ? r1_ : r0_);
+            graph_->capture_end();
+            at::cuda::getCurrentCUDAStream().synchronize();
+        }
+        // capture RECORDS without executing: iteration 4 onward comes
+        // entirely from replays
+        for (int t = 4; t <= T; ++t) {
+            t_dev_.fill_(static_cast<double>(t));
+            graph_->replay();
+        }
+        torch::cuda::synchronize();
+    } catch (const std::exception& e) {
+        std::fprintf(stderr,
+                     "[gpu] CUDA graph capture failed (%s) — eager "
+                     "fallback\n", e.what());
+        graph_.reset();
+        for (int t = 4; t <= T; ++t) iterate(t);
+    }
 }
 
 void BatchRiverSolver::root_values(

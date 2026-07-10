@@ -605,7 +605,7 @@ void EndgameTrainer::gpu_river_epoch(
             for (size_t k = off; k < end; ++k)
                 batch.push_back(pend[static_cast<size_t>(idxs[k])].sp);
             BatchRiverSolver bs(shapes[sig], batch, device_, torch::kFloat);
-            for (int t = 1; t <= cfg_.t_river; ++t) bs.iterate(t);
+            bs.solve(cfg_.t_river);
             std::vector<std::array<std::vector<double>, 2>> v, m;
             bs.root_values(v, m);
             for (size_t b = 0; b < batch.size(); ++b) {
