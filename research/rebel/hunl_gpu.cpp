@@ -484,15 +484,15 @@ void BatchRiverSolver::root_values(
                         .to(torch::kCPU).to(torch::kDouble).contiguous();
         auto ok = ((m > 1e-6) & (own > 0.0))
                       .to(torch::kDouble).to(torch::kCPU).contiguous();
-        auto va = vals.accessor<double, 2>();
-        auto oa = ok.accessor<double, 2>();
+        // bulk row copies — the per-element accessor loop was measurable
+        // at large B on top of the transfer itself
+        const double* vp = vals.data_ptr<double>();
+        const double* op = ok.data_ptr<double>();
         for (int b = 0; b < B_; ++b) {
-            v[static_cast<size_t>(b)][p].assign(kCombos, 0.0);
-            mask[static_cast<size_t>(b)][p].assign(kCombos, 0.0);
-            for (int i = 0; i < kCombos; ++i) {
-                v[static_cast<size_t>(b)][p][i] = va[b][i];
-                mask[static_cast<size_t>(b)][p][i] = oa[b][i];
-            }
+            const double* vr = vp + static_cast<size_t>(b) * kCombos;
+            const double* orow = op + static_cast<size_t>(b) * kCombos;
+            v[static_cast<size_t>(b)][p].assign(vr, vr + kCombos);
+            mask[static_cast<size_t>(b)][p].assign(orow, orow + kCombos);
         }
     }
 }
