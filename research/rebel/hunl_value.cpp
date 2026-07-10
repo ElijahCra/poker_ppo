@@ -2,6 +2,10 @@
 
 #include "hunl_gpu.h"
 
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -903,6 +907,27 @@ void EndgameTrainer::print_pot_hist(const std::vector<Sample>& v,
 void EndgameTrainer::append_dataset(const std::string& path,
                                     const std::vector<Sample>& fresh) {
     if (fresh.empty()) return;
+    // single-writer guard: concurrent appenders interleave buffered
+    // 40KB rows and corrupt the file structurally (observed on a rental:
+    // a double-launched generator, one dataset). flock held for process
+    // lifetime; a second writer exits loudly instead.
+    {
+        static std::mutex lk_mtx;
+        static std::unordered_map<std::string, int> lk_fds;
+        std::lock_guard<std::mutex> g(lk_mtx);
+        if (lk_fds.find(path) == lk_fds.end()) {
+            const int fd =
+                ::open((path + ".lock").c_str(), O_CREAT | O_RDWR, 0644);
+            if (fd >= 0 && ::flock(fd, LOCK_EX | LOCK_NB) != 0) {
+                std::fprintf(stderr,
+                             "  [data] %s is being appended by ANOTHER "
+                             "process — refusing to interleave (this "
+                             "corrupts rows). exiting\n", path.c_str());
+                std::exit(1);
+            }
+            lk_fds[path] = fd;
+        }
+    }
     const int n_out = 2 * kCombos;
     const bool empty_file = !std::filesystem::exists(path) ||
                             std::filesystem::file_size(path) == 0;
