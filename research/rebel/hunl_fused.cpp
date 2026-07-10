@@ -9,6 +9,7 @@
 // fp64 CPU solver like every other solver in this repo.
 #include "hunl_fused.h"
 
+#include <cuda_runtime_api.h>
 #include <dlfcn.h>
 
 #include <cstdio>
@@ -362,8 +363,18 @@ bool build_kernel() {
     nvrtcProgram prog = nullptr;
     if (k_.api.create(&prog, kSrc, "cfr_river.cu", 0, nullptr, nullptr))
         return false;
-    const char* opts[] = {"--gpu-architecture=compute_86",
-                          "--use_fast_math"};
+    // compile for the DEVICE's arch (rented boxes differ; PTX would
+    // forward-JIT from a lower target but native codegen is free perf)
+    int dev = 0, cc_major = 8, cc_minor = 6;
+    cudaGetDevice(&dev);
+    cudaDeviceGetAttribute(&cc_major, cudaDevAttrComputeCapabilityMajor,
+                           dev);
+    cudaDeviceGetAttribute(&cc_minor, cudaDevAttrComputeCapabilityMinor,
+                           dev);
+    const std::string arch = "--gpu-architecture=compute_" +
+                             std::to_string(cc_major) +
+                             std::to_string(cc_minor);
+    const char* opts[] = {arch.c_str(), "--use_fast_math"};
     const int rc = k_.api.compile(prog, 2, opts);
     if (rc != 0) {
         size_t ls = 0;
