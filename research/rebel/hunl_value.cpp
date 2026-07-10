@@ -540,13 +540,13 @@ void EndgameTrainer::direct_river_episode(poker_ppo::PokerEnvironment& env,
 
 void EndgameTrainer::gpu_river_epoch(
     std::vector<std::unique_ptr<poker_ppo::PokerEnvironment>>& envs, int W,
-    int ep, std::vector<Sample>& fresh) {
+    int ep, std::vector<Sample>& fresh, int episodes) {
     struct Pending {
         RiverSpec sp;
         std::string sig;
         bool ok = false;
     };
-    std::vector<Pending> pend(static_cast<size_t>(cfg_.episodes));
+    std::vector<Pending> pend(static_cast<size_t>(episodes));
     std::unordered_map<std::string, TreeShape> shapes;
     std::mutex mtx;
     std::atomic<int> next{0};
@@ -555,7 +555,7 @@ void EndgameTrainer::gpu_river_epoch(
             cfg_.seed * 1000003u + ep * 7919u + w * 104729u + 17u));
         while (true) {
             const int e = next.fetch_add(1);
-            if (e >= cfg_.episodes) break;
+            if (e >= episodes) break;
             auto& env = *envs[w];
             bool root = false;
             for (int tries = 0; tries < 50 && !root; ++tries)
@@ -1173,6 +1173,19 @@ void EndgameTrainer::run() {
         envs.push_back(std::make_unique<poker_ppo::PokerEnvironment>(
             poker_ppo::kPokerConfig, poker_ppo::config::kBetConfig,
             cfg_.seed + 1000 + w));
+    // GPU pipeline: its spec builders get their own envs so the GPU
+    // thread and the CPU worker pool can run the SAME epoch concurrently
+    std::vector<std::unique_ptr<poker_ppo::PokerEnvironment>> envs_gpu;
+    const int Wg = 4;
+    double gpu_frac = 0.33;   // ≈ 53 / (53 + 110) measured split
+    if (cfg_.river_only && cfg_.gpu_batch > 0) {
+        if (const char* s = std::getenv("REBEL_GPU_FRAC"))
+            gpu_frac = std::atof(s);
+        for (int w = 0; w < Wg; ++w)
+            envs_gpu.push_back(std::make_unique<poker_ppo::PokerEnvironment>(
+                poker_ppo::kPokerConfig, poker_ppo::config::kBetConfig,
+                cfg_.seed + 9000 + w));
+    }
     {
         const uint8_t warm[5] = {0, 5, 10, 15, 20};
         (void)combo_rank(ComboTable::get().id[25][30], warm);
@@ -1206,25 +1219,22 @@ void EndgameTrainer::run() {
                          "  [warn] REBEL_GPU_BATCH on a CPU-torch device is "
                          "~100x SLOWER than the worker path — use it on "
                          "CUDA only\n");
-        if (cfg_.river_only && cfg_.gpu_batch > 0) {
-            std::vector<Sample> fresh;
-            gpu_river_epoch(envs, W, ep, fresh);
-            auto t_sp1b = clock::now();
-            if (ep == 1) print_pot_hist(fresh, "gen");
-            if (!cfg_.data_out.empty()) append_dataset(cfg_.data_out, fresh);
-            const double heldout = !heldout_.empty() ? heldout_mse(heldout_)
-                                                     : heldout_mse(fresh);
-            for (Sample& smp : fresh) replay_insert(std::move(smp));
-            auto t_tr0b = clock::now();
-            const double vloss = train_net();
-            std::printf("  epoch %3d  replay=%5zu  vloss=%.3e  heldout=%.3e"
-                        "  [sp %.0fs train %.0fs]\n",
-                        ep, replay_.size(), vloss, heldout,
-                        secs(t_sp0, t_sp1b), secs(t_tr0b, clock::now()));
-            std::fflush(stdout);
-            if (!cfg_.ckpt.empty()) torch::save(net_, cfg_.ckpt);
-            continue;
-        }
+        // GPU pipeline share: a device thread solves e_gpu targets in
+        // lockstep batches while the CPU pool solves the rest — separate
+        // resources, so sequential use (the old exclusive gpu path)
+        // wasted whichever one wasn't running
+        const int e_gpu =
+            (cfg_.river_only && cfg_.gpu_batch > 0 && device_.is_cuda())
+                ? std::min(cfg_.episodes,
+                           static_cast<int>(cfg_.episodes * gpu_frac))
+                : 0;
+        const int e_cpu = cfg_.episodes - e_gpu;
+        std::vector<Sample> fresh_gpu;
+        std::unique_ptr<std::thread> gpu_thr;
+        if (e_gpu > 0)
+            gpu_thr = std::make_unique<std::thread>([&, ep, e_gpu] {
+                gpu_river_epoch(envs_gpu, Wg, ep, fresh_gpu, e_gpu);
+            });
         // episodes fan out over the worker pool (work-stealing counter)
         std::vector<std::vector<Sample>> fresh_w(W);
         std::atomic<int> next{0};
@@ -1233,7 +1243,7 @@ void EndgameTrainer::run() {
                 cfg_.seed * 1000003u + ep * 7919u + w * 104729u));
             while (true) {
                 const int e = next.fetch_add(1);
-                if (e >= cfg_.episodes) break;
+                if (e >= e_cpu) break;
                 if (cfg_.river_only)
                     direct_river_episode(*envs[w], wrng, fresh_w[w]);
                 else
@@ -1251,6 +1261,10 @@ void EndgameTrainer::run() {
         std::vector<Sample> fresh;
         for (auto& fw : fresh_w)
             for (auto& s : fw) fresh.push_back(std::move(s));
+        if (gpu_thr) {
+            gpu_thr->join();
+            for (auto& s : fresh_gpu) fresh.push_back(std::move(s));
+        }
         auto t_sp1 = clock::now();
         if (ep == 1) print_pot_hist(fresh, "gen");
         if (!cfg_.data_out.empty()) append_dataset(cfg_.data_out, fresh);

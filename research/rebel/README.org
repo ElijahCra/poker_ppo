@@ -262,6 +262,34 @@ PPO 1.85 / ESCHER 1.256 numbers. Integration:
    fold_probe off for turn nodes (a turn solve per probe). Sharded
    evaluate (~10s/hand/shard, 20 shards → ~5k hands/h).
 
+* CUDA solver campaign (2026-07-09/10) — measured wins and negative results
+
+=BatchRiverSolver= 11 → 53 targets/s (B=512, T=200), equivalence
+maintained throughout (=gpu_check= f32 + f64 + graphed-vs-eager):
+1. CUDA graphs (in-place state + capture/replay, bit-identical to eager):
+   NECESSARY but not sufficient — the "launch-bound" diagnosis was stale;
+   the solver was KERNEL-bound in the dense [B,n,52] showdown cumsum.
+2. Sparse per-card showdown (card-restricted prefix sums [B,52,51] +
+   constant boundary indices): 4.7× — the real win.
+3. NEGATIVE: level-synchronized flattening (one actor per depth, whole
+   levels per kernel, ~7× fewer launches) measured 33.7/s vs 52.7/s —
+   after the sparse fix the solver is memory-bound, and level-sync ADDS
+   traffic (both players' reaches materialized at every edge, per-node
+   value buffers, index ops). Reverted; f64 trajectory agreement was
+   incidentally 5× better (mean 2e-6), confirming the arithmetic.
+   Also: two 6.6/36-targets/s scares were CONTAMINATED benches (a
+   forgotten concurrent 8k-target run) — kill stray GPU jobs before
+   benchmarking.
+4. B-scaling INVERTED: B=2048 → 37/s (past the L2 knee); B=512 optimal.
+5. Deployment: REBEL_GPU_BATCH now PIPELINES (GPU thread + own spec
+   builders, REBEL_GPU_FRAC share) concurrent with the CPU pool — but on
+   this 20-core box the gain is ~5-10% (core contention eats it; CPU pool
+   alone ≈ 110 targets/s vs GPU 43-53/s incl. per-epoch capture). Verdict:
+   for river data generation on THIS box, CPU workers remain fine; the
+   graphed solver's real targets are GPU-rich/CPU-poor hardware (compute
+   VM), play-time re-solving, and future turn-tree GPU solves where net
+   leaf batching already lives on the device.
+
 * Phase B′ first results (2026-07-07)
 
 Hand-strength features broke the net-quality ceiling (probe 6.4 → ~2.0 bb

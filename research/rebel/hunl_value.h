@@ -218,9 +218,11 @@ private:
                               std::mt19937& rng, std::vector<Sample>& fresh);
     // GPU path: CPU workers sample specs (board/pot/ranges/tree shape), the
     // device solves them in lockstep batches; appends `episodes` samples.
+    // Runs on its own env pool so it can PIPELINE with the CPU worker pool
+    // (separate resources; sequential use wastes one of them).
     void gpu_river_epoch(
         std::vector<std::unique_ptr<poker_ppo::PokerEnvironment>>& envs,
-        int W, int ep, std::vector<Sample>& fresh);
+        int W, int ep, std::vector<Sample>& fresh, int episodes);
     // Random training range for the situation's board (nb=5 river, nb=4
     // turn). 70% DeepStack R(S,p): recursive mass splits over the valid
     // combos ORDERED BY HAND STRENGTH (weaker half / stronger half) —
