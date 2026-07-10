@@ -110,11 +110,18 @@ Built and validated on this machine (target =rebel_hunl=):
   fp64 CPU solver: f64 max 6.9e-5 of pot (exact); f32 max 5.5e-3 (pure
   accumulation drift over 200 iterations — negligible vs net error).
   =REBEL_GPU_BATCH=512= routes train_river target solving through it
-  (CPU workers build specs, device solves). CUDA-only in practice: on
-  CPU-torch the tensor kernels are ~100x slower than the worker path
-  (warned at runtime). Board-cached =RiverEval= also added (~1.75x on all
-  CPU river solves). Next perf steps if needed: overlap spec-building
-  with device solves; batch bigger; fuse showdown gathers.
+  (CPU workers build specs, device solves). Board-cached =RiverEval= also
+  added (~1.75x on all CPU river solves).
+  MEASURED on the 5090 (2026-07-06): B=512 is ~10x SLOWER than the
+  20-worker CPU path — the walk issues ~200k small kernel launches per
+  batch solve (launch-bound, not compute-bound). Remedies, in order:
+  crank B (launches are constant in B; 2048-4096 fits 32GB), or
+  CUDA-graph the iteration (capture once, replay T times — the proven
+  ppo/escher fit-graph pattern; requires extracting the t-weighted cum
+  update from the capture). NOT needed for river target generation: the
+  cached CPU worker path does ~100-150 targets/s ≈ 1M samples in ~2h,
+  which saturates the current need. Revisit for turn/flop-phase leaf
+  queries and play-time solving, where batching is intrinsic.
 - CPU parallel self-play (2026-07-05): episodes fan out over a worker pool
   (own env + RNG per worker, work-stealing counter, net read-only; torch
   intra-op pinned to 1; HandRanks pre-warmed before spawn). REBEL_THREADS
