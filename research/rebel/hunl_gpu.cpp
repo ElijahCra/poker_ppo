@@ -1,4 +1,5 @@
 #include "hunl_gpu.h"
+#include "hunl_fused.h"
 
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/CUDAGraph.h>
@@ -333,6 +334,93 @@ void BatchRiverSolver::iterate(int t) {
              upd == 0 ? r1_ : r0_);
 }
 
+bool BatchRiverSolver::try_fused(int T) {
+    const int M = static_cast<int>(shape_.nodes.size());
+    // kernel compile-time bounds: stack depth < 12, arity ≤ 8
+    std::vector<int> depth(static_cast<size_t>(M), 0);
+    int maxd = 0, maxA = 0;
+    for (int m = 0; m < M; ++m) {   // creation order: parents precede kids
+        for (int c : shape_.nodes[m].child)
+            depth[static_cast<size_t>(c)] = depth[static_cast<size_t>(m)] + 1;
+        maxd = std::max(maxd, depth[static_cast<size_t>(m)]);
+        maxA = std::max(maxA,
+                        static_cast<int>(shape_.nodes[m].acts.size()));
+    }
+    if (maxd + 1 >= 12 || maxA > 8) return false;
+
+    auto li = torch::TensorOptions().dtype(torch::kInt);
+    auto ll = torch::TensorOptions().dtype(torch::kLong);
+    auto kind = torch::empty({M}, li);
+    auto act = torch::empty({M}, li);
+    auto ar = torch::empty({M}, li);
+    auto cbase = torch::empty({M}, li);
+    std::vector<int> cflat;
+    auto rptr = torch::zeros({M}, ll);
+    auto cptr = torch::zeros({M}, ll);
+    {
+        auto ka = kind.accessor<int, 1>();
+        auto aa = act.accessor<int, 1>();
+        auto ra = ar.accessor<int, 1>();
+        auto ba = cbase.accessor<int, 1>();
+        auto rp = rptr.accessor<int64_t, 1>();
+        auto cp = cptr.accessor<int64_t, 1>();
+        for (int m = 0; m < M; ++m) {
+            const auto& nd = shape_.nodes[m];
+            ka[m] = nd.kind;
+            aa[m] = nd.player;
+            ra[m] = static_cast<int>(nd.acts.size());
+            ba[m] = static_cast<int>(cflat.size());
+            for (int c : nd.child) cflat.push_back(c);
+            if (regret_[static_cast<size_t>(m)].defined()) {
+                rp[m] = reinterpret_cast<int64_t>(
+                    regret_[static_cast<size_t>(m)].data_ptr<float>());
+                cp[m] = reinterpret_cast<int64_t>(
+                    cum_[static_cast<size_t>(m)].data_ptr<float>());
+            }
+        }
+    }
+    auto cflat_t = torch::tensor(cflat, li);
+    // the address/topology tables must live on-device for the kernel
+    auto kind_d = kind.to(dev_);
+    auto act_d = act.to(dev_);
+    auto ar_d = ar.to(dev_);
+    auto cbase_d = cbase.to(dev_);
+    auto cflat_d = cflat_t.to(dev_);
+    auto rptr_d = rptr.to(dev_);
+    auto cptr_d = cptr.to(dev_);
+
+    FusedRiverArgs a;
+    a.T = T;
+    a.M = M;
+    a.B = B_;
+    a.kind = kind_d.data_ptr<int>();
+    a.actor = act_d.data_ptr<int>();
+    a.arity = ar_d.data_ptr<int>();
+    a.child_base = cbase_d.data_ptr<int>();
+    a.child_flat = cflat_d.data_ptr<int>();
+    a.regret_ptr = rptr_d.data_ptr<int64_t>();
+    a.cum_ptr = cptr_d.data_ptr<int64_t>();
+    a.r0 = r0_.data_ptr<float>();
+    a.r1 = r1_.data_ptr<float>();
+    a.valid = valid_.data_ptr<float>();
+    a.c0 = c0_.data_ptr<float>();
+    a.c1 = c1_.data_ptr<float>();
+    a.perm = perm_.data_ptr<int64_t>();
+    a.prev1 = prev_end1_.data_ptr<int64_t>();
+    a.segend = seg_end_.data_ptr<int64_t>();
+    a.poscard = pos_card_.data_ptr<int64_t>();
+    a.ilowA = idx_lowA_.data_ptr<int64_t>();
+    a.ilowB = idx_lowB_.data_ptr<int64_t>();
+    a.iendA = idx_endA_.data_ptr<int64_t>();
+    a.iendB = idx_endB_.data_ptr<int64_t>();
+    a.itotA = idx_totA_.data_ptr<int64_t>();
+    a.itotB = idx_totB_.data_ptr<int64_t>();
+    a.cardA = card_a_.data_ptr<int64_t>();
+    a.cardB = card_b_.data_ptr<int64_t>();
+    torch::cuda::synchronize();   // context current, uploads complete
+    return fused_river_solve(a);
+}
+
 void BatchRiverSolver::solve(int T) {
     torch::NoGradGuard ng;
     const bool no_graph = std::getenv("REBEL_NO_CUDA_GRAPH") != nullptr;
@@ -340,6 +428,10 @@ void BatchRiverSolver::solve(int T) {
         for (int t = 1; t <= T; ++t) iterate(t);
         return;
     }
+    // persistent NVRTC kernel: the whole T-iteration solve in ONE launch
+    if (dt_ == torch::kFloat && !std::getenv("REBEL_NO_FUSED") &&
+        try_fused(T))
+        return;
     // warmup (allocator + kernel caches settle), then capture the whole
     // two-pass iteration; per remaining iteration: one fill_ + one replay
     try {

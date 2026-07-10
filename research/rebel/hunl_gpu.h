@@ -86,6 +86,10 @@ public:
     int batch() const { return B_; }
 
 private:
+    // NVRTC persistent kernel (fp32): one block per subgame runs all T
+    // iterations in a single launch on the SAME per-node state tensors.
+    // false → bounds/compile unavailable, caller uses the graph path.
+    bool try_fused(int T);
     torch::Tensor walk(int node, int upd, int t, bool update,
                        torch::Tensor my_reach, torch::Tensor opp_reach);
     torch::Tensor policies(int node, bool average);       // [B, A, n]

@@ -149,6 +149,7 @@ add_executable(rebel_hunl
     research/rebel/hunl_kernels.cpp
     research/rebel/hunl_solver.cpp
     research/rebel/hunl_gpu.cpp
+    research/rebel/hunl_fused.cpp
     research/rebel/hunl_value.cpp
     research/rebel/hunl_play.cpp
     research/rebel/hunl_main.cpp
@@ -158,7 +159,8 @@ add_executable(rebel_hunl
     src/network.cpp
 )
 target_include_directories(rebel_hunl PRIVATE research/rebel include)
-target_link_libraries(rebel_hunl PRIVATE "${TORCH_LIBRARIES}" Game)
+target_link_libraries(rebel_hunl PRIVATE "${TORCH_LIBRARIES}" Game
+                      ${CMAKE_DL_LIBS})
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
     target_compile_options(rebel_hunl PRIVATE
         "SHELL:-include ${GLIBC_FEATURES_H}/features.h"

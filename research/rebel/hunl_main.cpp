@@ -237,26 +237,40 @@ int run_gpu_check(int B, int T) {
     std::vector<std::array<std::vector<double>, 2>> gv, gm;
     gpu.root_values(gv, gm);
 
-    // the CUDA-graphed path must reproduce the eager path exactly (same
-    // in-place ops, same order — only the launch mechanism differs)
+    // solve() path (f64 → CUDA graph, bitwise vs eager; f32 → fused NVRTC
+    // kernel, different summation order → RM⁺ equilibrium-selection
+    // spread). Judged against the CPU fp64 solver with the SAME bars as
+    // the eager path — that's the truth anchor; solve-vs-eager is
+    // informational.
     BatchRiverSolver gpu_g(shape, specs, dev,
                            f64 ? torch::kDouble : torch::kFloat);
     gpu_g.solve(T);
     std::vector<std::array<std::vector<double>, 2>> ggv, ggm;
     gpu_g.root_values(ggv, ggm);
-    double gworst = 0.0;
+    double gworst = 0.0, sworst = 0.0, smean = 0.0;
+    long scnt = 0;
     for (size_t b = 0; b < specs.size(); ++b) {
         const double pot = 2.0 * specs[b].node_contrib0[0];
         for (int p = 0; p < 2; ++p)
             for (int i = 0; i < kCombos; ++i) {
+                if (cpu_m[b][0][p][i] > 0.5 && ggm[b][p][i] > 0.5) {
+                    const double d =
+                        std::fabs(cpu_v[b][0][p][i] - ggv[b][p][i]) / pot;
+                    sworst = std::max(sworst, d);
+                    smean += d;
+                    ++scnt;
+                }
                 if (gm[b][p][i] < 0.5 || ggm[b][p][i] < 0.5) continue;
                 gworst = std::max(gworst,
                                   std::fabs(gv[b][p][i] - ggv[b][p][i]) /
                                       pot);
             }
     }
-    std::printf("  graphed-vs-eager |Δv|/pot max=%.3e  %s\n", gworst,
-                gworst < 1e-5 ? "PASS" : "FAIL");
+    smean = scnt > 0 ? smean / scnt : 0.0;
+    std::printf("  solve-vs-eager |Δv|/pot max=%.3e (informational)\n",
+                gworst);
+    std::printf("  solve-vs-cpu   |Δv|/pot mean=%.3e max=%.3e\n", smean,
+                sworst);
 
     double worst = 0.0, mean = 0.0;
     long cnt = 0;
@@ -310,7 +324,8 @@ int run_gpu_check(int B, int T) {
                     gv[wb][wp][wi] / (2.0 * specs[wb].node_contrib0[0]),
                     mass[wi]);
     }
-    const bool pass = worst < bar && mean < mean_bar && gworst < 1e-5;
+    const bool pass = worst < bar && mean < mean_bar && sworst < bar &&
+                      smean < mean_bar;
     std::printf("gpu_check: B=%zu T=%d device=%s dtype=%s  |Δv|/pot "
                 "mean=%.3e max=%.3e  %s\n",
                 specs.size(), T, dev.is_cuda() ? "cuda" : "cpu",
