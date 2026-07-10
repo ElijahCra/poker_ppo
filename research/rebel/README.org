@@ -289,6 +289,19 @@ maintained throughout (=gpu_check= f32 + f64 + graphed-vs-eager):
    graphed solver's real targets are GPU-rich/CPU-poor hardware (compute
    VM), play-time re-solving, and future turn-tree GPU solves where net
    leaf batching already lives on the device.
+6. PERSISTENT KERNEL (=hunl_fused=, "rebel hunl 22"): the whole
+   T-iteration solve as ONE kernel launch, one block per subgame, NVRTC
+   runtime-compiled (no nvcc; dlopen'd nvrtc + driver API). Validated
+   fused-vs-CPU mean 3.9e-5 / max 1.4e-2 (mean = arithmetic honesty, max
+   = RM⁺ selection spread; fold atomics ⇒ nondeterministic runs).
+   Measured 55.9/s @B=512 (parity with graphs), 62/s @B=2048-8192 (fixes
+   the torch batch inversion, zero capture overhead). CONCLUSION, now
+   confirmed across three architectures: n=1326 river CFR is
+   LATENCY-bound on per-depth recursion state (depth×A×n > shared memory
+   → local memory), which CPU caches handle natively — ~55-60/s is this
+   GPU's level however the kernel is organized. The fused path is
+   solve()'s default (REBEL_NO_FUSED opts out); its value is large-B,
+   weaker-CPU hosts, and wider action abstractions.
 
 * Phase B′ first results (2026-07-07)
 
