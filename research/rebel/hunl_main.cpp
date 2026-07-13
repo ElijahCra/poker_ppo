@@ -779,6 +779,60 @@ int main(int argc, char** argv) {
                     res.wall_ms / 1000.0);
         return 0;
     }
+    if (mode == "flopctx_check") {
+        // Self-consistency guard for the preflop-solve feature cache:
+        // HunlNetOracle::flop_features (cached evaluators) must be
+        // BIT-EXACT vs HunlFeaturizer::features (training-row path), and
+        // both must be invariant to board ordering (training rows see the
+        // env's deal order; preflop leaves see pf_flops_'s shuffle order).
+        const int K = argc > 2 ? std::atoi(argv[2]) : 20;
+        const double stack = static_cast<double>(
+            poker_ppo::kPokerConfig.game.initial_stack);
+        {
+            const uint8_t warm[5] = {0, 5, 10, 15, 20};
+            (void)combo_rank(ComboTable::get().id[25][30], warm);
+        }
+        HunlValueNet net(64, 2, false, true);   // never forwarded
+        HunlNetOracle oracle(net, stack, torch::kCPU);
+        std::mt19937_64 rng(4242);
+        std::uniform_real_distribution<double> u(0.0, 1.0);
+        float maxd = 0.0f, maxp = 0.0f;
+        for (int k = 0; k < K; ++k) {
+            uint8_t deck[52];
+            for (int c = 0; c < 52; ++c) deck[c] = static_cast<uint8_t>(c);
+            for (int j = 0; j < 3; ++j)
+                std::swap(deck[j], deck[j + rng() % (52 - j)]);
+            const uint8_t flop[3] = {deck[0], deck[1], deck[2]};
+            const uint8_t perm[3] = {deck[2], deck[0], deck[1]};
+            HunlPBS beta;
+            beta.r0.resize(kCombos);
+            beta.r1.resize(kCombos);
+            for (int i = 0; i < kCombos; ++i) {
+                beta.r0[i] = std::pow(u(rng), 3.0);
+                beta.r1[i] = std::pow(u(rng), 3.0);
+            }
+            const double pot = 2000.0 + static_cast<double>(rng() % 40000);
+            const auto f1 =
+                HunlFeaturizer::features(1, flop, 3, pot, stack, beta);
+            const auto f2 = oracle.flop_features(flop, pot, beta);  // build
+            const auto f3 = oracle.flop_features(flop, pot, beta);  // hit
+            const auto f4 =
+                HunlFeaturizer::features(1, perm, 3, pot, stack, beta);
+            const auto f5 = oracle.flop_features(perm, pot, beta);
+            for (int i = 0; i < HunlFeaturizer::kDim; ++i) {
+                maxd = std::max(maxd, std::abs(f1[i] - f2[i]));
+                maxd = std::max(maxd, std::abs(f1[i] - f3[i]));
+                maxp = std::max(maxp, std::abs(f1[i] - f4[i]));
+                maxp = std::max(maxp, std::abs(f1[i] - f5[i]));
+            }
+        }
+        std::printf("flopctx_check: K=%d  cached-vs-uncached max|dF|=%g  "
+                    "order-invariance max|dF|=%g  %s\n",
+                    K, maxd, maxp,
+                    (maxd == 0.0f && maxp == 0.0f) ? "PASS (bit-exact)"
+                                                   : "FAIL");
+        return (maxd == 0.0f && maxp == 0.0f) ? 0 : 1;
+    }
     if (mode == "convert_data") {
         if (argc < 4) {
             std::fprintf(stderr, "usage: rebel_hunl convert_data <in> <out>\n");

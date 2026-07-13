@@ -132,9 +132,14 @@ std::vector<float> HunlFeaturizer::features(int street, const uint8_t* board,
         const auto& ct = ComboTable::get();
         std::vector<double> pct(kCombos, 0.0), eq0(kCombos, 0.0),
             eq1(kCombos, 0.0), n(kCombos, 0.0);
+        // hash the SORTED board: training rows see the env's deal order,
+        // preflop-leaf queries see pf_flops_'s shuffle order — the same
+        // flop must select the same runout subset from either
+        uint8_t sb[3] = {board[0], board[1], board[2]};
+        std::sort(sb, sb + 3);
         uint64_t key = 1469598103934665603ull;
         for (int b = 0; b < 3; ++b)
-            key = (key ^ board[b]) * 1099511628211ull;
+            key = (key ^ sb[b]) * 1099511628211ull;
         std::mt19937_64 rr(key);
         std::vector<uint8_t> rem;
         for (int c = 0; c < kCards; ++c) {
@@ -468,6 +473,88 @@ int convert_dataset(const std::string& in, const std::string& out) {
     return 0;
 }
 
+std::vector<float> HunlNetOracle::flop_features(const uint8_t* flop,
+                                                double pot,
+                                                const HunlPBS& beta) {
+    const auto& ct = ComboTable::get();
+    uint8_t sb[3] = {flop[0], flop[1], flop[2]};
+    std::sort(sb, sb + 3);
+    const uint32_t key32 = static_cast<uint32_t>(sb[0]) |
+                           (static_cast<uint32_t>(sb[1]) << 8) |
+                           (static_cast<uint32_t>(sb[2]) << 16);
+    if (flop_ctx_.size() > 256 && flop_ctx_.find(key32) == flop_ctx_.end())
+        flop_ctx_.clear();   // ~0.5MB/entry; recurring sets stay small
+    FlopCtx& cc = flop_ctx_[key32];
+    if (!cc.ev[0]) {
+        // identical draw sequence to HunlFeaturizer's nb==3 branch:
+        // FNV over the sorted board seeds the runout subset
+        uint64_t key = 1469598103934665603ull;
+        for (int b = 0; b < 3; ++b)
+            key = (key ^ sb[b]) * 1099511628211ull;
+        std::mt19937_64 rr(key);
+        std::vector<uint8_t> rem;
+        for (int c = 0; c < kCards; ++c) {
+            bool dead = false;
+            for (int b = 0; b < 3; ++b)
+                if (flop[b] == c) dead = true;
+            if (!dead) rem.push_back(static_cast<uint8_t>(c));
+        }
+        std::array<uint8_t, 5> b5{};
+        for (int b = 0; b < 3; ++b) b5[b] = flop[b];
+        cc.pct.assign(kCombos, 0.0);
+        cc.nrun.assign(kCombos, 0.0);
+        std::vector<double> pc;
+        for (int s2 = 0; s2 < 32; ++s2) {
+            const size_t i1 = rr() % rem.size();
+            size_t i2 = rr() % (rem.size() - 1);
+            if (i2 >= i1) ++i2;
+            b5[3] = rem[i1];
+            b5[4] = rem[i2];
+            cc.runouts[static_cast<size_t>(s2)] = {rem[i1], rem[i2]};
+            auto& ev = cc.ev[static_cast<size_t>(s2)];
+            ev = std::make_unique<RiverEval>(b5.data());
+            ev->percentile(pc);
+            for (int x = 0; x < kCombos; ++x) {
+                if (!ev->valid()[x]) continue;
+                cc.pct[x] += pc[x];
+                cc.nrun[x] += 1.0;
+            }
+        }
+        for (int x = 0; x < kCombos; ++x)
+            if (cc.nrun[x] > 0.0) cc.pct[x] /= cc.nrun[x];
+    }
+    // equity blocks are beta-dependent: recompute per query from the
+    // cached evaluators, in the SAME runout/accumulation order as the
+    // uncached path (bit-exact requirement)
+    std::vector<double> eq0(kCombos, 0.0), eq1(kCombos, 0.0), e, opp;
+    for (int s2 = 0; s2 < 32; ++s2) {
+        const RiverEval& ev = *cc.ev[static_cast<size_t>(s2)];
+        const uint8_t t2 = cc.runouts[static_cast<size_t>(s2)][0];
+        const uint8_t r2 = cc.runouts[static_cast<size_t>(s2)][1];
+        auto masked = [&](const std::vector<double>& r) {
+            opp = r;
+            for (int i = 0; i < kCombos; ++i)
+                if (ct.cards[i][0] == t2 || ct.cards[i][1] == t2 ||
+                    ct.cards[i][0] == r2 || ct.cards[i][1] == r2)
+                    opp[i] = 0.0;
+            return &opp;
+        };
+        equity_vs_range(ev, *masked(beta.r1), e);
+        for (int x = 0; x < kCombos; ++x)
+            if (ev.valid()[x]) eq0[x] += e[x];
+        equity_vs_range(ev, *masked(beta.r0), e);
+        for (int x = 0; x < kCombos; ++x)
+            if (ev.valid()[x]) eq1[x] += e[x];
+    }
+    for (int x = 0; x < kCombos; ++x)
+        if (cc.nrun[x] > 0.0) {
+            eq0[x] /= cc.nrun[x];
+            eq1[x] /= cc.nrun[x];
+        }
+    return HunlFeaturizer::features(1, flop, 3, pot, stack_, beta, cc.pct,
+                                    eq0, eq1);
+}
+
 void HunlNetOracle::value_boards(
     poker_ppo::PokerEnvironment& env,
     const std::vector<std::array<uint8_t, 3>>& flops,
@@ -482,9 +569,8 @@ void HunlNetOracle::value_boards(
     torch::NoGradGuard ng;
     auto X = torch::empty({N, HunlFeaturizer::kDim}, torch::kFloat);
     for (long r = 0; r < N; ++r) {
-        auto f = HunlFeaturizer::features(
-            1, flops[static_cast<size_t>(r)].data(), 3, pot, stack_,
-            betas[static_cast<size_t>(r)]);
+        auto f = flop_features(flops[static_cast<size_t>(r)].data(), pot,
+                               betas[static_cast<size_t>(r)]);
         std::copy(f.begin(), f.end(),
                   X.data_ptr<float>() +
                       static_cast<size_t>(r) * HunlFeaturizer::kDim);

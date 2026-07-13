@@ -21,6 +21,7 @@
 #include <array>
 #include <memory>
 #include <random>
+#include <unordered_map>
 #include <vector>
 
 #include "hunl_solver.h"
@@ -112,14 +113,28 @@ public:
                      std::vector<std::array<std::vector<double>, 2>>& outs)
         override;
     // preflop leaves: one forward for a whole leaf's sampled flops (the
-    // fixed set recurs every refresh — features come from the same
-    // deterministic per-board runout subset, so per-flop strength context
-    // is computed inside HunlFeaturizer directly)
+    // fixed set recurs every leaf × refresh AND across solves — pf_seed
+    // is fixed per agent — so the per-flop runout evaluators live in
+    // flop_ctx_, not in HunlFeaturizer)
     void value_boards(poker_ppo::PokerEnvironment& env,
                       const std::vector<std::array<uint8_t, 3>>& flops,
                       const std::vector<HunlPBS>& betas,
                       std::vector<std::array<std::vector<double>, 2>>& outs)
         override;
+    // per-flop strength context: the 32 deterministic runout evaluators +
+    // E[percentile] are beta-independent (cached); equity blocks depend
+    // on beta and are recomputed per query from the cached evaluators.
+    // MUST replicate HunlFeaturizer's nb==3 math bit-exactly — training
+    // rows use the uncached path; `rebel_hunl flopctx_check` verifies.
+    struct FlopCtx {
+        std::array<std::array<uint8_t, 2>, 32> runouts{};
+        std::array<std::unique_ptr<RiverEval>, 32> ev;
+        std::vector<double> pct, nrun;
+    };
+    // cache-backed replica of HunlFeaturizer::features(1, flop, 3, ...) —
+    // public so flopctx_check can compare the two paths
+    std::vector<float> flop_features(const uint8_t* flop, double pot,
+                                     const HunlPBS& beta);
 
 private:
     HunlValueNet net_;
@@ -128,6 +143,9 @@ private:
     std::array<CardCtx, kCards> ctx_{};
     std::array<uint8_t, 5> ctx_board_{255, 255, 255, 255, 255};
     int ctx_nb_ = -1;
+    // keyed by sorted 3-card triple (matches the featurizer's sorted
+    // runout hash: any ordering of a flop shares one context)
+    std::unordered_map<uint32_t, FlopCtx> flop_ctx_;
 };
 
 // Migrate a dataset file written by the pre-hand-strength featurizer
