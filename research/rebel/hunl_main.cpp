@@ -737,6 +737,14 @@ int main(int argc, char** argv) {
         pc.t_river = env_i("REBEL_T_RIVER", 200);
         pc.t_flop  = env_i("REBEL_T_FLOP", 60);
         pc.flop_solve = env_i("REBEL_FLOP", 1) != 0;
+        // preflop re-solving (sampled-flop leaves valued by the net) —
+        // OFF until a street-1-trained net exists; REBEL_PREFLOP=1 to try
+        pc.preflop_solve = env_i("REBEL_PREFLOP", 0) != 0;
+        pc.t_preflop     = env_i("REBEL_T_PREFLOP", 40);
+        pc.pf_samples    = env_i("REBEL_PF_SAMPLES", 64);
+        if (pc.preflop_solve)
+            std::printf("lbr: PREFLOP re-solving ON (T=%d, %d sampled "
+                        "flops/leaf)\n", pc.t_preflop, pc.pf_samples);
         // default OFF: paired 20k A/B measured a wash (1.909 off vs 1.963
         // on, seed 1234) with a worse fold profile — the net-priced
         // alternatives run generous, combos terminate, the follow-range
@@ -778,18 +786,26 @@ int main(int argc, char** argv) {
         }
         return convert_dataset(argv[2], argv[3]);
     }
-    if (mode == "train_turn" || mode == "train_river") {
+    if (mode == "train_turn" || mode == "train_river" ||
+        mode == "train_flop") {
         EndgameConfig cfg;
         cfg.river_only = (mode == "train_river");
+        cfg.flop_mode = (mode == "train_flop");
         if (cfg.river_only) {
             cfg.episodes = 2000;   // direct river targets per epoch
             cfg.sgd_steps = 500;
+        }
+        if (cfg.flop_mode) {
+            cfg.episodes = 50;   // a flop episode ≈ 1 flop + ~3 turn solves
+            cfg.harvest = 2;
         }
         if (argc > 2) cfg.epochs = std::atoi(argv[2]);
         if (argc > 3) cfg.episodes = std::atoi(argv[3]);
         auto env_int = [](const char* name, int& v) {
             if (const char* s = std::getenv(name)) v = std::atoi(s);
         };
+        env_int("REBEL_T_FLOP", cfg.t_flop);
+        env_int("REBEL_T_TURN_TRAIN", cfg.t_turn);
         env_int("REBEL_THREADS", cfg.threads);
         env_int("REBEL_GPU_BATCH", cfg.gpu_batch);
         env_int("REBEL_HARVEST", cfg.harvest);
@@ -818,6 +834,8 @@ int main(int argc, char** argv) {
         tr.run();
         return 0;
     }
-    std::fprintf(stderr, "mode must be kernels|river|turn|train_turn\n");
+    std::fprintf(stderr,
+                 "mode must be kernels|river|turn|train_turn|train_river|"
+                 "train_flop|lbr\n");
     return 1;
 }

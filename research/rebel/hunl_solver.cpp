@@ -218,6 +218,55 @@ void HunlSolver::reaches_to(int target, bool average, std::vector<double>& r0,
 
 void HunlSolver::refresh_leaves() {
     if (oracle_ == nullptr || leaf_ids_.empty()) return;
+    if (nb_root_ == 0) {
+        // preflop: fixed sampled-flop leaf set, drawn once
+        if (pf_flops_.empty()) {
+            std::mt19937_64 rng(pf_seed);
+            std::vector<uint8_t> deck(kCards);
+            for (int c = 0; c < kCards; ++c)
+                deck[static_cast<size_t>(c)] = static_cast<uint8_t>(c);
+            for (int k = 0; k < pf_samples; ++k) {
+                for (int j = 0; j < 3; ++j)
+                    std::swap(deck[static_cast<size_t>(j)],
+                              deck[static_cast<size_t>(
+                                  j + rng() % (kCards - j))]);
+                pf_flops_.push_back({deck[0], deck[1], deck[2]});
+            }
+            const auto& ct = ComboTable::get();
+            pf_cnt_.assign(kCombos, 0.0);
+            for (int x = 0; x < kCombos; ++x)
+                for (const auto& f : pf_flops_) {
+                    bool hit = false;
+                    for (int j = 0; j < 3; ++j)
+                        if (f[j] == ct.cards[x][0] ||
+                            f[j] == ct.cards[x][1])
+                            hit = true;
+                    if (!hit) pf_cnt_[x] += 1.0;
+                }
+            leaf_v_pf_.resize(nodes_.size());
+        }
+        for (int L : leaf_ids_) {
+            std::vector<double> r0, r1;
+            reaches_to(L, /*average=*/true, r0, r1);
+            env_.push_state();
+            for (int a : nodes_[L].path) env_.step(a);
+            std::vector<HunlPBS> betas;
+            betas.reserve(pf_flops_.size());
+            for (const auto& f : pf_flops_) {
+                HunlPBS beta;
+                beta.r0 = r0;
+                beta.r1 = r1;
+                for (int j = 0; j < 3; ++j) {
+                    mask_card(beta.r0, f[j]);
+                    mask_card(beta.r1, f[j]);
+                }
+                betas.push_back(std::move(beta));
+            }
+            oracle_->value_boards(env_, pf_flops_, betas, leaf_v_pf_[L]);
+            env_.pop_state();
+        }
+        return;
+    }
     for (int L : leaf_ids_) {
         auto& per = leaf_v_[L];
         per.assign(kCards, {});
@@ -296,6 +345,40 @@ std::vector<double> HunlSolver::walk(int i, int upd, int t, bool update,
         return cfv;
     }
     case Node::StreetEnd: {
+        if (nb_root_ == 0) {
+            // preflop: aggregate the sampled flops; a combo averages only
+            // over flops its own cards don't knock out (pf_cnt_)
+            if (leaf_v_pf_.empty() || leaf_v_pf_[static_cast<size_t>(i)]
+                                          .empty())
+                return cfv;
+            const auto& per = leaf_v_pf_[static_cast<size_t>(i)];
+            for (size_t f = 0; f < pf_flops_.size(); ++f) {
+                const auto& fl = pf_flops_[f];
+                const auto& v = per[f][static_cast<size_t>(upd)];
+                if (v.empty()) continue;
+                double S = 0.0, Sc[kCards] = {};
+                for (int j = 0; j < kCombos; ++j) {
+                    if (opp_reach[j] <= 0.0) continue;
+                    const int a = ct.cards[j][0], b = ct.cards[j][1];
+                    if (a == fl[0] || a == fl[1] || a == fl[2] ||
+                        b == fl[0] || b == fl[1] || b == fl[2])
+                        continue;
+                    S += opp_reach[j];
+                    Sc[a] += opp_reach[j];
+                    Sc[b] += opp_reach[j];
+                }
+                for (int x = 0; x < kCombos; ++x) {
+                    if (!valid_[x] || pf_cnt_[x] <= 0.0) continue;
+                    const int a = ct.cards[x][0], b = ct.cards[x][1];
+                    if (a == fl[0] || a == fl[1] || a == fl[2] ||
+                        b == fl[0] || b == fl[1] || b == fl[2])
+                        continue;
+                    const double mass = S - Sc[a] - Sc[b] + opp_reach[x];
+                    if (mass > 0.0) cfv[x] += v[x] * mass / pf_cnt_[x];
+                }
+            }
+            return cfv;
+        }
         if (leaf_v_[i].empty()) return cfv;   // no oracle: values 0 (unused)
         const double n_rem = 52.0 - nb_root_ - 4.0;
         for (int c = 0; c < kCards; ++c) {
@@ -557,6 +640,8 @@ std::vector<double> HunlSolver::best_response(int p,
 }
 
 double HunlSolver::exploitability_composed(int t_river) {
+    TORCH_CHECK(nb_root_ > 0,
+                "composed BR assumes single-card chance (not preflop)");
     const auto& ct = ComboTable::get();
     const double n_rem = 52.0 - nb_root_ - 4.0;
     // composed BR leaf values per (StreetEnd, player), aggregated over cards
@@ -677,6 +762,8 @@ void HunlSolver::root_values(std::array<std::vector<double>, 2>& v,
 
 bool HunlSolver::sample_leaf(std::mt19937& rng, double eps, int explorer,
                              int* leaf_node, uint8_t* card, HunlPBS* beta) {
+    if (nb_root_ == 0) return false;   // preflop t*-leaf = train_preflop,
+                                       // a later stage (3-card sample)
     std::uniform_real_distribution<double> u01(0.0, 1.0);
     const auto& ct = ComboTable::get();
     // sample compatible (hero, villain) combos from the root ranges

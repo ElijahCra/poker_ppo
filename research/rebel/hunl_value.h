@@ -111,6 +111,15 @@ public:
                      const std::vector<HunlPBS>& betas,
                      std::vector<std::array<std::vector<double>, 2>>& outs)
         override;
+    // preflop leaves: one forward for a whole leaf's sampled flops (the
+    // fixed set recurs every refresh — features come from the same
+    // deterministic per-board runout subset, so per-flop strength context
+    // is computed inside HunlFeaturizer directly)
+    void value_boards(poker_ppo::PokerEnvironment& env,
+                      const std::vector<std::array<uint8_t, 3>>& flops,
+                      const std::vector<HunlPBS>& betas,
+                      std::vector<std::array<std::vector<double>, 2>>& outs)
+        override;
 
 private:
     HunlValueNet net_;
@@ -175,6 +184,13 @@ struct EndgameConfig {
     // train_river mode: direct river-situation sampling (DeepStack recipe) —
     // no turn solves at all; `episodes` = river targets per epoch.
     bool   river_only   = false;
+    // train_flop mode: direct flop-situation sampling — flop subgames
+    // solved with net TURN-root leaves; emits one street-1 (flop-root)
+    // iterate-avg row per solve PLUS `harvest` street-2 rows from
+    // net-leaf turn solves at the flop solve's own (leaf, card) query
+    // distribution — the street-2 volume machine the flop lever needs.
+    bool   flop_mode    = false;
+    int    t_flop       = 60;
     // >0: solve river targets in GPU lockstep batches of this size
     // (BatchRiverSolver; equivalence-validated vs the CPU solver). CPU
     // workers build specs; the device does the solving.
@@ -216,6 +232,15 @@ private:
                          const HunlPBS& beta, std::vector<Sample>& out);
     void direct_river_episode(poker_ppo::PokerEnvironment& env,
                               std::mt19937& rng, std::vector<Sample>& fresh);
+    // train_flop episode: flop solve (net turn leaves) → street-1 root
+    // row + street-2 rows from harvested net-leaf turn solves
+    void flop_episode(poker_ppo::PokerEnvironment& env, std::mt19937& rng,
+                      std::vector<Sample>& fresh);
+    // emit the solver's iterate-averaged ROOT values as a training row
+    // (shared by the turn/flop episode paths). beta = raw root ranges.
+    void emit_root_sample(poker_ppo::PokerEnvironment& env, HunlSolver& s,
+                          const HunlPBS& beta, const uint8_t* board, int nb,
+                          int street, std::vector<Sample>& fresh);
     // GPU path: CPU workers sample specs (board/pot/ranges/tree shape), the
     // device solves them in lockstep batches; appends `episodes` samples.
     // Runs on its own env pool so it can PIPELINE with the CPU worker pool

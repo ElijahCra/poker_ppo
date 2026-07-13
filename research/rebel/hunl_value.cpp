@@ -121,7 +121,67 @@ std::vector<float> HunlFeaturizer::features(int street, const uint8_t* board,
             }
         return features(street, board, nb, pot, stack, beta, pct, eq0, eq1);
     }
-    // flop/preflop roots: strength blocks pending (two-street expectation)
+    if (nb == 3) {
+        // Flop-root rows / preflop-solve leaf queries: strength blocks as
+        // an expectation over a FIXED per-board runout subset (32 of the
+        // 1176 turn+river completions, seeded by a board hash) — the
+        // determinism is the self-consistency requirement: training rows
+        // and play-time queries at the same flop compute identical
+        // features. Exact two-street expectation is ~35× the cost for a
+        // sub-noise refinement.
+        const auto& ct = ComboTable::get();
+        std::vector<double> pct(kCombos, 0.0), eq0(kCombos, 0.0),
+            eq1(kCombos, 0.0), n(kCombos, 0.0);
+        uint64_t key = 1469598103934665603ull;
+        for (int b = 0; b < 3; ++b)
+            key = (key ^ board[b]) * 1099511628211ull;
+        std::mt19937_64 rr(key);
+        std::vector<uint8_t> rem;
+        for (int c = 0; c < kCards; ++c) {
+            bool dead = false;
+            for (int b = 0; b < 3; ++b)
+                if (board[b] == c) dead = true;
+            if (!dead) rem.push_back(static_cast<uint8_t>(c));
+        }
+        std::array<uint8_t, 5> b5{};
+        for (int b = 0; b < 3; ++b) b5[b] = board[b];
+        std::vector<double> pc, e0, e1, opp;
+        for (int s2 = 0; s2 < 32; ++s2) {
+            const size_t i1 = rr() % rem.size();
+            size_t i2 = rr() % (rem.size() - 1);
+            if (i2 >= i1) ++i2;
+            b5[3] = rem[i1];
+            b5[4] = rem[i2];
+            RiverEval ev(b5.data());
+            ev.percentile(pc);
+            auto masked = [&](const std::vector<double>& r) {
+                opp = r;
+                for (int i = 0; i < kCombos; ++i)
+                    if (ct.cards[i][0] == b5[3] || ct.cards[i][1] == b5[3] ||
+                        ct.cards[i][0] == b5[4] || ct.cards[i][1] == b5[4])
+                        opp[i] = 0.0;
+                return &opp;
+            };
+            equity_vs_range(ev, *masked(beta.r1), e0);
+            std::vector<double> e0copy = e0;
+            equity_vs_range(ev, *masked(beta.r0), e1);
+            for (int x = 0; x < kCombos; ++x) {
+                if (!ev.valid()[x]) continue;
+                pct[x] += pc[x];
+                eq0[x] += e0copy[x];
+                eq1[x] += e1[x];
+                n[x] += 1.0;
+            }
+        }
+        for (int x = 0; x < kCombos; ++x)
+            if (n[x] > 0.0) {
+                pct[x] /= n[x];
+                eq0[x] /= n[x];
+                eq1[x] /= n[x];
+            }
+        return features(street, board, nb, pot, stack, beta, pct, eq0, eq1);
+    }
+    // preflop root: strength blocks pending (train_preflop stage)
     return features(street, board, nb, pot, stack, beta, kZero, kZero,
                     kZero);
 }
@@ -408,6 +468,38 @@ int convert_dataset(const std::string& in, const std::string& out) {
     return 0;
 }
 
+void HunlNetOracle::value_boards(
+    poker_ppo::PokerEnvironment& env,
+    const std::vector<std::array<uint8_t, 3>>& flops,
+    const std::vector<HunlPBS>& betas,
+    std::vector<std::array<std::vector<double>, 2>>& outs) {
+    const long N = static_cast<long>(flops.size());
+    outs.resize(flops.size());
+    if (N == 0) return;
+    const double contrib =
+        static_cast<double>(env.game_config().initial_stack) - env.stack(0);
+    const double pot = 2.0 * contrib;
+    torch::NoGradGuard ng;
+    auto X = torch::empty({N, HunlFeaturizer::kDim}, torch::kFloat);
+    for (long r = 0; r < N; ++r) {
+        auto f = HunlFeaturizer::features(
+            1, flops[static_cast<size_t>(r)].data(), 3, pot, stack_,
+            betas[static_cast<size_t>(r)]);
+        std::copy(f.begin(), f.end(),
+                  X.data_ptr<float>() +
+                      static_cast<size_t>(r) * HunlFeaturizer::kDim);
+    }
+    auto y = net_->forward(X.to(device_)).to(torch::kCPU).contiguous();
+    auto acc = y.accessor<float, 2>();
+    for (long r = 0; r < N; ++r)
+        for (int p = 0; p < 2; ++p) {
+            auto& o = outs[static_cast<size_t>(r)][p];
+            o.assign(kCombos, 0.0);
+            for (int i = 0; i < kCombos; ++i)
+                o[i] = static_cast<double>(acc[r][p * kCombos + i]) * pot;
+        }
+}
+
 EndgameTrainer::EndgameTrainer(EndgameConfig cfg)
     : cfg_(std::move(cfg)),
       stack_(static_cast<double>(
@@ -678,9 +770,9 @@ std::vector<double> EndgameTrainer::random_range(std::mt19937& rng,
             double s;
             if (nb == 5) {
                 s = static_cast<double>(combo_rank(i, board));
-            } else {
-                // pre-river: expected rank over river cards (DeepStack
-                // orders earlier streets by expected hand strength)
+            } else if (nb == 4) {
+                // turn: expected rank over river cards (DeepStack orders
+                // earlier streets by expected hand strength)
                 std::array<uint8_t, 5> b5{};
                 for (int b = 0; b < nb; ++b) b5[b] = board[b];
                 double acc = 0.0;
@@ -691,6 +783,31 @@ std::vector<double> EndgameTrainer::random_range(std::mt19937& rng,
                         if (board[b] == c) dead = true;
                     if (dead) continue;
                     b5[nb] = static_cast<uint8_t>(c);
+                    acc += static_cast<double>(combo_rank(i, b5.data()));
+                    ++cnt;
+                }
+                s = cnt > 0 ? acc / cnt : 0.0;
+            } else {
+                // flop: sampled two-card runouts — ordering quality, not
+                // exactness, is what the recursion needs
+                std::array<uint8_t, 5> b5{};
+                for (int b = 0; b < nb; ++b) b5[b] = board[b];
+                double acc = 0.0;
+                int cnt = 0;
+                for (int s2 = 0; s2 < 8; ++s2) {
+                    uint8_t t2, r2;
+                    do {
+                        t2 = static_cast<uint8_t>(rng() % kCards);
+                    } while (t2 == ct.cards[i][0] || t2 == ct.cards[i][1] ||
+                             t2 == board[0] || t2 == board[1] ||
+                             t2 == board[2]);
+                    do {
+                        r2 = static_cast<uint8_t>(rng() % kCards);
+                    } while (r2 == t2 || r2 == ct.cards[i][0] ||
+                             r2 == ct.cards[i][1] || r2 == board[0] ||
+                             r2 == board[1] || r2 == board[2]);
+                    b5[3] = t2;
+                    b5[4] = r2;
                     acc += static_cast<double>(combo_rank(i, b5.data()));
                     ++cnt;
                 }
@@ -720,6 +837,49 @@ std::vector<double> EndgameTrainer::random_range(std::mt19937& rng,
     std::vector<double> r(kCombos);
     for (double& x : r) x = std::pow(u(rng), k);
     return r;
+}
+
+void EndgameTrainer::emit_root_sample(poker_ppo::PokerEnvironment& env,
+                                      HunlSolver& s, const HunlPBS& beta,
+                                      const uint8_t* board, int nb,
+                                      int street, std::vector<Sample>& fresh) {
+    std::array<std::vector<double>, 2> rv, rm;
+    const double contrib =
+        static_cast<double>(env.game_config().initial_stack) - env.stack(0);
+    if (contrib <= 0.0 || !s.avg_root_values(rv, rm)) return;
+    HunlPBS nbeta = beta;
+    std::vector<uint8_t> vmask;
+    board_valid(board, nb, vmask);
+    double s0 = 0.0, s1 = 0.0;
+    for (int i = 0; i < kCombos; ++i) {
+        if (!vmask[i]) {
+            nbeta.r0[i] = nbeta.r1[i] = 0.0;
+            continue;
+        }
+        s0 += nbeta.r0[i];
+        s1 += nbeta.r1[i];
+    }
+    if (s0 <= 0.0 || s1 <= 0.0) return;
+    for (int i = 0; i < kCombos; ++i) {
+        nbeta.r0[i] /= s0;
+        nbeta.r1[i] /= s1;
+    }
+    const double pot_root = 2.0 * contrib;
+    Sample smp;
+    smp.feat = HunlFeaturizer::features(street, board, nb, pot_root, stack_,
+                                        nbeta);
+    smp.target.assign(2 * kCombos, 0.0f);
+    smp.mask.assign(2 * kCombos, 0.0f);
+    for (int p = 0; p < 2; ++p) {
+        const auto& own = p == 0 ? nbeta.r0 : nbeta.r1;
+        for (int i = 0; i < kCombos; ++i) {
+            if (rm[p][i] < 0.5 || own[i] <= 0.0) continue;
+            smp.target[p * kCombos + i] =
+                static_cast<float>(rv[p][i] / pot_root);
+            smp.mask[p * kCombos + i] = 1.0f;
+        }
+    }
+    fresh.push_back(std::move(smp));
 }
 
 void EndgameTrainer::self_play_episode(poker_ppo::PokerEnvironment& env,
@@ -758,48 +918,7 @@ void EndgameTrainer::self_play_episode(poker_ppo::PokerEnvironment& env,
     // (1/T)·Σ_t v^{π^t}(β_root), bootstrapped through the net's river
     // leaves. Street-2 rows teach the net TURN-ROOT values, the
     // prerequisite for flop solves with net leaves.
-    {
-        std::array<std::vector<double>, 2> rv, rm;
-        const double contrib =
-            static_cast<double>(env.game_config().initial_stack) -
-            env.stack(0);
-        if (contrib > 0.0 && s.avg_root_values(rv, rm)) {
-            HunlPBS nb = beta;
-            std::vector<uint8_t> v4;
-            board_valid(b4, 4, v4);
-            double s0 = 0.0, s1 = 0.0;
-            for (int i = 0; i < kCombos; ++i) {
-                if (!v4[i]) {
-                    nb.r0[i] = nb.r1[i] = 0.0;
-                    continue;
-                }
-                s0 += nb.r0[i];
-                s1 += nb.r1[i];
-            }
-            if (s0 > 0.0 && s1 > 0.0) {
-                for (int i = 0; i < kCombos; ++i) {
-                    nb.r0[i] /= s0;
-                    nb.r1[i] /= s1;
-                }
-                const double pot_root = 2.0 * contrib;
-                Sample smp;
-                smp.feat = HunlFeaturizer::features(2, b4, 4, pot_root,
-                                                    stack_, nb);
-                smp.target.assign(2 * kCombos, 0.0f);
-                smp.mask.assign(2 * kCombos, 0.0f);
-                for (int p = 0; p < 2; ++p) {
-                    const auto& own = p == 0 ? nb.r0 : nb.r1;
-                    for (int i = 0; i < kCombos; ++i) {
-                        if (rm[p][i] < 0.5 || own[i] <= 0.0) continue;
-                        smp.target[p * kCombos + i] =
-                            static_cast<float>(rv[p][i] / pot_root);
-                        smp.mask[p * kCombos + i] = 1.0f;
-                    }
-                }
-                fresh.push_back(std::move(smp));
-            }
-        }
-    }
+    emit_root_sample(env, s, beta, b4, 4, 2, fresh);
 
     // Algorithm 1's t*-sampled continuation leaf (ε-explored coverage)
     if (have) {
@@ -863,6 +982,94 @@ void EndgameTrainer::self_play_episode(poker_ppo::PokerEnvironment& env,
         for (int a : nodes[L].path) env.step(a);
         river_sample_at(env, b5.data(), lb, fresh);
         env.pop_state();
+    }
+}
+
+void EndgameTrainer::flop_episode(poker_ppo::PokerEnvironment& env,
+                                  std::mt19937& rng,
+                                  std::vector<Sample>& fresh) {
+    for (int tries = 0; tries < 50; ++tries)
+        if (sample_street_root(env, rng, 1)) break;
+    if (env.is_terminal() || env.round() != 1) return;
+
+    uint8_t b3[3];
+    for (int i = 0; i < 3; ++i)
+        b3[i] = static_cast<uint8_t>(env.community_card(i));
+    HunlPBS beta;
+    beta.r0 = random_range(rng, b3, 3);
+    beta.r1 = random_range(rng, b3, 3);
+    HunlNetOracle oracle(net_, stack_, device_);
+    HunlSolver s(env, beta, &oracle, cfg_.actions);
+    s.refresh_every = 10;   // net leaves at turn boards; play uses 10 too
+    s.track_root_values();
+
+    std::uniform_int_distribution<int> dt(1, cfg_.t_flop);
+    const int tstar = dt(rng);
+    const int explorer = static_cast<int>(rng() & 1);
+    int leaf = -1;
+    uint8_t card = 0;
+    HunlPBS leaf_beta;
+    bool have = false;
+    for (int t = 1; t <= cfg_.t_flop; ++t) {
+        s.iterate(t);
+        if (t == tstar)
+            have = s.sample_leaf(rng, cfg_.eps_explore, explorer, &leaf,
+                                 &card, &leaf_beta);
+    }
+
+    // street-1 row: iterate-averaged FLOP-ROOT values, bootstrapped
+    // through the net's turn leaves — the training signal a preflop
+    // solver needs at ITS leaves.
+    emit_root_sample(env, s, beta, b3, 3, 1, fresh);
+
+    // a harvested (leaf, card) turn PBS becomes one turn solve whose
+    // iterate-averaged root values are a street-2 row on the FLOP query
+    // distribution (self-consistency: turn rows so far came from
+    // random-range roots, not from flop-solve leaf beliefs).
+    const auto& nodes = s.nodes();
+    auto turn_root_sample = [&](int L, uint8_t c, const HunlPBS& lb) {
+        std::array<uint8_t, 5> b4 = s.board();
+        b4[s.board_count()] = c;
+        env.push_state();
+        for (int a : nodes[L].path) env.step(a);
+        // board override: the env dealt its own turn card
+        HunlSolver ts(env, lb, &oracle, cfg_.actions, b4.data(), 4);
+        ts.refresh_every = 5;
+        ts.track_root_values();
+        const int T = std::max(1, cfg_.t_turn / 2);
+        for (int t = 1; t <= T; ++t) ts.iterate(t);
+        emit_root_sample(env, ts, lb, b4.data(), 4, 2, fresh);
+        env.pop_state();
+    };
+
+    // Algorithm 1's t*-sampled continuation leaf (ε-explored coverage)
+    if (have) turn_root_sample(leaf, card, leaf_beta);
+
+    // final-average-belief harvest — turn solves are ~50× a river solve,
+    // so take far fewer than the turn path's cfg_.harvest
+    std::vector<int> leaves;
+    for (size_t i = 0; i < nodes.size(); ++i)
+        if (nodes[i].kind == HunlSolver::Node::StreetEnd)
+            leaves.push_back(static_cast<int>(i));
+    if (leaves.empty()) return;
+    const int H = std::max(1, std::min(cfg_.harvest, 2));
+    for (int h = 0; h < H; ++h) {
+        const int L = leaves[rng() % leaves.size()];
+        uint8_t c;
+        while (true) {
+            c = static_cast<uint8_t>(rng() % kCards);
+            bool dead = false;
+            for (int b = 0; b < s.board_count(); ++b)
+                if (s.board()[b] == c) dead = true;
+            if (!dead) break;
+        }
+        HunlPBS lb;
+        s.beliefs_at(L, lb.r0, lb.r1);
+        const auto& ct = ComboTable::get();
+        for (int i = 0; i < kCombos; ++i)
+            if (ct.cards[i][0] == c || ct.cards[i][1] == c)
+                lb.r0[i] = lb.r1[i] = 0.0;
+        turn_root_sample(L, c, lb);
     }
 }
 
@@ -1175,10 +1382,13 @@ void EndgameTrainer::run() {
     if (W > 1) torch::set_num_threads(1);   // workers ARE the parallelism
     std::printf("HUNL endgame ReBeL (%s): T_turn=%d T_river=%d episodes=%d "
                 "epochs=%d hidden=%dx%d%s sgd=%d batch=%d lr=%g",
-                cfg_.river_only ? "direct-river" : "turn-selfplay",
+                cfg_.river_only ? "direct-river"
+                                : cfg_.flop_mode ? "flop-selfplay"
+                                                 : "turn-selfplay",
                 cfg_.t_turn, cfg_.t_river, cfg_.episodes, cfg_.epochs,
                 cfg_.hidden, cfg_.layers, cfg_.gelu_ln ? "(gelu+ln)" : "",
                 cfg_.sgd_steps, cfg_.batch, cfg_.lr);
+    if (cfg_.flop_mode) std::printf(" T_flop=%d", cfg_.t_flop);
     if (cfg_.lr_final > 0.0) std::printf("->%g", cfg_.lr_final);
     if (cfg_.huber_delta > 0.0)
         std::printf(" loss=huber(%g)", cfg_.huber_delta);
@@ -1271,6 +1481,8 @@ void EndgameTrainer::run() {
                 if (e >= e_cpu) break;
                 if (cfg_.river_only)
                     direct_river_episode(*envs[w], wrng, fresh_w[w]);
+                else if (cfg_.flop_mode)
+                    flop_episode(*envs[w], wrng, fresh_w[w]);
                 else
                     self_play_episode(*envs[w], wrng, fresh_w[w]);
             }

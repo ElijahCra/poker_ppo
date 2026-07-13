@@ -45,6 +45,17 @@ struct HunlValueOracle {
     // dealt card is irrelevant — the candidate board is passed explicitly).
     // out[p][combo] = E[chips_p | hold combo, opp ~ beta.r_{-p} \ overlap].
     virtual ~HunlValueOracle() = default;
+    // Multi-card chance (preflop→flop leaves): value the flop-root PBS for
+    // each sampled 3-card completion. Only net oracles implement this —
+    // an exact flop oracle would be a full two-street re-solve per query.
+    virtual void value_boards(
+        poker_ppo::PokerEnvironment& env,
+        const std::vector<std::array<uint8_t, 3>>& flops,
+        const std::vector<HunlPBS>& betas,
+        std::vector<std::array<std::vector<double>, 2>>& outs) {
+        (void)env; (void)flops; (void)betas; (void)outs;
+        TORCH_CHECK(false, "this oracle has no multi-card leaf support");
+    }
     virtual void value(poker_ppo::PokerEnvironment& env, const uint8_t* board,
                        int nb, const HunlPBS& beta,
                        std::array<std::vector<double>, 2>& out) = 0;
@@ -96,6 +107,14 @@ public:
     // each refresh costs |leaves|×48 full next-street re-solves. Net oracles
     // are cheap enough to keep k=1.
     int refresh_every = 1;
+    // Preflop subgames only: a StreetEnd chance is a 3-card flop (~19.6k
+    // branches — enumeration is ruinous). The solver draws pf_samples
+    // flops ONCE (deterministic in pf_seed) at the first refresh and
+    // treats them as the fixed leaf set: values via the oracle's
+    // value_boards, aggregation with per-combo compatible-sample counts
+    // (a combo's own cards knock out flops containing them).
+    int      pf_samples = 64;
+    uint64_t pf_seed = 20260713;
     // Subgame exploitability of the current average profile in chips/hand
     // (normalized by joint compatible mass; 0 at equilibrium). Exact when
     // there are no StreetEnd leaves; with an oracle it is BR within the
@@ -210,6 +229,11 @@ private:
     std::vector<int>     leaf_ids_;
     // StreetEnd leaf values per node per candidate card: [node][card][p][combo]
     std::vector<std::vector<std::array<std::vector<double>, 2>>> leaf_v_;
+    // preflop: sampled flop set + per-leaf values [node][flop_idx][p][combo]
+    // + per-combo count of compatible sampled flops (the divisor)
+    std::vector<std::array<uint8_t, 3>> pf_flops_;
+    std::vector<std::vector<std::array<std::vector<double>, 2>>> leaf_v_pf_;
+    std::vector<double>  pf_cnt_;
     // board-cached showdown evaluators: [0] = root board (river subgames);
     // per-runout entries for AllinShowdown (keyed by the runout card)
     std::unique_ptr<RiverEval> river_eval_;

@@ -69,6 +69,14 @@ struct RebelPlayConfig {
     // 1.60 → 3.41) — the Leduc oracle-sharpening effect: iterations
     // amplify a thin net's bias. Re-enable as street-2 data grows.
     bool   flop_solve = true;
+    // true → re-solve from the PREFLOP root too (no blueprint anywhere).
+    // Preflop StreetEnd chances are 3-card flops: the solver values
+    // pf_samples sampled flops via the net's value_boards (see
+    // HunlSolver::pf_samples). Uses the flop action set — same all-in /
+    // multi-street-showdown reasoning, one street earlier.
+    bool   preflop_solve = false;
+    int    t_preflop     = 40;
+    int    pf_samples    = 64;   // sampled flops per preflop leaf
     uint64_t seed     = 0;
 };
 
@@ -106,7 +114,9 @@ private:
 
     // first street the agent re-solves; earlier streets play/track under
     // the blueprint
-    int solve_from() const { return cfg_.flop_solve ? 1 : 2; }
+    int solve_from() const {
+        return cfg_.preflop_solve ? 0 : cfg_.flop_solve ? 1 : 2;
+    }
     // mask newly revealed board cards out of both ranges; clear the solve
     // cache on street changes
     void sync_public(poker_ppo::PokerEnvironment& env);

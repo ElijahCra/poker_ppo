@@ -172,9 +172,12 @@ std::pair<HunlSolver*, int> RebelTarget::solve_at(PokerEnvironment& env) {
     auto solver = std::make_unique<HunlSolver>(
         env, pbs_, river ? nullptr : oracle_.get(),
         river ? cfg_.actions_river
-              : round == 1 ? cfg_.actions_flop : cfg_.actions);
+              : round <= 1 ? cfg_.actions_flop : cfg_.actions);
     solver->refresh_every =
-        round == 1 ? cfg_.refresh_flop : cfg_.refresh_every;
+        round <= 1 ? cfg_.refresh_flop : cfg_.refresh_every;
+    solver->pf_samples = cfg_.pf_samples;
+    if (cfg_.seed)   // sampled preflop-leaf flops vary per shard
+        solver->pf_seed = cfg_.seed * 6364136223846793005ull + 1442695040888963407ull;
     if (river && cfg_.gadget && seat_ >= 0) {
         // a mid-street fresh solve (off-tree action) inherits alternatives
         // from the deepest in-tree node of a previous river solve — the
@@ -209,7 +212,8 @@ std::pair<HunlSolver*, int> RebelTarget::solve_at(PokerEnvironment& env) {
                                       1 - seat_)], cfg_.gadget_mix);
     }
     const int T = river ? cfg_.t_river
-                : round == 2 ? cfg_.t_turn : cfg_.t_flop;
+                : round == 2 ? cfg_.t_turn
+                : round == 1 ? cfg_.t_flop : cfg_.t_preflop;
     for (int t = 1; t <= T; ++t) solver->iterate(t);
     cache_.push_back(Solve{log, std::move(solver)});
     return {cache_.back().solver.get(), 0};
