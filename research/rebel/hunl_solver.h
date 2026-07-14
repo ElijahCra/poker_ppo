@@ -184,9 +184,11 @@ public:
     // Algorithm 1 SampleLeaf under the current AVERAGE profile (CFR-AVG
     // pairing): samples compatible private hands from the root ranges, walks
     // sampled actions (ε-uniform for `explorer`'s decisions), samples the
-    // next card at a StreetEnd. Returns false if the walk hit a terminal
-    // (episode over); else fills leaf node id, card, and the leaf PBS
-    // (avg-policy Bayes posteriors, card-masked, normalized).
+    // next street's chance at a StreetEnd — one card, or the 3-card flop
+    // when this is a preflop root (`card` must then point to 3 writable
+    // bytes). Returns false if the walk hit a terminal (episode over); else
+    // fills leaf node id, card(s), and the leaf PBS (avg-policy Bayes
+    // posteriors, card-masked, normalized).
     bool sample_leaf(std::mt19937& rng, double eps, int explorer,
                      int* leaf_node, uint8_t* card, HunlPBS* beta);
 

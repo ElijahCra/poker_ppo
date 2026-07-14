@@ -320,7 +320,63 @@ void RebelTarget::note_action(PokerEnvironment& env, int action) {
             k = static_cast<int>(j);
             break;
         }
-    if (k < 0) return;   // off-abstraction (LBR raise size): keep range
+    if (k < 0) {
+        // Off-tree raise: pseudo-harmonic action mapping (Ganzfried &
+        // Sandholm 2013) onto the two nearest in-tree sizes A ≤ x ≤ B
+        // (pot fractions; call counts as size 0). Skipping the update —
+        // the old behavior — leaks: the raiser's range stays
+        // un-conditioned on the raise, a blind spot an exploiter can
+        // aim off-tree sizes at. The observation likelihood becomes
+        // w·π(A|combo) + (1−w)·π(B|combo), w from the harmonic map.
+        if (action < 2) return;   // non-raise: nothing to map
+        static const double kFrac[13] = {0,   0,   0.25, 0.33, 0.5,
+                                         0.66, 0.75, 1.0, 1.25, 1.5,
+                                         2.0, 2.5, 3.0};
+        const double c   = static_cast<double>(env.amount_to_call());
+        const double pot = static_cast<double>(env.pot());
+        auto frac_of = [&](int a) {
+            if (a == 1) return 0.0;
+            if (a >= 2 && a <= 12) return kFrac[a];
+            // all-in: raise-by as a fraction of the called pot
+            return (static_cast<double>(env.stack(seat)) - c) /
+                   std::max(1.0, pot + c);
+        };
+        const double x = frac_of(action);
+        int ka = -1, kb = -1;
+        double fa = 0.0, fb = 0.0;
+        for (size_t j = 0; j < nd.acts.size(); ++j) {
+            const int a = nd.acts[j];
+            if (a == 0) continue;   // fold is not a size
+            const double f = frac_of(a);
+            if (f <= x && (ka < 0 || f > fa)) {
+                ka = static_cast<int>(j);
+                fa = f;
+            }
+            if (f >= x && (kb < 0 || f < fb)) {
+                kb = static_cast<int>(j);
+                fb = f;
+            }
+        }
+        if (ka < 0 && kb < 0) return;
+        if (ka < 0) {   // below every in-tree size: full weight above
+            ka = kb;
+            kb = -1;
+        }
+        double w = 1.0;   // kb<0 (above every size): clamp to largest
+        if (kb >= 0 && kb != ka && fb > fa)
+            w = ((fb - x) * (1.0 + fa)) / ((fb - fa) * (1.0 + x));
+        w = std::min(1.0, std::max(0.0, w));
+        std::vector<double> col(kCombos, 0.0);
+        for (int i = 0; i < kCombos; ++i) {
+            const auto pol = s->avg_policy(node, i);
+            double p = w * pol[static_cast<size_t>(ka)];
+            if (kb >= 0 && kb != ka)
+                p += (1.0 - w) * pol[static_cast<size_t>(kb)];
+            col[static_cast<size_t>(i)] = p;
+        }
+        apply_range_update(seat, col);
+        return;
+    }
     std::vector<double> col(kCombos, 0.0);
     for (int i = 0; i < kCombos; ++i)
         col[static_cast<size_t>(i)] =

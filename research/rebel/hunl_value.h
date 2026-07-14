@@ -209,6 +209,15 @@ struct EndgameConfig {
     // distribution — the street-2 volume machine the flop lever needs.
     bool   flop_mode    = false;
     int    t_flop       = 60;
+    // train_root mode: Algorithm 1 from the GAME ROOT — preflop solve at
+    // uniform ranges (sampled-flop leaves), then flop/turn continuations
+    // from its own sampled + harvested leaf PBSs. Street-1/2 rows land on
+    // the DEPLOYED agent's query distribution instead of random_range
+    // synthetics — the self-consistency closure. No street-0 rows are
+    // emitted (no solver queries preflop-root values).
+    bool   root_mode    = false;
+    int    t_preflop    = 40;
+    int    pf_samples   = 64;   // sampled flop leaves per preflop solve
     // >0: solve river targets in GPU lockstep batches of this size
     // (BatchRiverSolver; equivalence-validated vs the CPU solver). CPU
     // workers build specs; the device does the solving.
@@ -253,6 +262,17 @@ private:
     // train_flop episode: flop solve (net turn leaves) → street-1 root
     // row + street-2 rows from harvested net-leaf turn solves
     void flop_episode(poker_ppo::PokerEnvironment& env, std::mt19937& rng,
+                      std::vector<Sample>& fresh);
+    // solve the flop PBS at the env's CURRENT state (board_override b3:
+    // the env may have dealt different cards) → street-1 row + street-2
+    // turn continuations. Shared by flop_episode (random roots) and
+    // root_episode (preflop-solve leaf PBSs).
+    void flop_continue(poker_ppo::PokerEnvironment& env, const uint8_t* b3,
+                       const HunlPBS& beta, std::mt19937& rng,
+                       std::vector<Sample>& fresh);
+    // train_root episode: Algorithm 1 from the TRUE game root — preflop
+    // solve at uniform ranges, flop continuations at its own leaf PBSs
+    void root_episode(poker_ppo::PokerEnvironment& env, std::mt19937& rng,
                       std::vector<Sample>& fresh);
     // emit the solver's iterate-averaged ROOT values as a training row
     // (shared by the turn/flop episode paths). beta = raw root ranges.

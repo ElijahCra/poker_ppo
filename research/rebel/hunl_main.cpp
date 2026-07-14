@@ -841,10 +841,11 @@ int main(int argc, char** argv) {
         return convert_dataset(argv[2], argv[3]);
     }
     if (mode == "train_turn" || mode == "train_river" ||
-        mode == "train_flop") {
+        mode == "train_flop" || mode == "train_root") {
         EndgameConfig cfg;
         cfg.river_only = (mode == "train_river");
         cfg.flop_mode = (mode == "train_flop");
+        cfg.root_mode = (mode == "train_root");
         if (cfg.river_only) {
             cfg.episodes = 2000;   // direct river targets per epoch
             cfg.sgd_steps = 500;
@@ -853,6 +854,10 @@ int main(int argc, char** argv) {
             cfg.episodes = 50;   // a flop episode ≈ 1 flop + ~3 turn solves
             cfg.harvest = 2;
         }
+        if (cfg.root_mode) {
+            cfg.episodes = 30;   // ≈ 1 preflop + ~3 flop continuations,
+            cfg.harvest = 2;     //   each ≈ 1 flop + ~3 turn solves
+        }
         if (argc > 2) cfg.epochs = std::atoi(argv[2]);
         if (argc > 3) cfg.episodes = std::atoi(argv[3]);
         auto env_int = [](const char* name, int& v) {
@@ -860,6 +865,8 @@ int main(int argc, char** argv) {
         };
         env_int("REBEL_T_FLOP", cfg.t_flop);
         env_int("REBEL_T_TURN_TRAIN", cfg.t_turn);
+        env_int("REBEL_T_PREFLOP", cfg.t_preflop);
+        env_int("REBEL_PF_SAMPLES", cfg.pf_samples);
         env_int("REBEL_THREADS", cfg.threads);
         env_int("REBEL_GPU_BATCH", cfg.gpu_batch);
         env_int("REBEL_HARVEST", cfg.harvest);

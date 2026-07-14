@@ -762,8 +762,6 @@ void HunlSolver::root_values(std::array<std::vector<double>, 2>& v,
 
 bool HunlSolver::sample_leaf(std::mt19937& rng, double eps, int explorer,
                              int* leaf_node, uint8_t* card, HunlPBS* beta) {
-    if (nb_root_ == 0) return false;   // preflop t*-leaf = train_preflop,
-                                       // a later stage (3-card sample)
     std::uniform_real_distribution<double> u01(0.0, 1.0);
     const auto& ct = ComboTable::get();
     // sample compatible (hero, villain) combos from the root ranges
@@ -816,7 +814,10 @@ bool HunlSolver::sample_leaf(std::mt19937& rng, double eps, int explorer,
             nd.kind == Node::AllinShowdown)
             return false;                       // episode ends in-subgame
         if (nd.kind == Node::StreetEnd) {
-            // sample the next card avoiding board + both sampled hands
+            // sample the next street's chance avoiding board + both sampled
+            // hands: one card, or the 3-card flop when this is a preflop
+            // root (`card` must then point to 3 writable bytes)
+            const int nc = nb_root_ == 0 ? 3 : 1;
             bool dead[kCards] = {};
             for (int b = 0; b < nb_root_; ++b) dead[board_[b]] = true;
             for (int p = 0; p < 2; ++p) {
@@ -826,17 +827,22 @@ bool HunlSolver::sample_leaf(std::mt19937& rng, double eps, int explorer,
             std::vector<uint8_t> avail;
             for (int c = 0; c < kCards; ++c)
                 if (!dead[c]) avail.push_back(static_cast<uint8_t>(c));
-            const uint8_t c = avail[rng() % avail.size()];
+            std::array<uint8_t, 5> nb = board_;
+            for (int j = 0; j < nc; ++j) {
+                const size_t pick = rng() % avail.size();
+                card[j] = avail[pick];
+                avail.erase(avail.begin() + static_cast<long>(pick));
+                nb[nb_root_ + j] = card[j];
+            }
             *leaf_node = i;
-            *card = c;
             reaches_to(i, /*average=*/true, beta->r0, beta->r1);
-            mask_card(beta->r0, c);
-            mask_card(beta->r1, c);
+            for (int j = 0; j < nc; ++j) {
+                mask_card(beta->r0, card[j]);
+                mask_card(beta->r1, card[j]);
+            }
             // normalize (fallback uniform over live combos if zero mass)
             std::vector<uint8_t> v2;
-            std::array<uint8_t, 5> nb = board_;
-            nb[nb_root_] = c;
-            board_valid(nb.data(), nb_root_ + 1, v2);
+            board_valid(nb.data(), nb_root_ + nc, v2);
             normalize_range(beta->r0, v2);
             normalize_range(beta->r1, v2);
             return true;

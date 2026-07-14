@@ -1084,8 +1084,17 @@ void EndgameTrainer::flop_episode(poker_ppo::PokerEnvironment& env,
     HunlPBS beta;
     beta.r0 = random_range(rng, b3, 3);
     beta.r1 = random_range(rng, b3, 3);
+    flop_continue(env, b3, beta, rng, fresh);
+}
+
+void EndgameTrainer::flop_continue(poker_ppo::PokerEnvironment& env,
+                                   const uint8_t* b3, const HunlPBS& beta,
+                                   std::mt19937& rng,
+                                   std::vector<Sample>& fresh) {
     HunlNetOracle oracle(net_, stack_, device_);
-    HunlSolver s(env, beta, &oracle, cfg_.actions);
+    // board override: a root_episode continuation steps the env through a
+    // street end that deals its own flop
+    HunlSolver s(env, beta, &oracle, cfg_.actions, b3, 3);
     s.refresh_every = 10;   // net leaves at turn boards; play uses 10 too
     s.track_root_values();
 
@@ -1156,6 +1165,86 @@ void EndgameTrainer::flop_episode(poker_ppo::PokerEnvironment& env,
             if (ct.cards[i][0] == c || ct.cards[i][1] == c)
                 lb.r0[i] = lb.r1[i] = 0.0;
         turn_root_sample(L, c, lb);
+    }
+}
+
+void EndgameTrainer::root_episode(poker_ppo::PokerEnvironment& env,
+                                  std::mt19937& rng,
+                                  std::vector<Sample>& fresh) {
+    env.reset();
+    if (env.is_terminal() || env.round() != 0) return;
+    // the TRUE game root: both ranges uniform — no synthetic ranges
+    // anywhere in this episode; every downstream PBS is the agent's own
+    HunlPBS beta;
+    beta.r0.assign(kCombos, 1.0);
+    beta.r1.assign(kCombos, 1.0);
+    HunlNetOracle oracle(net_, stack_, device_);
+    HunlSolver s(env, beta, &oracle, cfg_.actions);
+    s.refresh_every = 10;
+    s.pf_samples = cfg_.pf_samples;
+    s.pf_seed = rng();   // fresh sampled-flop leaf set per episode
+    // no track_root_values / no street-0 row: no solver ever queries
+    // preflop-root values — the episode's yield is its continuations
+
+    std::uniform_int_distribution<int> dt(1, cfg_.t_preflop);
+    const int tstar = dt(rng);
+    const int explorer = static_cast<int>(rng() & 1);
+    int leaf = -1;
+    uint8_t f3[3] = {};
+    HunlPBS leaf_beta;
+    bool have = false;
+    for (int t = 1; t <= cfg_.t_preflop; ++t) {
+        s.iterate(t);
+        if (t == tstar)
+            have = s.sample_leaf(rng, cfg_.eps_explore, explorer, &leaf,
+                                 f3, &leaf_beta);
+    }
+
+    const auto& nodes = s.nodes();
+    auto flop_root_sample = [&](int L, const uint8_t* c3,
+                                const HunlPBS& lb) {
+        env.push_state();
+        for (int a : nodes[L].path) env.step(a);
+        flop_continue(env, c3, lb, rng, fresh);
+        env.pop_state();
+    };
+
+    // Algorithm 1's t*-sampled continuation (ε-explored coverage)
+    if (have) flop_root_sample(leaf, f3, leaf_beta);
+
+    // final-average-belief harvest — each continuation is a full flop
+    // solve + turn solves, so keep the count small
+    std::vector<int> leaves;
+    for (size_t i = 0; i < nodes.size(); ++i)
+        if (nodes[i].kind == HunlSolver::Node::StreetEnd)
+            leaves.push_back(static_cast<int>(i));
+    if (leaves.empty()) return;
+    const auto& ct = ComboTable::get();
+    const int H = std::max(1, std::min(cfg_.harvest, 2));
+    for (int h = 0; h < H; ++h) {
+        const int L = leaves[rng() % leaves.size()];
+        uint8_t c3[3];
+        for (int j = 0; j < 3; ++j) {
+            while (true) {
+                const uint8_t c = static_cast<uint8_t>(rng() % kCards);
+                bool dup = false;
+                for (int k = 0; k < j; ++k)
+                    if (c3[k] == c) dup = true;
+                if (!dup) {
+                    c3[j] = c;
+                    break;
+                }
+            }
+        }
+        HunlPBS lb;
+        s.beliefs_at(L, lb.r0, lb.r1);
+        for (int i = 0; i < kCombos; ++i)
+            for (int j = 0; j < 3; ++j)
+                if (ct.cards[i][0] == c3[j] || ct.cards[i][1] == c3[j]) {
+                    lb.r0[i] = lb.r1[i] = 0.0;
+                    break;
+                }
+        flop_root_sample(L, c3, lb);
     }
 }
 
@@ -1469,12 +1558,16 @@ void EndgameTrainer::run() {
     std::printf("HUNL endgame ReBeL (%s): T_turn=%d T_river=%d episodes=%d "
                 "epochs=%d hidden=%dx%d%s sgd=%d batch=%d lr=%g",
                 cfg_.river_only ? "direct-river"
+                                : cfg_.root_mode ? "root-selfplay"
                                 : cfg_.flop_mode ? "flop-selfplay"
                                                  : "turn-selfplay",
                 cfg_.t_turn, cfg_.t_river, cfg_.episodes, cfg_.epochs,
                 cfg_.hidden, cfg_.layers, cfg_.gelu_ln ? "(gelu+ln)" : "",
                 cfg_.sgd_steps, cfg_.batch, cfg_.lr);
-    if (cfg_.flop_mode) std::printf(" T_flop=%d", cfg_.t_flop);
+    if (cfg_.flop_mode || cfg_.root_mode)
+        std::printf(" T_flop=%d", cfg_.t_flop);
+    if (cfg_.root_mode)
+        std::printf(" T_preflop=%d pf=%d", cfg_.t_preflop, cfg_.pf_samples);
     if (cfg_.lr_final > 0.0) std::printf("->%g", cfg_.lr_final);
     if (cfg_.huber_delta > 0.0)
         std::printf(" loss=huber(%g)", cfg_.huber_delta);
@@ -1567,6 +1660,8 @@ void EndgameTrainer::run() {
                 if (e >= e_cpu) break;
                 if (cfg_.river_only)
                     direct_river_episode(*envs[w], wrng, fresh_w[w]);
+                else if (cfg_.root_mode)
+                    root_episode(*envs[w], wrng, fresh_w[w]);
                 else if (cfg_.flop_mode)
                     flop_episode(*envs[w], wrng, fresh_w[w]);
                 else
