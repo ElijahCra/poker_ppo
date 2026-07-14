@@ -7,9 +7,10 @@
 # Every phase refuses to start unless its inputs verifiably exist, so
 # re-running after any failure is safe: finished phases are skipped.
 # Phase 1 runs the river lane (GPU) and flop lane (CPU) concurrently;
-# phase 2 mixes the datasets and trains 3 seeds offline; the LBR gate
-# commands are printed at the end (run those by hand — they're the
-# rental-time budget decision).
+# phase 2 mixes the datasets and trains 3 seeds offline; phase 3 runs
+# the full 3x2 gate matrix (preflop arm + blueprint control per seed),
+# GATE_PAR gates concurrently — a 128-thread gate uses 1/3 of a
+# 384-vCPU box, so 3 at once cost ~nothing in per-gate wall time.
 set -uo pipefail
 
 BIN=./rebel_hunl
@@ -59,8 +60,12 @@ finish() {  # <pid> <log> <final_epoch> <label>
     || die "$V2 missing or truncated (need $V2_SIZE bytes) — re-upload it"
 pgrep -f 'rebel_hun[l]' >/dev/null \
     && die "rebel_hunl already running — decide, then: pkill -9 -f 'rebel_hun[l]'"
-free_gb=$(df -BG --output=avail . | tail -1 | tr -dc 0-9)
-[ "$free_gb" -ge 100 ] || die "need ~100GB free disk here, have ${free_gb}GB"
+# disk is only needed for generation+mix — once mix.bin exists the
+# remaining phases write logs/CSVs (a completed run must not die here)
+if [ "$(rows mix.bin)" -lt 1050000 ]; then
+    free_gb=$(df -BG --output=avail . | tail -1 | tr -dc 0-9)
+    [ "$free_gb" -ge 100 ] || die "need ~100GB free disk for generation, have ${free_gb}GB"
+fi
 
 # ── phase 1: generation ──────────────────────────────────────────────
 RIVER_TGT=$(( RIVER_EPOCHS * RIVER_EPS ))
@@ -146,14 +151,74 @@ for s in 1 2 3; do
 done
 echo "== training done: cand_f1.pt cand_f2.pt cand_f3.pt"
 
+# ── phase 3: LBR gate matrix ─────────────────────────────────────────
+# 3 candidates x {preflop arm, blueprint control}, GATE_PAR concurrent.
+# ~3.7h per gate at 128 threads (measured); 3-wide => ~2 waves for the
+# 5 arms remaining after a manual f2_pre. pre < ctl on the same net =>
+# preflop solving pays; ctl spread across nets = the net lottery.
+GATE_HANDS=${GATE_HANDS:-20000}
+GATE_THREADS=${GATE_THREADS:-128}
+GATE_PAR=${GATE_PAR:-3}
+BP=poker_ppo_model_nlhe_full_52.pt
+[ "$(stat -c%s $BP 2>/dev/null || echo 0)" -eq 7627976 ] \
+    || die "$BP missing or truncated (need 7627976 bytes) — controls need it"
+
+gate_done() {  # <name> — finished log line, or CSVs from a manual run
+    grep -q 'LBR vs ReBeL agent:' "gate_$1.log" 2>/dev/null && return 0
+    if [ -s "gate_$1.csv" ]; then
+        echo "   (gate_$1.csv exists without a finished log — treating as a"
+        echo "    manual/console run. rm gate_$1.csv* to force a re-run)"
+        return 0
+    fi
+    return 1
+}
+
+run_gate() {  # <name> <ckpt> <pre|ctl>
+    local name=$1 ckpt=$2 kind=$3
+    if [ "$kind" = pre ]; then
+        REBEL_PREFLOP=1 REBEL_T_TURN=240 REBEL_T_RIVER=800 \
+        REBEL_CKPT="$ckpt" REBEL_SEED=1234 REBEL_LBR_LOG="gate_$name.csv" \
+        $BIN lbr "$GATE_HANDS" "$GATE_THREADS" > "gate_$name.log" 2>&1
+    else
+        REBEL_PREFLOP=0 REBEL_BLUEPRINT=$BP REBEL_T_TURN=240 REBEL_T_RIVER=800 \
+        REBEL_CKPT="$ckpt" REBEL_SEED=1234 REBEL_LBR_LOG="gate_$name.csv" \
+        $BIN lbr "$GATE_HANDS" "$GATE_THREADS" > "gate_$name.log" 2>&1
+    fi
+}
+
+ARMS="f1_pre:cand_f1.pt:pre f2_pre:cand_f2.pt:pre f3_pre:cand_f3.pt:pre \
+f1_ctl:cand_f1.pt:ctl f2_ctl:cand_f2.pt:ctl f3_ctl:cand_f3.pt:ctl"
+active=0
+for arm in $ARMS; do
+    IFS=: read -r name ckpt kind <<< "$arm"
+    if gate_done "$name"; then
+        echo "== gate $name: done, skipping"
+        continue
+    fi
+    echo "== gate $name: launching ($kind, $ckpt, $GATE_HANDS hands @ $GATE_THREADS thr)"
+    run_gate "$name" "$ckpt" "$kind" &
+    active=$((active+1))
+    if [ "$active" -ge "$GATE_PAR" ]; then
+        wait -n
+        active=$((active-1))
+    fi
+done
+wait
+
+echo ""
+echo "== GATE RESULTS =========================================="
+for arm in $ARMS; do
+    IFS=: read -r name ckpt kind <<< "$arm"
+    line=$(grep 'LBR vs ReBeL agent:' "gate_$name.log" 2>/dev/null | tail -1)
+    if [ -n "$line" ]; then
+        echo "  $name  $line"
+    elif [ -s "gate_$name.csv" ]; then
+        echo "  $name  (manual/console run — result not in a log here)"
+    else
+        echo "  $name  INCOMPLETE — check gate_$name.log"
+    fi
+done
 cat <<'EOF'
-== next: LBR gates (CPU-bound, ~30 min each at 128 threads) ==
-per candidate, preflop-solving arm + control (the 1.796 config of record):
-
-REBEL_PREFLOP=1 REBEL_T_TURN=240 REBEL_T_RIVER=800 REBEL_CKPT=cand_f1.pt \
-REBEL_SEED=1234 REBEL_LBR_LOG=gate_f1_pre.csv ./rebel_hunl lbr 20000 128
-
-REBEL_PREFLOP=0 REBEL_BLUEPRINT=poker_ppo_model_nlhe_full_52.pt \
-REBEL_T_TURN=240 REBEL_T_RIVER=800 REBEL_CKPT=cand_f1.pt \
-REBEL_SEED=1234 REBEL_LBR_LOG=gate_f1_ctl.csv ./rebel_hunl lbr 20000 128
+reference: hybrid best 1.796 | blueprint alone 3.451 | f2_pre manual 1.6125
+SE(20k hands) ~ +/-0.21 bb/hand, all arms paired on seed 1234.
 EOF
