@@ -121,18 +121,28 @@ fi
 aligned mix.bin || die "mix.bin misaligned"
 echo "== mix: $(rows mix.bin) rows"
 
+# SEQUENTIAL: three concurrent ~43GB dataset loads OOM-killed a seed on
+# a rental (RAM varies by box); training is ~10 min/seed anyway. Each
+# seed must show its final epoch WITH a non-empty replay to count —
+# a missing log line means it died (OOM leaves no trace in its own log).
+SEED_EPOCHS=30
 for s in 1 2 3; do
+    if grep -Eq "epoch +${SEED_EPOCHS} +replay=" seed$s.log 2>/dev/null; then
+        echo "== seed $s: already trained, skipping"
+        continue
+    fi
     cp "$V2" cand_f$s.pt
+    echo "== seed $s training (log seed$s.log)"
     REBEL_SEED=$((200+s)) REBEL_CKPT=cand_f$s.pt REBEL_DATA_IN=mix.bin \
     REBEL_REPLAY_CAP=1200000 REBEL_PROBE_K=0 \
     REBEL_LR=2e-4 REBEL_LR_FINAL=5e-5 REBEL_SGD_STEPS=2000 REBEL_BATCH=512 \
-    $BIN train_flop 30 0 > seed$s.log 2>&1 &
-    echo "== seed $s launched (pid $!, log seed$s.log)"
-done
-wait
-for s in 1 2 3; do
+    $BIN train_flop $SEED_EPOCHS 0 > seed$s.log 2>&1
+    grep -Eq "epoch +${SEED_EPOCHS} +replay=" seed$s.log || {
+        tail -3 seed$s.log >&2
+        die "seed $s did not finish (OOM/crash?) — cand_f$s.pt is NOT trained"
+    }
     grep -m1 'replay=' seed$s.log | grep -q 'replay= *0 ' \
-        && die "seed$s trained on an EMPTY replay — check seed$s.log"
+        && die "seed $s trained on an EMPTY replay — check seed$s.log"
 done
 echo "== training done: cand_f1.pt cand_f2.pt cand_f3.pt"
 
