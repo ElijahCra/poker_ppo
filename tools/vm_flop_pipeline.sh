@@ -163,18 +163,38 @@ BP=poker_ppo_model_nlhe_full_52.pt
 [ "$(stat -c%s $BP 2>/dev/null || echo 0)" -eq 7627976 ] \
     || die "$BP missing or truncated (need 7627976 bytes) — controls need it"
 
-gate_done() {  # <name> — finished log line, or CSVs from a manual run
+csv_hands() {  # <name> — completed hands across all shard CSVs
+    local n=0 f l
+    for f in "gate_$1.csv" "gate_$1.csv".*; do
+        [ -f "$f" ] || continue
+        l=$(wc -l < "$f")
+        [ "$l" -ge 1 ] && n=$(( n + l - 1 ))   # minus header line
+    done
+    echo "$n"
+}
+
+gate_done() {  # <name> — finished log line, or COMPLETE CSVs from a
+               # manual run. A died-mid-run gate leaves partial CSVs
+               # (< GATE_HANDS rows) and must restart from scratch — the
+               # bound is only comparable at the full paired hand count.
     grep -q 'LBR vs ReBeL agent:' "gate_$1.log" 2>/dev/null && return 0
-    if [ -s "gate_$1.csv" ]; then
-        echo "   (gate_$1.csv exists without a finished log — treating as a"
-        echo "    manual/console run. rm gate_$1.csv* to force a re-run)"
+    local h
+    h=$(csv_hands "$1")
+    if [ "$h" -ge "$GATE_HANDS" ]; then
+        echo "   (gate_$1: $h/$GATE_HANDS hands in CSVs, no finished log —"
+        echo "    treating as a completed manual/console run)"
         return 0
+    fi
+    if [ "$h" -gt 0 ]; then
+        echo "   (gate_$1: PARTIAL — $h/$GATE_HANDS hands; instance died"
+        echo "    mid-gate. clearing partial CSVs and re-running)"
     fi
     return 1
 }
 
 run_gate() {  # <name> <ckpt> <pre|ctl>
     local name=$1 ckpt=$2 kind=$3
+    rm -f "gate_$name.csv" "gate_$name.csv".* "gate_$name.log"
     if [ "$kind" = pre ]; then
         REBEL_PREFLOP=1 REBEL_T_TURN=240 REBEL_T_RIVER=800 \
         REBEL_CKPT="$ckpt" REBEL_SEED=1234 REBEL_LBR_LOG="gate_$name.csv" \
