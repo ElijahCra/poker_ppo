@@ -46,4 +46,36 @@ struct FusedRiverArgs {
 // process; failures are logged to stderr once.
 bool fused_river_solve(const FusedRiverArgs& a);
 
+// Persistent-kernel TURN CFR: iterations t_start..t_end (one refresh
+// window) in a single launch. Leaves: Fold (bins), AllinShowdown via the
+// antisymmetric precomputed operator (op[x][y] = −op[y][x], so coalesced
+// row reads need no transposed copy), StreetEnd via net-value tensors +
+// the closed-form compatible mass (bins + pair-combo lookups). CFR+ or
+// PCFR+ (pred buffers + quadratic averaging). Root values of the current
+// profile accumulate into root_acc.
+struct FusedTurnArgs {
+    int t_start = 1, t_end = 0, M = 0, B = 0, pcfr = 0;
+    const int32_t* kind = nullptr;        // [M]
+    const int32_t* actor = nullptr;       // [M]
+    const int32_t* arity = nullptr;       // [M]
+    const int32_t* child_base = nullptr;  // [M]
+    const int32_t* child_flat = nullptr;
+    const int64_t* regret_ptr = nullptr;  // [M] device addresses
+    const int64_t* cum_ptr = nullptr;     // [M]
+    const int64_t* pred_ptr = nullptr;    // [M] (used when pcfr)
+    const int64_t* leaf_ptr = nullptr;    // [M] ([B,52,2,n] per StreetEnd)
+    const float* r0 = nullptr;            // [B, n]
+    const float* r1 = nullptr;            // [B, n]
+    const float* valid = nullptr;         // [B, n]
+    const float* c0 = nullptr;            // [B, M]
+    const float* c1 = nullptr;            // [B, M]
+    const float* allin_op = nullptr;      // [B, n, n], antisymmetric
+    const int32_t* id_pair = nullptr;     // [52*52] combo id of {a,b}
+    const int64_t* cardA = nullptr;       // [n]
+    const int64_t* cardB = nullptr;       // [n]
+    float* root_acc0 = nullptr;           // [B, n]
+    float* root_acc1 = nullptr;           // [B, n]
+};
+bool fused_turn_solve(const FusedTurnArgs& a);
+
 }  // namespace rebel_hunl

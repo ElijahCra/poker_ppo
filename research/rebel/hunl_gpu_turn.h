@@ -112,6 +112,10 @@ private:
             : static_cast<double>(t);
     }
     void iterate_body();   // both update passes + root-value accumulation
+    // persistent fused kernel: device tables + bounds audit (once), then
+    // whole refresh windows per launch. -1 = unavailable (fallback).
+    bool fused_setup();
+    bool fused_window(int t_start, int t_end);
     torch::Tensor policies(int node, bool average);       // [B, A, n]
     torch::Tensor fold_cfv_t(int node, int upd, const torch::Tensor& opp);
     torch::Tensor allin_cfv_t(int node, const torch::Tensor& opp);
@@ -161,6 +165,10 @@ private:
     std::array<torch::Tensor, 2> root_acc_{};
     long rv_n_ = 0;
     std::unique_ptr<at::cuda::CUDAGraph> graph_;
+    // fused-kernel device tables
+    int fused_state_ = 0;   // 0 unknown, 1 ready, -1 unavailable
+    torch::Tensor f_kind_, f_actor_, f_arity_, f_cbase_, f_cflat_;
+    torch::Tensor f_rptr_, f_cptr_, f_pptr_, f_lptr_, f_idpair_;
 };
 
 class HunlNetOracle;

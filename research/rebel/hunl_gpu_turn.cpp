@@ -1,4 +1,5 @@
 #include "hunl_gpu_turn.h"
+#include "hunl_fused.h"
 #include "hunl_value.h"
 
 #include <ATen/cuda/CUDAContext.h>
@@ -518,12 +519,158 @@ void BatchTurnSolver::iterate(int t) {
     ++rv_n_;
 }
 
+bool BatchTurnSolver::fused_setup() {
+    if (fused_state_) return fused_state_ > 0;
+    fused_state_ = -1;
+    if (dt_ != torch::kFloat || !dev_.is_cuda() ||
+        std::getenv("REBEL_NO_FUSED"))
+        return false;
+    const int M = static_cast<int>(shape_.nodes.size());
+    // bounds + tree audit: no single-street Showdown, allin needs the
+    // operator, arity ≤ 4, depth ≤ 12 (children follow parents in the
+    // build order, so one forward pass computes depth)
+    std::vector<int> depth(static_cast<size_t>(M), 0);
+    int maxd = 0, maxa = 0;
+    bool any_allin = false;
+    for (int m = 0; m < M; ++m) {
+        const auto& nd = shape_.nodes[static_cast<size_t>(m)];
+        if (nd.kind == HunlSolver::Node::Showdown) return false;
+        if (nd.kind == HunlSolver::Node::AllinShowdown) any_allin = true;
+        maxa = std::max(maxa, static_cast<int>(nd.acts.size()));
+        for (int ch : nd.child) {
+            depth[static_cast<size_t>(ch)] =
+                depth[static_cast<size_t>(m)] + 1;
+            maxd = std::max(maxd, depth[static_cast<size_t>(ch)]);
+        }
+    }
+    if (maxa > 4 || maxd + 1 > 12) return false;
+    if (any_allin && !use_allin_op_) return false;
+    // topology + state-pointer tables
+    auto i32 = torch::TensorOptions().dtype(torch::kInt);
+    auto i64 = torch::TensorOptions().dtype(torch::kLong);
+    auto kind = torch::zeros({M}, i32);
+    auto actor = torch::zeros({M}, i32);
+    auto arity = torch::zeros({M}, i32);
+    auto cbase = torch::zeros({M}, i32);
+    std::vector<int> cflat;
+    auto rptr = torch::zeros({M}, i64);
+    auto cptr = torch::zeros({M}, i64);
+    auto pptr = torch::zeros({M}, i64);
+    auto lptr = torch::zeros({M}, i64);
+    for (int m = 0; m < M; ++m) {
+        const auto& nd = shape_.nodes[static_cast<size_t>(m)];
+        kind[m] = nd.kind;
+        actor[m] = nd.player;
+        arity[m] = static_cast<int>(nd.acts.size());
+        cbase[m] = static_cast<int>(cflat.size());
+        for (int ch : nd.child) cflat.push_back(ch);
+        if (nd.kind == HunlSolver::Node::Decision) {
+            rptr[m] = reinterpret_cast<int64_t>(
+                regret_[static_cast<size_t>(m)].data_ptr<float>());
+            cptr[m] = reinterpret_cast<int64_t>(
+                cum_[static_cast<size_t>(m)].data_ptr<float>());
+            if (pcfr_) {
+                if (!pred_[static_cast<size_t>(m)].defined() ||
+                    pred_[static_cast<size_t>(m)].numel() == 0)
+                    pred_[static_cast<size_t>(m)] =
+                        torch::zeros_like(regret_[static_cast<size_t>(m)]);
+                pptr[m] = reinterpret_cast<int64_t>(
+                    pred_[static_cast<size_t>(m)].data_ptr<float>());
+            }
+        } else if (nd.kind == HunlSolver::Node::StreetEnd) {
+            for (size_t j = 0; j < leaf_nodes_.size(); ++j)
+                if (leaf_nodes_[j] == m)
+                    lptr[m] = reinterpret_cast<int64_t>(
+                        leaf_v_[j].data_ptr<float>());
+        }
+    }
+    auto cf = torch::zeros({static_cast<long>(cflat.size())}, i32);
+    for (size_t q = 0; q < cflat.size(); ++q)
+        cf[static_cast<long>(q)] = cflat[q];
+    auto idp = torch::zeros({kCards * kCards}, i32);
+    {
+        const auto& ct = ComboTable::get();
+        auto a = idp.accessor<int, 1>();
+        for (int x = 0; x < kCards; ++x)
+            for (int y = 0; y < kCards; ++y)
+                a[x * kCards + y] = x == y ? 0 : ct.id[x][y];
+    }
+    f_kind_ = kind.to(dev_);
+    f_actor_ = actor.to(dev_);
+    f_arity_ = arity.to(dev_);
+    f_cbase_ = cbase.to(dev_);
+    f_cflat_ = cf.to(dev_);
+    f_rptr_ = rptr.to(dev_);
+    f_cptr_ = cptr.to(dev_);
+    f_pptr_ = pptr.to(dev_);
+    f_lptr_ = lptr.to(dev_);
+    f_idpair_ = idp.to(dev_);
+    fused_state_ = 1;
+    return true;
+}
+
+bool BatchTurnSolver::fused_window(int t_start, int t_end) {
+    FusedTurnArgs a;
+    a.t_start = t_start;
+    a.t_end = t_end;
+    a.M = static_cast<int>(shape_.nodes.size());
+    a.B = B_;
+    a.pcfr = pcfr_ ? 1 : 0;   // quadratic averaging implied (the pairing)
+    a.kind = f_kind_.data_ptr<int>();
+    a.actor = f_actor_.data_ptr<int>();
+    a.arity = f_arity_.data_ptr<int>();
+    a.child_base = f_cbase_.data_ptr<int>();
+    a.child_flat = f_cflat_.data_ptr<int>();
+    a.regret_ptr = f_rptr_.data_ptr<int64_t>();
+    a.cum_ptr = f_cptr_.data_ptr<int64_t>();
+    a.pred_ptr = f_pptr_.data_ptr<int64_t>();
+    a.leaf_ptr = f_lptr_.data_ptr<int64_t>();
+    a.r0 = r0_.data_ptr<float>();
+    a.r1 = r1_.data_ptr<float>();
+    a.valid = valid_.data_ptr<float>();
+    a.c0 = c0_.data_ptr<float>();
+    a.c1 = c1_.data_ptr<float>();
+    a.allin_op = use_allin_op_ && allin_op_.defined()
+        ? allin_op_.data_ptr<float>()
+        : nullptr;
+    a.id_pair = f_idpair_.data_ptr<int>();
+    a.cardA = card_a_.data_ptr<int64_t>();
+    a.cardB = card_b_.data_ptr<int64_t>();
+    a.root_acc0 = root_acc_[0].data_ptr<float>();
+    a.root_acc1 = root_acc_[1].data_ptr<float>();
+    return fused_turn_solve(a);
+}
+
 void BatchTurnSolver::solve(int T, int refresh_every,
                             const std::function<void(int)>& refresh) {
     torch::NoGradGuard ng;
     auto sched = [&](int t) {
         return t == 1 || refresh_every <= 1 || t % refresh_every == 0;
     };
+    // fused persistent kernel: each refresh window is ONE launch
+    if (fused_setup()) {
+        int ts = 1;
+        bool ok = true;
+        while (ts <= T && ok) {
+            refresh(ts);   // window starts are exactly the refresh points
+            const int te = refresh_every <= 1
+                ? ts
+                : std::min(T, (ts / refresh_every + 1) * refresh_every - 1);
+            torch::cuda::synchronize();   // leaf copies before raw launch
+            ok = fused_window(ts, te);
+            if (ok) {
+                rv_n_ += te - ts + 1;
+                ts = te + 1;
+            }
+        }
+        if (ts > T) return;
+        fused_state_ = -1;   // launch failed mid-solve: finish eager
+        for (int t = ts; t <= T; ++t) {
+            if (sched(t) && t != ts) refresh(t);
+            iterate(t);
+        }
+        return;
+    }
     const bool no_graph = std::getenv("REBEL_NO_CUDA_GRAPH") != nullptr;
     if (!dev_.is_cuda() || T < 8 || no_graph) {
         for (int t = 1; t <= T; ++t) {

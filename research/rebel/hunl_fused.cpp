@@ -363,18 +363,20 @@ struct Kernel {
     bool tried = false;
 };
 Kernel k_;
+Kernel kt_;
 
-bool build_kernel() {
-    if (k_.tried) return k_.fn != nullptr;
-    k_.tried = true;
-    k_.api = load_api();
-    if (!k_.api.ok) {
+bool build_one(Kernel& k, const char* src, const char* file,
+               const char* fname) {
+    if (k.tried) return k.fn != nullptr;
+    k.tried = true;
+    k.api = load_api();
+    if (!k.api.ok) {
         std::fprintf(stderr, "[fused] NVRTC/driver unavailable — torch "
                      "graph path stays\n");
         return false;
     }
     nvrtcProgram prog = nullptr;
-    if (k_.api.create(&prog, kSrc, "cfr_river.cu", 0, nullptr, nullptr))
+    if (k.api.create(&prog, src, file, 0, nullptr, nullptr))
         return false;
     // compile for the DEVICE's arch (rented boxes differ; PTX would
     // forward-JIT from a lower target but native codegen is free perf)
@@ -388,32 +390,277 @@ bool build_kernel() {
                              std::to_string(cc_major) +
                              std::to_string(cc_minor);
     const char* opts[] = {arch.c_str(), "--use_fast_math"};
-    const int rc = k_.api.compile(prog, 2, opts);
+    const int rc = k.api.compile(prog, 2, opts);
     if (rc != 0) {
         size_t ls = 0;
-        k_.api.log_size(prog, &ls);
+        k.api.log_size(prog, &ls);
         std::string log(ls, '\0');
-        k_.api.log(prog, log.data());
-        std::fprintf(stderr, "[fused] NVRTC compile failed:\n%s\n",
-                     log.c_str());
+        k.api.log(prog, log.data());
+        std::fprintf(stderr, "[fused] NVRTC compile failed (%s):\n%s\n",
+                     fname, log.c_str());
         return false;
     }
     size_t ps = 0;
-    k_.api.ptx_size(prog, &ps);
+    k.api.ptx_size(prog, &ps);
     std::string ptx(ps, '\0');
-    k_.api.ptx(prog, ptx.data());
+    k.api.ptx(prog, ptx.data());
     CUmodule mod = nullptr;
-    if (k_.api.mod_load(&mod, ptx.c_str())) {
-        std::fprintf(stderr, "[fused] cuModuleLoadData failed\n");
+    if (k.api.mod_load(&mod, ptx.c_str())) {
+        std::fprintf(stderr, "[fused] cuModuleLoadData failed (%s)\n",
+                     fname);
         return false;
     }
-    if (k_.api.mod_func(&k_.fn, mod, "cfr_river")) {
-        std::fprintf(stderr, "[fused] kernel symbol missing\n");
-        k_.fn = nullptr;
+    if (k.api.mod_func(&k.fn, mod, fname)) {
+        std::fprintf(stderr, "[fused] kernel symbol missing (%s)\n", fname);
+        k.fn = nullptr;
         return false;
     }
     return true;
 }
+
+bool build_kernel() { return build_one(k_, kSrc, "cfr_river.cu",
+                                       "cfr_river"); }
+
+// ── persistent TURN kernel ───────────────────────────────────────────
+const char* kTurnSrc = R"CU(
+#define N 1326
+#define NT 256
+#define PC 6
+#define MAXD 12
+#define MAXA 4
+
+extern "C" __global__ void cfr_turn(
+    int tStart, int tEnd, int M, int pcfr,
+    const int* kind, const int* actor, const int* arity,
+    const int* childBase, const int* childFlat,
+    const long long* regretPtr, const long long* cumPtr,
+    const long long* predPtr, const long long* leafPtr,
+    const float* r0g, const float* r1g, const float* validg,
+    const float* c0g, const float* c1g,
+    const float* opg, const int* idPairg,
+    const long long* cardAg, const long long* cardBg,
+    float* racc0g, float* racc1g) {
+  const int b = blockIdx.x, tid = threadIdx.x;
+  __shared__ float shA[N];       // opp reach by combo (leaf staging)
+  __shared__ float shBins[56];   // S + per-card sums
+
+  const float* R0 = r0g + (size_t)b * N;
+  const float* R1 = r1g + (size_t)b * N;
+  const float* VAL = validg + (size_t)b * N;
+  const float* C0 = c0g + (size_t)b * M;
+  const float* C1 = c1g + (size_t)b * M;
+
+  float reach[2][MAXD][PC];
+  float sig[MAXD][MAXA][PC];
+  float vacc[MAXD][PC];
+  int ndstk[MAXD];
+  int cur[MAXD];
+
+  for (int t = tStart; t <= tEnd; ++t)
+  for (int upd = 0; upd < 2; ++upd) {
+    for (int j = 0; j < PC; ++j) {
+      const int i = tid + j * NT;
+      if (i < N) { reach[0][0][j] = R0[i]; reach[1][0][j] = R1[i]; }
+      vacc[0][j] = 0.f;
+    }
+    int d = 0; ndstk[0] = 0; cur[0] = -1;
+    while (d >= 0) {
+      const int m = ndstk[d];
+      const int K = kind[m];
+      bool leaf_done = false;
+      if (K == 1) {                       // Fold
+        for (int q = tid; q < 56; q += NT) shBins[q] = 0.f;
+        __syncthreads();
+        for (int j = 0; j < PC; ++j) {
+          const int i = tid + j * NT; if (i >= N) continue;
+          const float o = reach[1 - upd][d][j];
+          if (o != 0.f) {
+            atomicAdd(&shBins[52], o);
+            atomicAdd(&shBins[(int)cardAg[i]], o);
+            atomicAdd(&shBins[(int)cardBg[i]], o);
+          }
+        }
+        __syncthreads();
+        const float u = (upd == actor[m])
+            ? -(upd == 0 ? C0[m] : C1[m])
+            : (upd == 0 ? C1[m] : C0[m]);
+        for (int j = 0; j < PC; ++j) {
+          const int i = tid + j * NT; if (i >= N) { vacc[d][j] = 0.f; continue; }
+          const float o = reach[1 - upd][d][j];
+          vacc[d][j] = u *
+              (shBins[52] - shBins[(int)cardAg[i]] -
+               shBins[(int)cardBg[i]] + o) * VAL[i];
+        }
+        __syncthreads();
+        leaf_done = true;
+      } else if (K == 3) {                // AllinShowdown: operator dot
+        for (int j = 0; j < PC; ++j) {
+          const int i = tid + j * NT;
+          if (i < N) shA[i] = reach[1 - upd][d][j];
+        }
+        __syncthreads();
+        const float* OP = opg + (size_t)b * N * N;
+        float out[PC];
+        for (int j = 0; j < PC; ++j) out[j] = 0.f;
+        for (int y = 0; y < N; ++y) {
+          const float oy = shA[y];
+          if (oy == 0.f) continue;
+          // antisymmetry: op[x][y] = -op[y][x]; row y reads coalesce
+          const float* row = OP + (size_t)y * N;
+          for (int j = 0; j < PC; ++j) {
+            const int i = tid + j * NT;
+            if (i < N) out[j] -= row[i] * oy;
+          }
+        }
+        __syncthreads();
+        for (int j = 0; j < PC; ++j) {
+          const int i = tid + j * NT;
+          vacc[d][j] = (i < N) ? out[j] * VAL[i] : 0.f;
+        }
+        leaf_done = true;
+      } else if (K == 4) {                // StreetEnd: net leaf values
+        for (int q = tid; q < 56; q += NT) shBins[q] = 0.f;
+        for (int j = 0; j < PC; ++j) {
+          const int i = tid + j * NT;
+          if (i < N) shA[i] = reach[1 - upd][d][j];
+        }
+        __syncthreads();
+        for (int j = 0; j < PC; ++j) {
+          const int i = tid + j * NT; if (i >= N) continue;
+          const float o = shA[i];
+          if (o != 0.f) {
+            atomicAdd(&shBins[52], o);
+            atomicAdd(&shBins[(int)cardAg[i]], o);
+            atomicAdd(&shBins[(int)cardBg[i]], o);
+          }
+        }
+        __syncthreads();
+        const float* LV = (const float*)leafPtr[m] +
+                          (size_t)b * 52 * 2 * N + (size_t)upd * N;
+        const float S = shBins[52];
+        for (int j = 0; j < PC; ++j) {
+          const int i = tid + j * NT;
+          if (i >= N) { vacc[d][j] = 0.f; continue; }
+          const int ca = (int)cardAg[i], cb = (int)cardBg[i];
+          const float w = shA[i];
+          // closed-form compatible mass: excluding runout c costs T[c]
+          // minus the two pair combos {a,c}, {b,c} counted back in
+          const float base = S - shBins[ca] - shBins[cb] + w;
+          float acc = 0.f;
+          for (int c = 0; c < 52; ++c) {
+            if (c == ca || c == cb) continue;
+            const float v = LV[(size_t)c * 2 * N + i];
+            if (v == 0.f) continue;   // board slots + dead combos
+            const float mass = base - shBins[c] +
+                shA[idPairg[ca * 52 + c]] + shA[idPairg[cb * 52 + c]];
+            acc += v * mass;
+          }
+          vacc[d][j] = acc * (1.f / 44.f) * VAL[i];
+        }
+        __syncthreads();
+        leaf_done = true;
+      } else if (K == 0) {                // Decision
+        const int A = arity[m];
+        if (cur[d] < 0) {
+          const float* RG =
+              (const float*)regretPtr[m] + (size_t)b * A * N;
+          const float* PD = pcfr
+              ? (const float*)predPtr[m] + (size_t)b * A * N
+              : (const float*)0;
+          for (int j = 0; j < PC; ++j) {
+            const int i = tid + j * NT; if (i >= N) continue;
+            float s = 0.f, pk[MAXA];
+            for (int k = 0; k < A; ++k) {
+              float x = RG[(size_t)k * N + i];
+              if (pcfr) x += PD[(size_t)k * N + i];
+              x = x > 0.f ? x : 0.f;
+              pk[k] = x; s += x;
+            }
+            if (s > 1e-12f)
+              for (int k = 0; k < A; ++k) sig[d][k][j] = pk[k] / s;
+            else {
+              const float u = 1.f / A;
+              for (int k = 0; k < A; ++k) sig[d][k][j] = u;
+            }
+            vacc[d][j] = 0.f;
+          }
+          if (actor[m] == upd) {
+            float* CM = (float*)cumPtr[m] + (size_t)b * A * N;
+            const float wv = pcfr ? (float)t * (float)t : (float)t;
+            for (int j = 0; j < PC; ++j) {
+              const int i = tid + j * NT; if (i >= N) continue;
+              const float w = wv * reach[upd][d][j];
+              for (int k = 0; k < A; ++k)
+                CM[(size_t)k * N + i] += w * sig[d][k][j];
+            }
+          }
+          cur[d] = 0;
+        }
+        if (cur[d] < A) {
+          const int k = cur[d]++;
+          const int a = actor[m];
+          for (int j = 0; j < PC; ++j) {
+            reach[a][d + 1][j] = reach[a][d][j] * sig[d][k][j];
+            reach[1 - a][d + 1][j] = reach[1 - a][d][j];
+            vacc[d + 1][j] = 0.f;
+          }
+          ndstk[d + 1] = childFlat[childBase[m] + k];
+          cur[d + 1] = -1;
+          ++d;
+          continue;
+        }
+        // children done: ((r + v_k) − v_p)+; PCFR+ pred = v_k − v_p
+        if (actor[m] == upd) {
+          float* RG = (float*)regretPtr[m] + (size_t)b * A * N;
+          float* PD = pcfr ? (float*)predPtr[m] + (size_t)b * A * N
+                           : (float*)0;
+          for (int j = 0; j < PC; ++j) {
+            const int i = tid + j * NT; if (i >= N) continue;
+            const float vp = vacc[d][j];
+            for (int k = 0; k < A; ++k) {
+              const float r = RG[(size_t)k * N + i] - vp;
+              RG[(size_t)k * N + i] = r > 0.f ? r : 0.f;
+              if (pcfr) PD[(size_t)k * N + i] -= vp;
+            }
+          }
+        }
+        leaf_done = true;
+      } else {
+        leaf_done = true;                 // Showdown: host refuses tree
+      }
+      if (leaf_done) {
+        if (d == 0) { d = -1; break; }
+        const int mp = ndstk[d - 1];
+        const int ke = cur[d - 1] - 1;
+        if (actor[mp] == upd) {
+          float* RG =
+              (float*)regretPtr[mp] + (size_t)b * arity[mp] * N;
+          float* PD = pcfr
+              ? (float*)predPtr[mp] + (size_t)b * arity[mp] * N
+              : (float*)0;
+          for (int j = 0; j < PC; ++j) {
+            const int i = tid + j * NT; if (i >= N) continue;
+            const float vc = vacc[d][j];
+            vacc[d - 1][j] += sig[d - 1][ke][j] * vc;
+            RG[(size_t)ke * N + i] += vc;    // provisional (σ pre-stashed)
+            if (pcfr) PD[(size_t)ke * N + i] = vc;   // inst, pre −v_p
+          }
+        } else {
+          for (int j = 0; j < PC; ++j) vacc[d - 1][j] += vacc[d][j];
+        }
+        --d;
+      }
+    }
+    // iterate-averaged root values of the current profile
+    float* RACC = (upd == 0 ? racc0g : racc1g) + (size_t)b * N;
+    for (int j = 0; j < PC; ++j) {
+      const int i = tid + j * NT;
+      if (i < N) RACC[i] += vacc[0][j];
+    }
+    __syncthreads();
+  }
+}
+)CU";
 
 }  // namespace
 
@@ -444,6 +691,36 @@ bool fused_river_solve(const FusedRiverArgs& a) {
         return false;
     }
     return k_.api.ctx_sync() == 0;
+}
+
+bool fused_turn_solve(const FusedTurnArgs& a) {
+    if (!build_one(kt_, kTurnSrc, "cfr_turn.cu", "cfr_turn")) return false;
+    void* args[] = {
+        const_cast<int*>(&a.t_start), const_cast<int*>(&a.t_end),
+        const_cast<int*>(&a.M), const_cast<int*>(&a.pcfr),
+        const_cast<int32_t**>(&a.kind), const_cast<int32_t**>(&a.actor),
+        const_cast<int32_t**>(&a.arity),
+        const_cast<int32_t**>(&a.child_base),
+        const_cast<int32_t**>(&a.child_flat),
+        const_cast<int64_t**>(&a.regret_ptr),
+        const_cast<int64_t**>(&a.cum_ptr),
+        const_cast<int64_t**>(&a.pred_ptr),
+        const_cast<int64_t**>(&a.leaf_ptr),
+        const_cast<float**>(&a.r0), const_cast<float**>(&a.r1),
+        const_cast<float**>(&a.valid), const_cast<float**>(&a.c0),
+        const_cast<float**>(&a.c1), const_cast<float**>(&a.allin_op),
+        const_cast<int32_t**>(&a.id_pair),
+        const_cast<int64_t**>(&a.cardA), const_cast<int64_t**>(&a.cardB),
+        const_cast<float**>(&a.root_acc0),
+        const_cast<float**>(&a.root_acc1)};
+    const int rc = kt_.api.launch(
+        kt_.fn, static_cast<unsigned>(a.B), 1, 1, 256, 1, 1, 0, nullptr,
+        args, nullptr);
+    if (rc != 0) {
+        std::fprintf(stderr, "[fused-turn] cuLaunchKernel rc=%d\n", rc);
+        return false;
+    }
+    return kt_.api.ctx_sync() == 0;
 }
 
 }  // namespace rebel_hunl
