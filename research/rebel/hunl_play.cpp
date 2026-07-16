@@ -46,11 +46,29 @@ void RebelTarget::on_hand_start(PokerEnvironment& env) {
     pbs_.r0.assign(kCombos, 1.0 / kCombos);
     pbs_.r1.assign(kCombos, 1.0 / kCombos);
     board_seen_ = 0;
-    cache_.clear();
+    clear_solves();
     cache_round_ = -1;
     seat_ = -1;
     have_alt_ = false;
     sync_public(env);
+}
+
+void RebelTarget::clear_solves() {
+    // The GAME-ROOT preflop solve (empty action log) is identical every
+    // hand: uniform PBS, no board, blind pot, fixed pf flop sample, and
+    // CFR is deterministic — so it is solved once per agent lifetime and
+    // survives both the per-hand and per-street cache clears. Bit-equal
+    // policies to re-solving, at ~one preflop solve per SHARD per gate
+    // instead of per hand.
+    if (cfg_.preflop_solve) {
+        cache_.erase(std::remove_if(cache_.begin(), cache_.end(),
+                                    [](const Solve& s) {
+                                        return !s.log_at_root.empty();
+                                    }),
+                     cache_.end());
+    } else {
+        cache_.clear();
+    }
 }
 
 void RebelTarget::alt_from_turn_leaf(PokerEnvironment& env) {
@@ -133,7 +151,7 @@ std::pair<HunlSolver*, int> RebelTarget::solve_at(PokerEnvironment& env) {
         // leaf BEFORE the turn cache drops
         if (cfg_.gadget && env.round() == 3 && cache_round_ == 2)
             alt_from_turn_leaf(env);
-        cache_.clear();
+        clear_solves();
         cache_round_ = env.round();
     }
     const auto& log = env.action_log();

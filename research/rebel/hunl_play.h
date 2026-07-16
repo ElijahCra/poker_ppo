@@ -111,6 +111,9 @@ private:
         std::vector<int> log_at_root;   // env.action_log() at the root
         std::unique_ptr<HunlSolver> solver;
     };
+    // drop cached solves; the game-root preflop solve (empty log) is
+    // kept — it is identical every hand and reused across hands
+    void clear_solves();
 
     // first street the agent re-solves; earlier streets play/track under
     // the blueprint
