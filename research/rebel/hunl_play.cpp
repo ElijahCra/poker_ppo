@@ -193,6 +193,10 @@ std::pair<HunlSolver*, int> RebelTarget::solve_at(PokerEnvironment& env) {
               : round <= 1 ? cfg_.actions_flop : cfg_.actions);
     solver->refresh_every =
         round <= 1 ? cfg_.refresh_flop : cfg_.refresh_every;
+    // pcfr_bench: PCFR+ wins 1.5-3.5x on the sparse net-leaf streets but
+    // LOSES ~2x on river trees — river stays CFR+ (also keeps the GPU
+    // river solver's CPU-equivalence meaningful)
+    solver->pcfr = cfg_.pcfr && !river;
     solver->pf_samples = cfg_.pf_samples;
     if (cfg_.seed)   // sampled preflop-leaf flops vary per shard
         solver->pf_seed = cfg_.seed * 6364136223846793005ull + 1442695040888963407ull;

@@ -218,6 +218,11 @@ struct EndgameConfig {
     bool   root_mode    = false;
     int    t_preflop    = 40;
     int    pf_samples   = 64;   // sampled flop leaves per preflop solve
+    // PCFR+ for the CPU solves that produce training targets (turn/flop/
+    // preflop subgame solves AND the exact river target solves). The GPU
+    // river pipeline (gpu_batch) stays plain CFR+ — don't mix variants in
+    // one dataset build if rows must be provenance-uniform.
+    bool   pcfr         = false;
     // >0: solve river targets in GPU lockstep batches of this size
     // (BatchRiverSolver; equivalence-validated vs the CPU solver). CPU
     // workers build specs; the device does the solving.

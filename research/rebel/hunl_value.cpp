@@ -656,6 +656,9 @@ bool EndgameTrainer::sample_street_root(poker_ppo::PokerEnvironment& env,
 bool EndgameTrainer::river_sample_at(poker_ppo::PokerEnvironment& env,
                                      const uint8_t* b5, const HunlPBS& beta,
                                      std::vector<Sample>& out) {
+    // river target solves stay CFR+ — pcfr_bench measured PCFR+ ~2x
+    // WORSE on river trees (cfg_.pcfr covers the turn/flop/preflop
+    // solves, where it wins 1.5-3.5x)
     ExactStreetOracle exact(cfg_.t_river, cfg_.actions);
     std::array<std::vector<double>, 2> v;
     exact.value(env, b5, 5, beta, v);
@@ -984,6 +987,7 @@ void EndgameTrainer::self_play_episode(poker_ppo::PokerEnvironment& env,
     HunlNetOracle oracle(net_, stack_, device_);
     HunlSolver s(env, beta, &oracle, cfg_.actions);
     s.refresh_every = 5;
+    s.pcfr = cfg_.pcfr;
     s.track_root_values();
 
     std::uniform_int_distribution<int> dt(1, cfg_.t_turn);
@@ -1096,6 +1100,7 @@ void EndgameTrainer::flop_continue(poker_ppo::PokerEnvironment& env,
     // street end that deals its own flop
     HunlSolver s(env, beta, &oracle, cfg_.actions, b3, 3);
     s.refresh_every = 10;   // net leaves at turn boards; play uses 10 too
+    s.pcfr = cfg_.pcfr;
     s.track_root_values();
 
     std::uniform_int_distribution<int> dt(1, cfg_.t_flop);
@@ -1130,6 +1135,7 @@ void EndgameTrainer::flop_continue(poker_ppo::PokerEnvironment& env,
         // board override: the env dealt its own turn card
         HunlSolver ts(env, lb, &oracle, cfg_.actions, b4.data(), 4);
         ts.refresh_every = 5;
+        ts.pcfr = cfg_.pcfr;
         ts.track_root_values();
         const int T = std::max(1, cfg_.t_turn / 2);
         for (int t = 1; t <= T; ++t) ts.iterate(t);
@@ -1181,6 +1187,7 @@ void EndgameTrainer::root_episode(poker_ppo::PokerEnvironment& env,
     HunlNetOracle oracle(net_, stack_, device_);
     HunlSolver s(env, beta, &oracle, cfg_.actions);
     s.refresh_every = 10;
+    s.pcfr = cfg_.pcfr;
     s.pf_samples = cfg_.pf_samples;
     s.pf_seed = rng();   // fresh sampled-flop leaf set per episode
     // no track_root_values / no street-0 row: no solver ever queries

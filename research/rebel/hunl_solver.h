@@ -90,6 +90,9 @@ public:
         std::array<int, 2> contrib{}; // chips invested up to this node
         std::vector<int> path;        // env actions root -> node
         std::vector<double> regret, cum_strat;   // [combo * |acts| + k]
+        // PCFR+ prediction: last instantaneous regret per (combo, act).
+        // Allocated lazily on the first update when `pcfr` is set.
+        std::vector<double> pred;
     };
 
     // Builds the tree from the env's CURRENT state (restored on return).
@@ -115,6 +118,18 @@ public:
     // (a combo's own cards knock out flops containing them).
     int      pf_samples = 64;
     uint64_t pf_seed = 20260713;
+    // Predictive CFR+ (Farina, Kroer & Sandholm 2021): the CURRENT policy
+    // is regret-matched over [R + m]^+ where the prediction m is the last
+    // instantaneous regret (optimism), and the average strategy uses
+    // QUADRATIC iterate weights (t^2, vs CFR+'s linear t). Same fixed
+    // points, measurably fewer iterations to a given exploitability.
+    // Opt-in: default false keeps every existing path bit-identical
+    // (the GPU river kernels remain plain CFR+ — leave this off for any
+    // solve that will be compared against them). Set before iterate(1).
+    bool     pcfr = false;
+    // Averaging weight under PCFR+: t^2 (paper pairing) vs CFR+'s linear
+    // t. Measured per-street on our trees — see pcfr_bench.
+    bool     pcfr_quad = true;
     // Subgame exploitability of the current average profile in chips/hand
     // (normalized by joint compatible mass; 0 at equilibrium). Exact when
     // there are no StreetEnd leaves; with an oracle it is BR within the
@@ -248,8 +263,9 @@ private:
 // `iters` CFR+ iterations under the same action restriction.
 class ExactStreetOracle : public HunlValueOracle {
 public:
-    ExactStreetOracle(int iters, std::vector<int> allowed = {})
-        : iters_(iters), allowed_(std::move(allowed)) {}
+    ExactStreetOracle(int iters, std::vector<int> allowed = {},
+                      bool pcfr = false)
+        : iters_(iters), allowed_(std::move(allowed)), pcfr_(pcfr) {}
     void value(poker_ppo::PokerEnvironment& env, const uint8_t* board, int nb,
                const HunlPBS& beta,
                std::array<std::vector<double>, 2>& out) override;
@@ -257,6 +273,7 @@ public:
 private:
     int iters_;
     std::vector<int> allowed_;
+    bool pcfr_ = false;
 };
 
 }  // namespace rebel_hunl

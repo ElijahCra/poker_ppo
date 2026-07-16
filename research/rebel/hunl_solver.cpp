@@ -161,9 +161,11 @@ std::vector<double> HunlSolver::policy_row(const Node& nd, int combo,
     const int A = static_cast<int>(nd.acts.size());
     std::vector<double> p(A, 0.0);
     const std::vector<double>& src = average ? nd.cum_strat : nd.regret;
+    const bool use_pred = pcfr && !average && !nd.pred.empty();
     double s = 0.0;
     for (int k = 0; k < A; ++k) {
         double v = src[static_cast<size_t>(combo) * A + k];
+        if (use_pred) v += nd.pred[static_cast<size_t>(combo) * A + k];
         if (v < 0.0) v = 0.0;   // regrets are RM⁺-clamped anyway; belt+braces
         p[k] = v;
         s += v;
@@ -183,12 +185,16 @@ void HunlSolver::policies_into(const Node& nd, bool average,
                                std::vector<double>& out) const {
     const int A = static_cast<int>(nd.acts.size());
     const std::vector<double>& src = average ? nd.cum_strat : nd.regret;
+    // PCFR+: the CURRENT policy regret-matches over [R + m]^+ (m = last
+    // instantaneous regret). The average policy is computed as usual.
+    const bool use_pred = pcfr && !average && !nd.pred.empty();
     out.resize(static_cast<size_t>(kCombos) * A);
     for (int x = 0; x < kCombos; ++x) {
         double s = 0.0;
         const size_t off = static_cast<size_t>(x) * A;
         for (int k = 0; k < A; ++k) {
             double v = src[off + k];
+            if (use_pred) v += nd.pred[off + k];
             if (v < 0.0) v = 0.0;
             out[off + k] = v;
             s += v;
@@ -423,6 +429,13 @@ std::vector<double> HunlSolver::walk(int i, int upd, int t, bool update,
             cfv_a[k] =
                 walk(nd.child[k], upd, t, update, child_reach, opp_reach);
         }
+        // PCFR+ pairs the predictive policy with QUADRATIC strategy
+        // averaging (t^2); CFR+ uses linear (t)
+        const double w_avg = (pcfr && pcfr_quad)
+                                 ? static_cast<double>(t) * t
+                                 : static_cast<double>(t);
+        if (update && pcfr && nd.pred.empty())
+            nd.pred.assign(nd.regret.size(), 0.0);
         for (int x = 0; x < kCombos; ++x) {
             if (!valid_[x]) continue;
             const size_t off = static_cast<size_t>(x) * A;
@@ -431,11 +444,13 @@ std::vector<double> HunlSolver::walk(int i, int upd, int t, bool update,
             cfv[x] = v;
             if (!update) continue;
             for (int k = 0; k < A; ++k) {
+                const double inst = cfv_a[k][x] - v;
                 double& r = nd.regret[off + k];
-                r += cfv_a[k][x] - v;
+                r += inst;
                 if (r < 0.0) r = 0.0;   // RM⁺
+                if (pcfr) nd.pred[off + k] = inst;
                 nd.cum_strat[off + k] +=
-                    static_cast<double>(t) * my_reach[x] * sig[off + k];
+                    w_avg * my_reach[x] * sig[off + k];
             }
         }
         return cfv;
@@ -870,6 +885,7 @@ void ExactStreetOracle::value(poker_ppo::PokerEnvironment& env,
                               const HunlPBS& beta,
                               std::array<std::vector<double>, 2>& out) {
     HunlSolver s(env, beta, /*oracle=*/nullptr, allowed_, board, nb);
+    s.pcfr = pcfr_;
     for (int t = 1; t <= iters_; ++t) s.iterate(t);
     std::array<std::vector<double>, 2> mask;
     s.root_values(out, mask);

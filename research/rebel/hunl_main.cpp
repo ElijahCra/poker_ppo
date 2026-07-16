@@ -745,6 +745,8 @@ int main(int argc, char** argv) {
         if (pc.preflop_solve)
             std::printf("lbr: PREFLOP re-solving ON (T=%d, %d sampled "
                         "flops/leaf)\n", pc.t_preflop, pc.pf_samples);
+        pc.pcfr = env_i("REBEL_PCFR", 0) != 0;
+        if (pc.pcfr) std::printf("lbr: PCFR+ ON (all play-time solves)\n");
         // default OFF: paired 20k A/B measured a wash (1.909 off vs 1.963
         // on, seed 1234) with a worse fold profile — the net-priced
         // alternatives run generous, combos terminate, the follow-range
@@ -777,6 +779,168 @@ int main(int argc, char** argv) {
                     "(LBR win rate %.3f, %.0fs)\n",
                     res.bb_per_hand, res.num_hands, res.lbr_win_rate,
                     res.wall_ms / 1000.0);
+        return 0;
+    }
+    if (mode == "pcfr_bench") {
+        // CFR+ vs PCFR+ on K fixed exact river subgames:
+        //  (1) exploitability vs iterations — the iteration-reduction factor
+        //  (2) root-value agreement of PCFR+ at reduced T vs a LONG CFR+
+        //      reference, judged against CFR+'s own self-distance — the
+        //      "doesn't affect training targets" check.
+        const int K = argc > 2 ? std::atoi(argv[2]) : 3;
+        {
+            const uint8_t warm[5] = {0, 5, 10, 15, 20};
+            (void)combo_rank(ComboTable::get().id[25][30], warm);
+        }
+        const double bb = static_cast<double>(
+            poker_ppo::kPokerConfig.game.big_blind);
+        const std::vector<int> acts = {0, 1, 4, 7, 13};
+        static const int kT[] = {50, 100, 200, 400, 800};
+        std::mt19937_64 rng(20260714);
+        std::uniform_real_distribution<double> u(0.0, 1.0);
+        for (int k = 0; k < K; ++k) {
+            poker_ppo::PokerEnvironment env(poker_ppo::kPokerConfig,
+                                            poker_ppo::config::kBetConfig,
+                                            777 + 131 * k);
+            std::mt19937 wrng(555 + 31 * k);
+            std::uniform_real_distribution<double> uw(0.0, 1.0);
+            for (int tries = 0; tries < 50; ++tries) {
+                env.reset();
+                while (!env.is_terminal() && env.round() < 3) {
+                    int a = 1;
+                    if (uw(wrng) < 0.3) {
+                        static const int kR[] = {4, 7, 10};
+                        a = kR[wrng() % 3];
+                    }
+                    auto mask = env.legal_action_mask();
+                    auto ma = mask.accessor<float, 1>();
+                    env.step(ma[a] > 0.5f ? a : 1);
+                }
+                if (!env.is_terminal() && env.round() == 3) break;
+            }
+            if (env.is_terminal() || env.round() != 3) continue;
+            HunlPBS beta;
+            beta.r0.resize(kCombos);
+            beta.r1.resize(kCombos);
+            for (int i = 0; i < kCombos; ++i) {
+                beta.r0[i] = std::pow(u(rng), 3.0);
+                beta.r1[i] = std::pow(u(rng), 3.0);
+            }
+            std::printf("[situation %d] pot=%d\n", k, env.pot());
+            for (int T : kT) {
+                double e[3];
+                for (int variant = 0; variant < 3; ++variant) {
+                    HunlSolver s(env, beta, nullptr, acts);
+                    s.pcfr = variant >= 1;
+                    s.pcfr_quad = variant == 1;
+                    for (int t = 1; t <= T; ++t) s.iterate(t);
+                    e[variant] = s.exploitability() / bb;
+                }
+                std::printf("  T=%4d  cfr+ %.5f   pcfr+q %.5f (%.1fx)   "
+                            "pcfr+lin %.5f (%.1fx) bb\n", T, e[0],
+                            e[1], e[1] > 0 ? e[0] / e[1] : 0.0,
+                            e[2], e[2] > 0 ? e[0] / e[2] : 0.0);
+                std::fflush(stdout);
+            }
+            // (2) root-value agreement, first situation only (it's the
+            // expensive part): reference = CFR+ T=3200
+            if (k == 0) {
+                auto vals = [&](bool pcfr, int T) {
+                    HunlSolver s(env, beta, nullptr, acts);
+                    s.pcfr = pcfr;
+                    for (int t = 1; t <= T; ++t) s.iterate(t);
+                    std::array<std::vector<double>, 2> v, m;
+                    s.root_values(v, m);
+                    return std::make_pair(v, m);
+                };
+                auto [vr, mr] = vals(false, 3200);
+                const double pot = static_cast<double>(env.pot());
+                auto dist = [&](const std::array<std::vector<double>, 2>& v,
+                                const std::array<std::vector<double>, 2>& m) {
+                    double s = 0.0;
+                    long n = 0;
+                    for (int p = 0; p < 2; ++p)
+                        for (int i = 0; i < kCombos; ++i)
+                            if (m[p][i] > 0.5 && mr[p][i] > 0.5) {
+                                s += std::abs(v[p][i] - vr[p][i]) / pot;
+                                ++n;
+                            }
+                    return n ? s / n : 0.0;
+                };
+                for (int T : {200, 400, 800}) {
+                    auto [vc, mc] = vals(false, T);
+                    auto [vp, mp] = vals(true, T);
+                    std::printf("  root-value mean|d|/pot vs cfr+@3200:  "
+                                "cfr+@%d %.2e   pcfr+@%d %.2e\n",
+                                T, dist(vc, mc), T, dist(vp, mp));
+                    std::fflush(stdout);
+                }
+            }
+        }
+        // ── turn subgames with NET leaves (the dominant play/training
+        // cost) — needs REBEL_CKPT. exploitability() here is BR within
+        // the leaf-valued game: comparative, not absolute.
+        const char* ck = std::getenv("REBEL_CKPT");
+        if (ck && *ck) {
+            HunlValueNet net(1024, 2, false, true);
+            torch::load(net, ck);
+            torch::Device dev(torch::cuda::is_available() ? torch::kCUDA
+                                                          : torch::kCPU);
+            net->to(dev);
+            const double stack = static_cast<double>(
+                poker_ppo::kPokerConfig.game.initial_stack);
+            const std::vector<int> tacts = {0, 1, 7, 13};
+            for (int k = 0; k < K; ++k) {
+                poker_ppo::PokerEnvironment env(
+                    poker_ppo::kPokerConfig, poker_ppo::config::kBetConfig,
+                    999 + 17 * k);
+                std::mt19937 wrng(444 + 13 * k);
+                std::uniform_real_distribution<double> uw(0.0, 1.0);
+                for (int tries = 0; tries < 50; ++tries) {
+                    env.reset();
+                    while (!env.is_terminal() && env.round() < 2) {
+                        int a = 1;
+                        if (uw(wrng) < 0.3) {
+                            static const int kR[] = {4, 7, 10};
+                            a = kR[wrng() % 3];
+                        }
+                        auto mask = env.legal_action_mask();
+                        auto ma = mask.accessor<float, 1>();
+                        env.step(ma[a] > 0.5f ? a : 1);
+                    }
+                    if (!env.is_terminal() && env.round() == 2) break;
+                }
+                if (env.is_terminal() || env.round() != 2) continue;
+                HunlPBS beta;
+                beta.r0.resize(kCombos);
+                beta.r1.resize(kCombos);
+                for (int i = 0; i < kCombos; ++i) {
+                    beta.r0[i] = std::pow(u(rng), 3.0);
+                    beta.r1[i] = std::pow(u(rng), 3.0);
+                }
+                std::printf("[turn situation %d] pot=%d (net leaves)\n", k,
+                            env.pot());
+                for (int T : {30, 60, 120, 240}) {
+                    double e[3];
+                    for (int variant = 0; variant < 3; ++variant) {
+                        HunlNetOracle oracle(net, stack, dev);
+                        HunlSolver s(env, beta, &oracle, tacts);
+                        s.refresh_every = 5;
+                        s.pcfr = variant >= 1;
+                        s.pcfr_quad = variant == 1;
+                        for (int t = 1; t <= T; ++t) s.iterate(t);
+                        e[variant] = s.exploitability() / bb;
+                    }
+                    std::printf("  T=%4d  cfr+ %.5f   pcfr+q %.5f (%.1fx)   "
+                                "pcfr+lin %.5f (%.1fx) bb\n", T, e[0],
+                                e[1], e[1] > 0 ? e[0] / e[1] : 0.0,
+                                e[2], e[2] > 0 ? e[0] / e[2] : 0.0);
+                    std::fflush(stdout);
+                }
+            }
+        } else {
+            std::printf("(set REBEL_CKPT for the net-leaf turn section)\n");
+        }
         return 0;
     }
     if (mode == "flopctx_check") {
@@ -885,6 +1049,8 @@ int main(int argc, char** argv) {
             cfg.gelu_ln = std::atoi(s) != 0;
         if (const char* s = std::getenv("REBEL_ZERO_SUM"))
             cfg.zero_sum = std::atoi(s) != 0;
+        if (const char* s = std::getenv("REBEL_PCFR"))
+            cfg.pcfr = std::atoi(s) != 0;
         env_int("REBEL_CIRCULAR", cfg.circular);
         if (const char* s = std::getenv("REBEL_CKPT")) cfg.ckpt = s;
         if (const char* s = std::getenv("REBEL_DATA_IN")) cfg.data_in = s;

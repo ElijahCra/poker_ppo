@@ -76,6 +76,10 @@ struct RebelPlayConfig {
     // multi-street-showdown reasoning, one street earlier.
     bool   preflop_solve = false;
     int    t_preflop     = 40;
+    // PCFR+ for every play-time solve (same fixed points, fewer
+    // iterations to a given exploitability — or better quality at the
+    // same T). Changes the agent: gate before adopting.
+    bool   pcfr          = false;
     int    pf_samples    = 64;   // sampled flops per preflop leaf
     uint64_t seed     = 0;
 };
