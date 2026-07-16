@@ -163,6 +163,13 @@ public:
 
     std::vector<double> avg_policy(int node, int combo) const;
 
+    // Overwrite a decision node's cumulative average-strategy numerators
+    // (the basis of avg_policy / reaches / beliefs_at) — adopts a solve
+    // computed elsewhere (the batched GPU turn solver) into a CPU solver
+    // built on the identical tree, so every query path works unchanged.
+    // cum layout: [combo * |acts| + k].
+    void set_cum_strat(int node, const std::vector<double>& cum);
+
     // ── Safe re-solving gadget (Burch et al. 2014) ─────────────────────
     // Replaces player `opp`'s fixed root range with a per-combo
     // Terminate/Follow decision, regret-matched across iterations:

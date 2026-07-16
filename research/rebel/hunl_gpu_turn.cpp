@@ -573,7 +573,7 @@ void BatchTurnSolver::solve(int T, int refresh_every,
 
 void refresh_turn_leaves(
     BatchTurnSolver& s, const std::vector<TurnSpec>& specs,
-    std::vector<std::unique_ptr<HunlNetOracle>>& oracles, int threads,
+    const std::vector<HunlNetOracle*>& oracles, int threads,
     TurnRefreshWorkspace* ws) {
     const int B = s.batch();
     const auto& ct = ComboTable::get();

@@ -99,6 +99,11 @@ public:
 
     int batch() const { return B_; }
     torch::Dtype dtype() const { return dt_; }
+    // final cumulative average-strategy numerators of a decision node,
+    // [B, A, n] on device — the state a CPU solver adopts at play time
+    const torch::Tensor& cum_state(int node) const {
+        return cum_[static_cast<size_t>(node)];
+    }
 
 private:
     double weight(int t) const {
@@ -177,7 +182,7 @@ struct TurnRefreshWorkspace {
 // refreshes). Values are thread-partition-independent.
 void refresh_turn_leaves(
     BatchTurnSolver& s, const std::vector<TurnSpec>& specs,
-    std::vector<std::unique_ptr<HunlNetOracle>>& oracles, int threads = 0,
+    const std::vector<HunlNetOracle*>& oracles, int threads = 0,
     TurnRefreshWorkspace* ws = nullptr);
 
 }  // namespace rebel_hunl

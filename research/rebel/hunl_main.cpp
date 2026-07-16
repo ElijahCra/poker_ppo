@@ -748,6 +748,9 @@ int main(int argc, char** argv) {
                         "flops/leaf)\n", pc.t_preflop, pc.pf_samples);
         pc.pcfr = env_i("REBEL_PCFR", 0) != 0;
         if (pc.pcfr) std::printf("lbr: PCFR+ ON (all play-time solves)\n");
+        pc.gpu_turn = env_i("REBEL_GPU_TURN", 0) != 0;
+        if (pc.gpu_turn)
+            std::printf("lbr: GPU TURN solves ON (B=1 state transfer)\n");
         // default OFF: paired 20k A/B measured a wash (1.909 off vs 1.963
         // on, seed 1234) with a worse fold profile — the net-priced
         // alternatives run generous, combos terminate, the follow-range
@@ -915,9 +918,11 @@ int main(int argc, char** argv) {
             for (int b = 0; b < B; ++b)
                 gora.push_back(std::make_unique<HunlNetOracle>(net, stack,
                                                                dev));
+            std::vector<HunlNetOracle*> gop;
+            for (auto& o : gora) gop.push_back(o.get());
             TurnRefreshWorkspace wsp;
             gpu.solve(T, refresh, [&](int) {
-                refresh_turn_leaves(gpu, specs, gora, 0, &wsp);
+                refresh_turn_leaves(gpu, specs, gop, 0, &wsp);
             });
 
             // ── compare iterate-averaged root values ──
@@ -1070,12 +1075,14 @@ int main(int argc, char** argv) {
         std::vector<std::unique_ptr<HunlNetOracle>> gora;
         for (int b = 0; b < B; ++b)
             gora.push_back(std::make_unique<HunlNetOracle>(net, stack, dev));
+        std::vector<HunlNetOracle*> gop;
+        for (auto& o : gora) gop.push_back(o.get());
         double cb_s = 0.0;
         TurnRefreshWorkspace wsp;
         auto ts0 = clk::now();
         gpu.solve(T, refresh, [&](int) {
             auto c0 = clk::now();
-            refresh_turn_leaves(gpu, specs, gora, 0, &wsp);
+            refresh_turn_leaves(gpu, specs, gop, 0, &wsp);
             cb_s += secs(c0, clk::now());
         });
         std::vector<std::array<std::vector<double>, 2>> gv, gm;

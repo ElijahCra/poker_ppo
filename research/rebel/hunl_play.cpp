@@ -236,9 +236,68 @@ std::pair<HunlSolver*, int> RebelTarget::solve_at(PokerEnvironment& env) {
     const int T = river ? cfg_.t_river
                 : round == 2 ? cfg_.t_turn
                 : round == 1 ? cfg_.t_flop : cfg_.t_preflop;
-    for (int t = 1; t <= T; ++t) solver->iterate(t);
+    bool solved = false;
+    if (cfg_.gpu_turn && round == 2 && !cfg_.gadget)
+        solved = gpu_turn_solve(*solver, T);
+    if (!solved)
+        for (int t = 1; t <= T; ++t) solver->iterate(t);
     cache_.push_back(Solve{log, std::move(solver)});
     return {cache_.back().solver.get(), 0};
+}
+
+bool RebelTarget::gpu_turn_solve(HunlSolver& s, int T) {
+    if (!torch::cuda::is_available() || s.board_count() != 4) return false;
+    try {
+        TurnSpec sp;
+        for (int i = 0; i < 4; ++i)
+            sp.board[static_cast<size_t>(i)] = s.board()[static_cast<size_t>(i)];
+        sp.r0 = pbs_.r0;
+        sp.r1 = pbs_.r1;
+        const auto& nodes = s.nodes();
+        sp.node_contrib0.resize(nodes.size());
+        sp.node_contrib1.resize(nodes.size());
+        for (size_t m = 0; m < nodes.size(); ++m) {
+            sp.node_contrib0[m] = nodes[m].contrib[0];
+            sp.node_contrib1[m] = nodes[m].contrib[1];
+        }
+        auto shape = TreeShape::from(s);
+        torch::Device dev(torch::kCUDA);
+        std::vector<TurnSpec> specs{sp};
+        BatchTurnSolver g(shape, specs, dev, torch::kFloat, cfg_.pcfr);
+        HunlNetOracle oracle(net_, stack_, dev);
+        std::vector<HunlNetOracle*> ora{&oracle};
+        // threads=1: gates run one agent per shard across many shards —
+        // nested pools would oversubscribe
+        g.solve(T, cfg_.refresh_every, [&](int) {
+            refresh_turn_leaves(g, specs, ora, /*threads=*/1, &gpu_ws_);
+        });
+        for (size_t m = 0; m < nodes.size(); ++m) {
+            if (nodes[m].kind != HunlSolver::Node::Decision) continue;
+            const int A = static_cast<int>(nodes[m].acts.size());
+            auto cum = g.cum_state(static_cast<int>(m))
+                           .select(0, 0)
+                           .to(torch::kCPU)
+                           .to(torch::kDouble)
+                           .contiguous();   // [A, n]
+            const double* cp = cum.data_ptr<double>();
+            std::vector<double> row(static_cast<size_t>(A) * kCombos);
+            for (int x = 0; x < kCombos; ++x)
+                for (int k = 0; k < A; ++k)
+                    row[static_cast<size_t>(x) * A + k] =
+                        cp[static_cast<size_t>(k) * kCombos + x];
+            s.set_cum_strat(static_cast<int>(m), row);
+        }
+        return true;
+    } catch (const std::exception& e) {
+        static bool warned = false;
+        if (!warned) {
+            std::fprintf(stderr,
+                         "[gpu-turn] play-time solve failed (%s) — CPU "
+                         "fallback\n", e.what());
+            warned = true;
+        }
+        return false;
+    }
 }
 
 void RebelTarget::apply_range_update(int seat,

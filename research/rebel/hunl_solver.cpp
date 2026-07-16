@@ -181,6 +181,15 @@ std::vector<double> HunlSolver::avg_policy(int node, int combo) const {
     return policy_row(nodes_[node], combo, /*average=*/true);
 }
 
+void HunlSolver::set_cum_strat(int node, const std::vector<double>& cum) {
+    Node& nd = nodes_[static_cast<size_t>(node)];
+    TORCH_CHECK(nd.kind == Node::Decision,
+                "set_cum_strat: not a decision node");
+    TORCH_CHECK(cum.size() == nd.cum_strat.size(),
+                "set_cum_strat: size mismatch");
+    nd.cum_strat = cum;
+}
+
 void HunlSolver::policies_into(const Node& nd, bool average,
                                std::vector<double>& out) const {
     const int A = static_cast<int>(nd.acts.size());

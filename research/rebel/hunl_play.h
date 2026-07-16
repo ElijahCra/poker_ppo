@@ -25,6 +25,7 @@
 // runnable — the resulting bound measures that toy hybrid, not ReBeL.
 #pragma once
 
+#include "hunl_gpu_turn.h"
 #include "hunl_solver.h"
 #include "hunl_value.h"
 #include "lbr.h"
@@ -80,6 +81,12 @@ struct RebelPlayConfig {
     // iterations to a given exploitability — or better quality at the
     // same T). Changes the agent: gate before adopting.
     bool   pcfr          = false;
+    // TURN solves on the batched GPU solver (B=1), final average
+    // strategy transferred into the CPU solver's tree. f32 solve —
+    // a different (equally valid) equilibrium selection than the CPU
+    // path: gate before adopting. Requires CUDA; gadget-on falls back
+    // to CPU (values_at needs CPU leaf values).
+    bool   gpu_turn      = false;
     int    pf_samples    = 64;   // sampled flops per preflop leaf
     uint64_t seed     = 0;
 };
@@ -118,6 +125,9 @@ private:
     // drop cached solves; the game-root preflop solve (empty log) is
     // kept — it is identical every hand and reused across hands
     void clear_solves();
+    // solve a freshly built TURN tree on the batched GPU solver and
+    // adopt its average strategy; false = declined (caller iterates CPU)
+    bool gpu_turn_solve(HunlSolver& s, int T);
 
     // first street the agent re-solves; earlier streets play/track under
     // the blueprint
@@ -141,6 +151,7 @@ private:
 
     HunlValueNet  net_;
     double        stack_;
+    TurnRefreshWorkspace gpu_ws_;   // reused across gpu_turn solves
     torch::Device device_;
     RebelPlayConfig cfg_;
     poker_ppo::ILBRTarget* blueprint_;
