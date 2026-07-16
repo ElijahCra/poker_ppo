@@ -112,6 +112,23 @@ public:
                      const std::vector<HunlPBS>& betas,
                      std::vector<std::array<std::vector<double>, 2>>& outs)
         override;
+    // pot-parameterized core — the env above is consulted ONLY for the
+    // pot. Callers that know the leaf pot (the batched turn pipeline
+    // reads it off spec contribs) skip env plumbing entirely.
+    void value_batch_pot(
+        double pot, const uint8_t* base_board, int nb_base,
+        const std::vector<uint8_t>& cards, const std::vector<HunlPBS>& betas,
+        std::vector<std::array<std::vector<double>, 2>>& outs);
+    // Split API for callers that batch MANY leaves into ONE forward
+    // (2400 small per-leaf forwards measured as 98% of the batched turn
+    // solver's wall): river_row_features writes one river-root query row
+    // (cached per-card strength context; NOT thread-safe on one oracle —
+    // distinct oracles are independent); values_forward runs the net on
+    // a [N, kDim] CPU feature block and returns [N, 2*kCombos] on CPU,
+    // in POT units (callers scale by their pots).
+    void river_row_features(const uint8_t* board4, uint8_t card, double pot,
+                            const HunlPBS& beta, float* dst);
+    torch::Tensor values_forward(const torch::Tensor& feats_cpu);
     // preflop leaves: one forward for a whole leaf's sampled flops (the
     // fixed set recurs every leaf × refresh AND across solves — pf_seed
     // is fixed per agent — so the per-flop runout evaluators live in

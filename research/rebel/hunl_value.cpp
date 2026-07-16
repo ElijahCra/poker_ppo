@@ -289,12 +289,18 @@ void HunlNetOracle::value_batch(
     poker_ppo::PokerEnvironment& env, const uint8_t* base_board, int nb_base,
     const std::vector<uint8_t>& cards, const std::vector<HunlPBS>& betas,
     std::vector<std::array<std::vector<double>, 2>>& outs) {
+    const double contrib =
+        static_cast<double>(env.game_config().initial_stack) - env.stack(0);
+    value_batch_pot(2.0 * contrib, base_board, nb_base, cards, betas, outs);
+}
+
+void HunlNetOracle::value_batch_pot(
+    double pot, const uint8_t* base_board, int nb_base,
+    const std::vector<uint8_t>& cards, const std::vector<HunlPBS>& betas,
+    std::vector<std::array<std::vector<double>, 2>>& outs) {
     const long N = static_cast<long>(cards.size());
     outs.resize(cards.size());
     if (N == 0) return;
-    const double contrib =
-        static_cast<double>(env.game_config().initial_stack) - env.stack(0);
-    const double pot = 2.0 * contrib;
     torch::NoGradGuard ng;
     auto X = torch::empty({N, HunlFeaturizer::kDim}, torch::kFloat);
     std::array<uint8_t, 5> b{};
@@ -313,16 +319,12 @@ void HunlNetOracle::value_batch(
         b[nb_base] = card;
         std::vector<float> f;
         if (nb_base + 1 == 5) {
-            CardCtx& cc = ctx_[card];
-            if (!cc.ev) {
-                cc.ev = std::make_unique<RiverEval>(b.data());
-                cc.ev->percentile(cc.pct);
-            }
-            const HunlPBS& beta = betas[static_cast<size_t>(r)];
-            equity_vs_range(*cc.ev, beta.r1, eq0);
-            equity_vs_range(*cc.ev, beta.r0, eq1);
-            f = HunlFeaturizer::features(street_of(5), b.data(), 5, pot,
-                                         stack_, beta, cc.pct, eq0, eq1);
+            river_row_features(base_board, card, pot,
+                               betas[static_cast<size_t>(r)],
+                               X.data_ptr<float>() +
+                                   static_cast<size_t>(r) *
+                                       HunlFeaturizer::kDim);
+            continue;
         } else if (nb_base + 1 == 4) {
             // turn-root query (flop solve leaf): E-over-river strength
             // blocks from the cached per-runout evaluators — building
@@ -391,7 +393,7 @@ void HunlNetOracle::value_batch(
     }
     // ONE forward for the whole leaf (all candidate cards) on the device.
     // Net predicts values in POT units (paper normalization).
-    auto y = net_->forward(X.to(device_)).to(torch::kCPU).contiguous();
+    auto y = values_forward(X);
     auto acc = y.accessor<float, 2>();
     for (long r = 0; r < N; ++r)
         for (int p = 0; p < 2; ++p) {
@@ -400,6 +402,36 @@ void HunlNetOracle::value_batch(
             for (int i = 0; i < kCombos; ++i)
                 o[i] = static_cast<double>(acc[r][p * kCombos + i]) * pot;
         }
+}
+
+void HunlNetOracle::river_row_features(const uint8_t* board4, uint8_t card,
+                                       double pot, const HunlPBS& beta,
+                                       float* dst) {
+    std::array<uint8_t, 5> b{};
+    for (int i = 0; i < 4; ++i) b[i] = board4[i];
+    if (ctx_nb_ != 4 ||
+        !std::equal(b.begin(), b.begin() + 4, ctx_board_.begin())) {
+        for (auto& c : ctx_) c = CardCtx{};
+        ctx_board_ = b;
+        ctx_nb_ = 4;
+    }
+    b[4] = card;
+    CardCtx& cc = ctx_[card];
+    if (!cc.ev) {
+        cc.ev = std::make_unique<RiverEval>(b.data());
+        cc.ev->percentile(cc.pct);
+    }
+    std::vector<double> eq0, eq1;
+    equity_vs_range(*cc.ev, beta.r1, eq0);
+    equity_vs_range(*cc.ev, beta.r0, eq1);
+    auto f = HunlFeaturizer::features(street_of(5), b.data(), 5, pot,
+                                      stack_, beta, cc.pct, eq0, eq1);
+    std::copy(f.begin(), f.end(), dst);
+}
+
+torch::Tensor HunlNetOracle::values_forward(const torch::Tensor& feats_cpu) {
+    torch::NoGradGuard ng;
+    return net_->forward(feats_cpu.to(device_)).to(torch::kCPU).contiguous();
 }
 
 int convert_dataset(const std::string& in, const std::string& out) {

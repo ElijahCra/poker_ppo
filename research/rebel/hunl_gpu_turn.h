@@ -50,6 +50,7 @@ public:
     BatchTurnSolver(TreeShape shape, std::vector<TurnSpec> specs,
                     torch::Device device, torch::Dtype dtype = torch::kFloat,
                     bool pcfr = false, bool pcfr_quad = true);
+    ~BatchTurnSolver();   // out-of-line: CUDAGraph is fwd-declared here
 
     // StreetEnd leaves, in shape order. leaf_reaches/set_leaf_values are
     // indexed by position in this list.
@@ -66,6 +67,13 @@ public:
     void leaf_reaches(
         int leaf_idx,
         std::vector<std::array<std::vector<double>, 2>>& out);
+    // All leaves at once: ONE download of the average policies, path
+    // walks on CPU threads. The per-leaf device walk costs ~30 kernel
+    // launches + 2 syncs per leaf per refresh — measured dominant.
+    // out[leaf][b][player][combo].
+    void all_leaf_reaches(
+        std::vector<std::vector<std::array<std::vector<double>, 2>>>& out,
+        int threads = 0);
 
     // Upload leaf values: CPU tensor [B, 52, 2, n] (chips, absolute — the
     // oracle's ×pot convention), card slot = runout river card; slots for
@@ -90,8 +98,15 @@ public:
         std::vector<std::array<std::vector<double>, 2>>& mask);
 
     int batch() const { return B_; }
+    torch::Dtype dtype() const { return dt_; }
 
 private:
+    double weight(int t) const {
+        return pcfr_ && pcfr_quad_
+            ? static_cast<double>(t) * static_cast<double>(t)
+            : static_cast<double>(t);
+    }
+    void iterate_body();   // both update passes + root-value accumulation
     torch::Tensor policies(int node, bool average);       // [B, A, n]
     torch::Tensor fold_cfv_t(int node, int upd, const torch::Tensor& opp);
     torch::Tensor allin_cfv_t(int node, const torch::Tensor& opp);
@@ -114,9 +129,18 @@ private:
     // per-spec
     torch::Tensor valid_;             // [B, n] (valid on the 4-card board)
     torch::Tensor r0_, r1_;           // [B, n] normalized root ranges
+    torch::Tensor r0c_, r1c_;         // CPU float copies (reach walks)
     torch::Tensor runout_ok_;         // [B, 52, 1]: card off the board
     torch::Tensor c0_, c1_;           // [B, nodes] contribs
-    // per-(spec, runout) showdown structure, runouts on the batch dim
+    // AllinShowdown as a precomputed linear operator: cfv = Op · opp,
+    // Op[x][y] = half_pot/44 · Σ_runouts sign(x beats y) with exact card
+    // removal — one bmm per pass instead of the 48-runout showdown
+    // pipeline (measured dominant per iteration). [B, n, n], ~225MB at
+    // B=32 f32. REBEL_NO_ALLIN_OP falls back to the runout kernels.
+    bool use_allin_op_ = false;
+    torch::Tensor allin_op_;
+    // fallback: per-(spec, runout) showdown structure, runouts on the
+    // batch dim (built + uploaded only when the operator is off)
     torch::Tensor perm52_, prev52_, seg52_;      // [B*52, n] long
     torch::Tensor poscard52_;                    // [B*52, 52*51] long
     torch::Tensor ilowA52_, ilowB52_, iendA52_, iendB52_, itotA52_,
@@ -131,6 +155,29 @@ private:
     // iterate-averaged root values
     std::array<torch::Tensor, 2> root_acc_{};
     long rv_n_ = 0;
+    std::unique_ptr<at::cuda::CUDAGraph> graph_;
 };
+
+class HunlNetOracle;
+
+// Reusable host buffers for refresh_turn_leaves: the per-refresh feature
+// block (~250MB at B=32) and per-leaf value tensors (~200MB) re-alloc +
+// first-touch cost more than the math when created fresh every refresh.
+struct TurnRefreshWorkspace {
+    torch::Tensor X;                   // [R, kDim] float CPU (pinned)
+    torch::Tensor Y;                   // [R, 2n] float CPU (forward out)
+    std::vector<torch::Tensor> vals;   // per leaf [B, 52, 2, n]
+};
+
+// Standard oracle round-trip for one refresh: leaf beliefs via ONE
+// policy download + CPU walks, feature rows for every (spec, leaf,
+// card) built by `threads` workers into one block, ONE net forward,
+// threaded scatter back. One oracle per spec (the per-card strength
+// context is keyed by the spec's board; contexts persist across
+// refreshes). Values are thread-partition-independent.
+void refresh_turn_leaves(
+    BatchTurnSolver& s, const std::vector<TurnSpec>& specs,
+    std::vector<std::unique_ptr<HunlNetOracle>>& oracles, int threads = 0,
+    TurnRefreshWorkspace* ws = nullptr);
 
 }  // namespace rebel_hunl

@@ -882,8 +882,10 @@ int main(int argc, char** argv) {
                     shape.nodes.size(), n_leaves, pcfr ? 1 : 0,
                     dev.is_cuda() ? "cuda" : "cpu");
 
-        for (int phase = 0; phase < 2; ++phase) {
+        for (int phase = 0; phase < 3; ++phase) {
+            // 0: f64 frozen leaves; 1: f64 live refresh; 2: f32 live
             const int refresh = phase == 0 ? 1000000 : 5;
+            const auto gdt = phase == 2 ? torch::kFloat : torch::kDouble;
             // ── CPU side: fresh solvers, tracked root values ──
             std::vector<std::unique_ptr<HunlSolver>> cpu;
             std::vector<std::unique_ptr<HunlNetOracle>> oracles;
@@ -905,62 +907,18 @@ int main(int argc, char** argv) {
                 for (int b = 0; b < B; ++b) cpu[static_cast<size_t>(b)]
                     ->iterate(t);
 
-            // ── GPU side: one batch, oracle round-trip in the callback ──
-            BatchTurnSolver gpu(shape, specs, dev, torch::kDouble, pcfr);
+            // ── GPU side: one batch; the shared oracle round-trip (pot
+            // read off spec contribs — validates value_batch_pot against
+            // the CPU side's env-based path) ──
+            BatchTurnSolver gpu(shape, specs, dev, gdt, pcfr);
             std::vector<std::unique_ptr<HunlNetOracle>> gora;
             for (int b = 0; b < B; ++b)
                 gora.push_back(std::make_unique<HunlNetOracle>(net, stack,
                                                                dev));
-            auto refresh_cb = [&](int) {
-                const int L = static_cast<int>(gpu.leaf_nodes().size());
-                for (int j = 0; j < L; ++j) {
-                    std::vector<std::array<std::vector<double>, 2>> reach;
-                    gpu.leaf_reaches(j, reach);
-                    auto vals = torch::zeros(
-                        {B, static_cast<long>(kCards), 2,
-                         static_cast<long>(kCombos)},
-                        torch::TensorOptions().dtype(torch::kDouble));
-                    auto va = vals.accessor<double, 4>();
-                    for (int b = 0; b < B; ++b) {
-                        auto& env = *envs[static_cast<size_t>(b)];
-                        env.push_state();
-                        for (int a : gpu.leaf_path(j)) env.step(a);
-                        std::vector<uint8_t> cards;
-                        std::vector<HunlPBS> betas;
-                        const auto& bd = specs[static_cast<size_t>(b)].board;
-                        for (int c = 0; c < kCards; ++c) {
-                            bool on = false;
-                            for (int q = 0; q < 4; ++q)
-                                if (bd[static_cast<size_t>(q)] == c)
-                                    on = true;
-                            if (on) continue;
-                            HunlPBS lb;
-                            lb.r0 = reach[static_cast<size_t>(b)][0];
-                            lb.r1 = reach[static_cast<size_t>(b)][1];
-                            const auto& ctm = ComboTable::get();
-                            for (int x = 0; x < kCombos; ++x)
-                                if (ctm.cards[x][0] == c ||
-                                    ctm.cards[x][1] == c)
-                                    lb.r0[static_cast<size_t>(x)] =
-                                        lb.r1[static_cast<size_t>(x)] = 0.0;
-                            cards.push_back(static_cast<uint8_t>(c));
-                            betas.push_back(std::move(lb));
-                        }
-                        std::vector<std::array<std::vector<double>, 2>> outs;
-                        gora[static_cast<size_t>(b)]->value_batch(
-                            env, bd.data(), 4, cards, betas, outs);
-                        for (size_t q = 0; q < cards.size(); ++q)
-                            for (int p = 0; p < 2; ++p)
-                                for (int x = 0; x < kCombos; ++x)
-                                    va[b][cards[q]][p][x] =
-                                        outs[q][static_cast<size_t>(p)]
-                                            [static_cast<size_t>(x)];
-                        env.pop_state();
-                    }
-                    gpu.set_leaf_values(j, vals);
-                }
-            };
-            gpu.solve(T, refresh, refresh_cb);
+            TurnRefreshWorkspace wsp;
+            gpu.solve(T, refresh, [&](int) {
+                refresh_turn_leaves(gpu, specs, gora, 0, &wsp);
+            });
 
             // ── compare iterate-averaged root values ──
             std::vector<std::array<std::vector<double>, 2>> gv, gm;
@@ -992,15 +950,162 @@ int main(int argc, char** argv) {
                     }
             }
             mean = cnt ? mean / static_cast<double>(cnt) : 0.0;
-            const double bar_mean = phase == 0 ? 1e-6 : 1e-3;
-            const double bar_max = phase == 0 ? 1e-4 : 5e-2;
+            // f32 bars follow the river solver's calibration (mean =
+            // arithmetic honesty; max = RM+ clamp-order equilibrium drift)
+            const double bar_mean = phase == 0 ? 1e-6
+                                  : phase == 1 ? 1e-3 : 2e-3;
+            const double bar_max = phase == 0 ? 1e-4
+                                 : phase == 1 ? 5e-2 : 5e-2;
+            static const char* kPhase[] = {"A (f64 frozen leaves)",
+                                           "B (f64 live refresh)",
+                                           "C (f32 live refresh)"};
             std::printf("  phase %s: |dv|/pot mean=%.3e max=%.3e  %s\n",
-                        phase == 0 ? "A (frozen leaves)"
-                                   : "B (live refresh) ",
-                        mean, mx,
+                        kPhase[phase], mean, mx,
                         (mean <= bar_mean && mx <= bar_max) ? "PASS"
                                                             : "FAIL");
             std::fflush(stdout);
+        }
+        return 0;
+    }
+    if (mode == "turn_gpu_bench") {
+        // Throughput: one batched GPU turn solve (graphed iterations +
+        // oracle refreshes) vs the CPU solver on the same specs.
+        // usage: turn_gpu_bench [B] [T]  (REBEL_CKPT required;
+        //        REBEL_PCFR, REBEL_REFRESH=5, REBEL_CPU_REF=2)
+        const int B = argc > 2 ? std::atoi(argv[2]) : 32;
+        const int T = argc > 3 ? std::atoi(argv[3]) : 120;
+        const int refresh = std::getenv("REBEL_REFRESH")
+            ? std::atoi(std::getenv("REBEL_REFRESH")) : 5;
+        int cpu_ref = std::getenv("REBEL_CPU_REF")
+            ? std::atoi(std::getenv("REBEL_CPU_REF")) : 2;
+        const char* ck = std::getenv("REBEL_CKPT");
+        const bool pcfr = std::getenv("REBEL_PCFR") &&
+                          std::atoi(std::getenv("REBEL_PCFR")) != 0;
+        if (!ck || !*ck) {
+            std::fprintf(stderr, "turn_gpu_bench needs REBEL_CKPT\n");
+            return 1;
+        }
+        {
+            const uint8_t warm[5] = {0, 5, 10, 15, 20};
+            (void)combo_rank(ComboTable::get().id[25][30], warm);
+        }
+        HunlValueNet net(1024, 2, false, true);
+        torch::load(net, ck);
+        torch::Device dev(torch::cuda::is_available() ? torch::kCUDA
+                                                      : torch::kCPU);
+        net->to(dev);
+        const double stack = static_cast<double>(
+            poker_ppo::kPokerConfig.game.initial_stack);
+        const std::vector<int> acts = {0, 1, 7, 13};
+        std::mt19937_64 rng(20260716);
+        std::uniform_real_distribution<double> u(0.0, 1.0);
+        HunlNetOracle shape_oracle(net, stack, dev);
+        std::vector<std::unique_ptr<poker_ppo::PokerEnvironment>> envs;
+        std::vector<TurnSpec> specs;
+        std::string sig;
+        TreeShape shape;
+        for (int tries = 0; tries < std::max(4000, 300 * B) &&
+                            static_cast<int>(specs.size()) < B; ++tries) {
+            auto env = std::make_unique<poker_ppo::PokerEnvironment>(
+                poker_ppo::kPokerConfig, poker_ppo::config::kBetConfig,
+                60601 + 11 * tries);
+            std::mt19937 wrng(881 + 5 * tries);
+            std::uniform_real_distribution<double> uw(0.0, 1.0);
+            env->reset();
+            while (!env->is_terminal() && env->round() < 2) {
+                int a = 1;
+                if (uw(wrng) < 0.3) {
+                    static const int kR[] = {4, 7, 10};
+                    a = kR[wrng() % 3];
+                }
+                auto mask = env->legal_action_mask();
+                auto ma = mask.accessor<float, 1>();
+                env->step(ma[a] > 0.5f ? a : 1);
+            }
+            if (env->is_terminal() || env->round() != 2) continue;
+            TurnSpec sp;
+            for (int i = 0; i < 4; ++i)
+                sp.board[static_cast<size_t>(i)] =
+                    static_cast<uint8_t>(env->community_card(i));
+            sp.r0.resize(kCombos);
+            sp.r1.resize(kCombos);
+            for (int i = 0; i < kCombos; ++i) {
+                sp.r0[static_cast<size_t>(i)] = std::pow(u(rng), 3.0);
+                sp.r1[static_cast<size_t>(i)] = std::pow(u(rng), 3.0);
+            }
+            HunlPBS beta;
+            beta.r0 = sp.r0;
+            beta.r1 = sp.r1;
+            HunlSolver s(*env, beta, &shape_oracle, acts);
+            auto sh = TreeShape::from(s);
+            if (sig.empty()) {
+                sig = sh.signature;
+                shape = sh;
+            }
+            if (sh.signature != sig) continue;
+            sp.node_contrib0.resize(s.nodes().size());
+            sp.node_contrib1.resize(s.nodes().size());
+            for (size_t m = 0; m < s.nodes().size(); ++m) {
+                sp.node_contrib0[m] = s.nodes()[m].contrib[0];
+                sp.node_contrib1[m] = s.nodes()[m].contrib[1];
+            }
+            envs.push_back(std::move(env));
+            specs.push_back(std::move(sp));
+        }
+        if (static_cast<int>(specs.size()) < B) {
+            std::fprintf(stderr, "only %zu/%d specs share a topology\n",
+                         specs.size(), B);
+            return 1;
+        }
+        using clk = std::chrono::steady_clock;
+        auto secs = [](clk::time_point a, clk::time_point b) {
+            return std::chrono::duration<double>(b - a).count();
+        };
+        std::printf("turn_gpu_bench: B=%d T=%d refresh=%d pcfr=%d nodes=%zu "
+                    "device=%s f32\n", B, T, refresh, pcfr ? 1 : 0,
+                    shape.nodes.size(), dev.is_cuda() ? "cuda" : "cpu");
+        auto tc0 = clk::now();
+        BatchTurnSolver gpu(shape, specs, dev, torch::kFloat, pcfr);
+        auto tc1 = clk::now();
+        std::vector<std::unique_ptr<HunlNetOracle>> gora;
+        for (int b = 0; b < B; ++b)
+            gora.push_back(std::make_unique<HunlNetOracle>(net, stack, dev));
+        double cb_s = 0.0;
+        TurnRefreshWorkspace wsp;
+        auto ts0 = clk::now();
+        gpu.solve(T, refresh, [&](int) {
+            auto c0 = clk::now();
+            refresh_turn_leaves(gpu, specs, gora, 0, &wsp);
+            cb_s += secs(c0, clk::now());
+        });
+        std::vector<std::array<std::vector<double>, 2>> gv, gm;
+        gpu.avg_root_values(gv, gm);
+        auto ts1 = clk::now();
+        const double wall = secs(ts0, ts1);
+        std::printf("  gpu: ctor %.2fs  solve %.2fs (refresh %.2fs = %.0f%%)"
+                    "  -> %.1f targets/s\n", secs(tc0, tc1), wall, cb_s,
+                    100.0 * cb_s / wall, B / wall);
+        cpu_ref = std::min(cpu_ref, B);
+        if (cpu_ref > 0) {
+            auto tr0 = clk::now();
+            for (int b = 0; b < cpu_ref; ++b) {
+                HunlPBS beta;
+                beta.r0 = specs[static_cast<size_t>(b)].r0;
+                beta.r1 = specs[static_cast<size_t>(b)].r1;
+                HunlNetOracle orc(net, stack, dev);
+                HunlSolver s(*envs[static_cast<size_t>(b)], beta, &orc,
+                             acts);
+                s.refresh_every = refresh;
+                s.pcfr = pcfr;
+                s.track_root_values();
+                for (int t = 1; t <= T; ++t) s.iterate(t);
+                std::array<std::vector<double>, 2> v, m;
+                s.avg_root_values(v, m);
+            }
+            const double cpu_s = secs(tr0, clk::now()) / cpu_ref;
+            std::printf("  cpu: %.2fs/solve (1 thread)  -> batch speedup "
+                        "%.1fx (vs %d such threads: %.1fx)\n", cpu_s,
+                        cpu_s * B / wall, B, cpu_s / wall);
         }
         return 0;
     }
