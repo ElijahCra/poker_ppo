@@ -1377,6 +1377,7 @@ int main(int argc, char** argv) {
         env_int("REBEL_PF_SAMPLES", cfg.pf_samples);
         env_int("REBEL_THREADS", cfg.threads);
         env_int("REBEL_GPU_BATCH", cfg.gpu_batch);
+        env_int("REBEL_GPU_TURN_BATCH", cfg.gpu_turn_batch);
         env_int("REBEL_HARVEST", cfg.harvest);
         env_int("REBEL_HIDDEN", cfg.hidden);
         env_int("REBEL_LAYERS", cfg.layers);

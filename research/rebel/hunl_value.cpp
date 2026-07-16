@@ -1,6 +1,7 @@
 #include "hunl_value.h"
 
 #include "hunl_gpu.h"
+#include "hunl_gpu_turn.h"
 
 #include <fcntl.h>
 #include <sys/file.h>
@@ -867,6 +868,152 @@ void EndgameTrainer::gpu_river_epoch(
     }
 }
 
+void EndgameTrainer::gpu_turn_epoch(
+    std::vector<std::unique_ptr<poker_ppo::PokerEnvironment>>& envs, int W,
+    int ep, std::vector<Sample>& fresh, int episodes) {
+    struct Pending {
+        TurnSpec sp;
+        std::string sig;
+        bool ok = false;
+    };
+    std::vector<Pending> pend(static_cast<size_t>(episodes));
+    std::unordered_map<std::string, TreeShape> shapes;
+    std::mutex mtx;
+    std::atomic<int> next{0};
+    auto work = [&](int w) {
+        std::mt19937 wrng(static_cast<unsigned>(
+            cfg_.seed * 1000003u + ep * 7919u + w * 104729u + 29u));
+        while (true) {
+            const int e = next.fetch_add(1);
+            if (e >= episodes) break;
+            auto& env = *envs[static_cast<size_t>(w)];
+            bool root = false;
+            for (int tries = 0; tries < 50 && !root; ++tries)
+                root = sample_street_root(env, wrng, 2);
+            if (!root) continue;
+            Pending& p = pend[static_cast<size_t>(e)];
+            for (int i = 0; i < 4; ++i)
+                p.sp.board[static_cast<size_t>(i)] =
+                    static_cast<uint8_t>(env.community_card(i));
+            p.sp.r0 = random_range(wrng, p.sp.board.data(), 4);
+            p.sp.r1 = random_range(wrng, p.sp.board.data(), 4);
+            HunlPBS beta;
+            beta.r0 = p.sp.r0;
+            beta.r1 = p.sp.r1;
+            HunlSolver tmp(env, beta, nullptr, cfg_.actions);
+            auto sh = TreeShape::from(tmp);
+            p.sig = sh.signature;
+            for (const auto& nd : tmp.nodes()) {
+                p.sp.node_contrib0.push_back(nd.contrib[0]);
+                p.sp.node_contrib1.push_back(nd.contrib[1]);
+            }
+            {
+                std::lock_guard<std::mutex> lk(mtx);
+                shapes.emplace(p.sig, std::move(sh));
+            }
+            p.ok = true;
+        }
+    };
+    if (W == 1) {
+        work(0);
+    } else {
+        std::vector<std::thread> pool;
+        for (int w = 0; w < W; ++w) pool.emplace_back(work, w);
+        for (auto& th : pool) th.join();
+    }
+
+    // group by topology signature, solve in device batches (fused kernel
+    // + on-device leaf featurization; net shared read-only with the CPU
+    // worker pool — inference is thread-safe)
+    std::unordered_map<std::string, std::vector<int>> groups;
+    for (size_t e = 0; e < pend.size(); ++e)
+        if (pend[e].ok) groups[pend[e].sig].push_back(static_cast<int>(e));
+    for (auto& [sig, idxs] : groups) {
+        for (size_t off = 0; off < idxs.size();
+             off += static_cast<size_t>(cfg_.gpu_turn_batch)) {
+            const size_t end = std::min(
+                idxs.size(),
+                off + static_cast<size_t>(cfg_.gpu_turn_batch));
+            std::vector<TurnSpec> batch;
+            batch.reserve(end - off);
+            for (size_t k = off; k < end; ++k)
+                batch.push_back(pend[static_cast<size_t>(idxs[k])].sp);
+            BatchTurnSolver bs(shapes[sig], batch, device_, torch::kFloat,
+                               cfg_.pcfr);
+            bs.solve(cfg_.t_turn, /*refresh_every=*/5,
+                     [&](int) { bs.refresh_leaves_device(net_, stack_); });
+            std::vector<std::array<std::vector<double>, 2>> v, m;
+            if (!bs.avg_root_values(v, m)) continue;
+            // street-2 rows (iterate-averaged TURN-ROOT values — the
+            // ReBeL target). The nb==4 featurizer (48 river evals/row)
+            // is the emission cost: parallelize across the batch.
+            const int EW = std::max(1, std::min(W * 4,
+                                                static_cast<int>(
+                                                    batch.size())));
+            std::vector<std::vector<Sample>> out_w(
+                static_cast<size_t>(EW));
+            std::atomic<int> bnext{0};
+            auto emit = [&](int w) {
+                while (true) {
+                    const int b = bnext.fetch_add(1);
+                    if (b >= static_cast<int>(batch.size())) break;
+                    const TurnSpec& sp = batch[static_cast<size_t>(b)];
+                    const double pot = 2.0 * sp.node_contrib0[0];
+                    if (pot <= 0.0) continue;
+                    std::vector<uint8_t> v4;
+                    board_valid(sp.board.data(), 4, v4);
+                    HunlPBS nb;
+                    nb.r0 = sp.r0;
+                    nb.r1 = sp.r1;
+                    double s0 = 0.0, s1 = 0.0;
+                    for (int i = 0; i < kCombos; ++i) {
+                        if (!v4[i]) {
+                            nb.r0[i] = nb.r1[i] = 0.0;
+                            continue;
+                        }
+                        s0 += nb.r0[i];
+                        s1 += nb.r1[i];
+                    }
+                    if (s0 <= 0.0 || s1 <= 0.0) continue;
+                    for (int i = 0; i < kCombos; ++i) {
+                        nb.r0[i] /= s0;
+                        nb.r1[i] /= s1;
+                    }
+                    Sample smp;
+                    smp.feat = HunlFeaturizer::features(
+                        2, sp.board.data(), 4, pot, stack_, nb);
+                    smp.target.assign(2 * kCombos, 0.0f);
+                    smp.mask.assign(2 * kCombos, 0.0f);
+                    for (int p = 0; p < 2; ++p)
+                        for (int i = 0; i < kCombos; ++i) {
+                            if (m[static_cast<size_t>(b)]
+                                 [static_cast<size_t>(p)]
+                                 [static_cast<size_t>(i)] < 0.5)
+                                continue;
+                            smp.target[p * kCombos + i] =
+                                static_cast<float>(
+                                    v[static_cast<size_t>(b)]
+                                     [static_cast<size_t>(p)]
+                                     [static_cast<size_t>(i)] / pot);
+                            smp.mask[p * kCombos + i] = 1.0f;
+                        }
+                    out_w[static_cast<size_t>(w)].push_back(
+                        std::move(smp));
+                }
+            };
+            if (EW == 1) {
+                emit(0);
+            } else {
+                std::vector<std::thread> pool;
+                for (int w = 0; w < EW; ++w) pool.emplace_back(emit, w);
+                for (auto& th : pool) th.join();
+            }
+            for (auto& ow : out_w)
+                for (auto& s : ow) fresh.push_back(std::move(s));
+        }
+    }
+}
+
 std::vector<double> EndgameTrainer::random_range(std::mt19937& rng,
                                                  const uint8_t* board,
                                                  int nb) {
@@ -1630,8 +1777,13 @@ void EndgameTrainer::run() {
     // thread and the CPU worker pool can run the SAME epoch concurrently
     std::vector<std::unique_ptr<poker_ppo::PokerEnvironment>> envs_gpu;
     const int Wg = 4;
-    double gpu_frac = 0.33;   // ≈ 53 / (53 + 110) measured split
-    if (cfg_.river_only && cfg_.gpu_batch > 0) {
+    // turn lane: GPU episodes are 1 street-2 row each vs a CPU episode's
+    // ~1+harvest rows — and the batch path is the street-2 machine, so
+    // it takes most of the episode budget by default
+    const bool turn_gpu_lane = !cfg_.river_only && !cfg_.flop_mode &&
+                               !cfg_.root_mode && cfg_.gpu_turn_batch > 0;
+    double gpu_frac = cfg_.river_only ? 0.33 : 0.9;
+    if ((cfg_.river_only && cfg_.gpu_batch > 0) || turn_gpu_lane) {
         if (const char* s = std::getenv("REBEL_GPU_FRAC"))
             gpu_frac = std::atof(s);
         for (int w = 0; w < Wg; ++w)
@@ -1676,17 +1828,22 @@ void EndgameTrainer::run() {
         // lockstep batches while the CPU pool solves the rest — separate
         // resources, so sequential use (the old exclusive gpu path)
         // wasted whichever one wasn't running
-        const int e_gpu =
-            (cfg_.river_only && cfg_.gpu_batch > 0 && device_.is_cuda())
-                ? std::min(cfg_.episodes,
-                           static_cast<int>(cfg_.episodes * gpu_frac))
-                : 0;
+        const bool gpu_lane_on =
+            device_.is_cuda() &&
+            ((cfg_.river_only && cfg_.gpu_batch > 0) || turn_gpu_lane);
+        const int e_gpu = gpu_lane_on
+            ? std::min(cfg_.episodes,
+                       static_cast<int>(cfg_.episodes * gpu_frac))
+            : 0;
         const int e_cpu = cfg_.episodes - e_gpu;
         std::vector<Sample> fresh_gpu;
         std::unique_ptr<std::thread> gpu_thr;
         if (e_gpu > 0)
             gpu_thr = std::make_unique<std::thread>([&, ep, e_gpu] {
-                gpu_river_epoch(envs_gpu, Wg, ep, fresh_gpu, e_gpu);
+                if (cfg_.river_only)
+                    gpu_river_epoch(envs_gpu, Wg, ep, fresh_gpu, e_gpu);
+                else
+                    gpu_turn_epoch(envs_gpu, Wg, ep, fresh_gpu, e_gpu);
             });
         // episodes fan out over the worker pool (work-stealing counter)
         std::vector<std::vector<Sample>> fresh_w(W);

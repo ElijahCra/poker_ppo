@@ -244,6 +244,13 @@ struct EndgameConfig {
     // (BatchRiverSolver; equivalence-validated vs the CPU solver). CPU
     // workers build specs; the device does the solving.
     int    gpu_batch    = 0;
+    // >0 (train_turn only): a GPU lane solves TURN targets in lockstep
+    // batches of this size (BatchTurnSolver: fused kernel + on-device
+    // leaf featurization, PCFR+-aware). A GPU episode yields ONE
+    // street-2 row and NO river harvest — river rows come from the
+    // river lanes — so size `episodes` accordingly. REBEL_GPU_FRAC
+    // splits episodes between this lane (default 0.9) and CPU workers.
+    int    gpu_turn_batch = 0;
     // net checkpoint: loaded at start if present, saved each epoch. Lets a
     // train_turn run fine-tune a river-pretrained net (and later serves the
     // play-time solver). Empty = off.
@@ -306,6 +313,12 @@ private:
     // Runs on its own env pool so it can PIPELINE with the CPU worker pool
     // (separate resources; sequential use wastes one of them).
     void gpu_river_epoch(
+        std::vector<std::unique_ptr<poker_ppo::PokerEnvironment>>& envs,
+        int W, int ep, std::vector<Sample>& fresh, int episodes);
+    // GPU turn lane (train_turn): CPU workers build TurnSpecs, the
+    // device solves signature-grouped lockstep batches, street-2 rows
+    // are emitted from iterate-averaged root values.
+    void gpu_turn_epoch(
         std::vector<std::unique_ptr<poker_ppo::PokerEnvironment>>& envs,
         int W, int ep, std::vector<Sample>& fresh, int episodes);
     // Random training range for the situation's board (nb=5 river, nb=4
