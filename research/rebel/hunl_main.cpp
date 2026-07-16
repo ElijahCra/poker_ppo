@@ -593,6 +593,15 @@ int run_gadget_check(int T) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    // REBEL_TF32=1: TF32 tensor-core matmuls (Ampere+, ~2x f32 GEMM
+    // throughput; 10-bit mantissa). Affects every net forward (leaf
+    // refreshes, play solves) and training GEMMs — a numerics change,
+    // so opt-in: gate agents built with it before comparing to without.
+    if (const char* s = std::getenv("REBEL_TF32"); s && std::atoi(s)) {
+        at::globalContext().setAllowTF32CuBLAS(true);
+        at::globalContext().setAllowTF32CuDNN(true);
+        std::printf("TF32 matmuls ON\n");
+    }
     const std::string mode = argc > 1 ? argv[1] : "kernels";
     if (mode == "kernels") return run_kernels();
     if (mode == "gadget_check")

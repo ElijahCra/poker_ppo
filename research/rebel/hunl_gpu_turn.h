@@ -186,6 +186,7 @@ private:
     torch::Tensor pct52_;    // [B, 52, n] percentile per (spec, runout)
     torch::Tensor fbase_;    // [B, 52] base-board one-hot
     torch::Tensor eye52_;    // [52, 52]
+    torch::Tensor feat_X_;   // [L·B·52, kDim] persistent feature buffer
 };
 
 class HunlNetOracle;

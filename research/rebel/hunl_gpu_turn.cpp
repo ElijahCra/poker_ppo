@@ -532,13 +532,44 @@ void BatchTurnSolver::refresh_leaves_device(HunlValueNet& net,
                 "refresh_leaves_device: f32 solves only");
     const long n = kCombos;
     const long BR = static_cast<long>(B_) * kCards;
+    const long L = static_cast<long>(leaf_nodes_.size());
     const long off = 4 + kCards + 1;
-    for (size_t j = 0; j < leaf_nodes_.size(); ++j) {
+    if (!feat_X_.defined()) {
+        // persistent feature buffer, ALL leaves stacked on the row dim so
+        // the refresh runs ONE forward. Constant blocks (street one-hot,
+        // board multi-hot, pot, percentiles) are written once per solve;
+        // per refresh only ranges + equity move.
+        feat_X_ = torch::zeros({L * BR, HunlFeaturizer::kDim},
+                               r0_.options());
+        feat_X_.narrow(1, 3, 1).fill_(1.0);   // street 3 (river queries)
+        auto bd = (fbase_.unsqueeze(1).expand({B_,
+                                               static_cast<long>(kCards),
+                                               static_cast<long>(kCards)}) +
+                   eye52_.unsqueeze(0))
+                      .reshape({BR, static_cast<long>(kCards)});
+        for (long j = 0; j < L; ++j) {
+            auto rows = feat_X_.narrow(0, j * BR, BR);
+            rows.narrow(1, 4, kCards).copy_(bd);
+            auto pot = c0_.select(1, leaf_nodes_[static_cast<size_t>(j)]) *
+                       2.0;
+            rows.narrow(1, 4 + kCards, 1)
+                .copy_((pot / stack)
+                           .unsqueeze(1)
+                           .expand({B_, static_cast<long>(kCards)})
+                           .reshape({BR, 1}));
+            rows.narrow(1, off + 2 * n, n).copy_(pct52_.reshape({BR, n}));
+        }
+    }
+    // dead combos (x∋c, invalid on the turn board, pads) must read eq=0
+    // exactly as the CPU path writes them — the prefix pads produce
+    // nonzero garbage there otherwise
+    auto dead = mask_xc_ * valid_.unsqueeze(1);              // [B, 52, n]
+    for (long j = 0; j < L; ++j) {
         // average-profile reaches, never leaving the device
         auto r0 = r0_.clone();
         auto r1 = r1_.clone();
         int node = 0;
-        for (int a : leaf_path_[j]) {
+        for (int a : leaf_path_[static_cast<size_t>(j)]) {
             const auto& nd = shape_.nodes[static_cast<size_t>(node)];
             int k = -1;
             for (size_t q = 0; q < nd.acts.size(); ++q)
@@ -552,35 +583,22 @@ void BatchTurnSolver::refresh_leaves_device(HunlValueNet& net,
         // exactly these (unnormalized) as the range features
         auto r0c = r0.unsqueeze(1) * mask_xc_;               // [B, 52, n]
         auto r1c = r1.unsqueeze(1) * mask_xc_;
-        // dead combos (x∋c, invalid on the turn board, pads) must read
-        // eq=0 exactly as the CPU path writes them — the prefix pads
-        // produce nonzero garbage there otherwise
-        auto dead = mask_xc_ * valid_.unsqueeze(1);          // [B, 52, n]
         auto eq0 = runout_equity(r1c) * dead;
         auto eq1 = runout_equity(r0c) * dead;
-        auto X = torch::zeros({BR, HunlFeaturizer::kDim},
-                              r0.options());
-        X.narrow(1, 3, 1).fill_(1.0);   // street 3 (river-root queries)
-        auto bd = fbase_.unsqueeze(1).expand({B_, static_cast<long>(kCards),
-                                              static_cast<long>(kCards)}) +
-                  eye52_.unsqueeze(0);
-        X.narrow(1, 4, kCards).copy_(bd.reshape({BR, kCards}));
-        auto pot = c0_.select(1, leaf_nodes_[j]) * 2.0;      // [B]
-        X.narrow(1, 4 + kCards, 1)
-            .copy_((pot / stack)
-                       .unsqueeze(1)
-                       .expand({B_, static_cast<long>(kCards)})
-                       .reshape({BR, 1}));
-        X.narrow(1, off, n).copy_(r0c.reshape({BR, n}));
-        X.narrow(1, off + n, n).copy_(r1c.reshape({BR, n}));
-        X.narrow(1, off + 2 * n, n).copy_(pct52_.reshape({BR, n}));
-        X.narrow(1, off + 3 * n, n).copy_(eq0.reshape({BR, n}));
-        X.narrow(1, off + 4 * n, n).copy_(eq1.reshape({BR, n}));
-        auto y = net->forward(X);                            // [BR, 2n]
-        auto v = y.reshape({B_, static_cast<long>(kCards), 2, n}) *
+        auto rows = feat_X_.narrow(0, j * BR, BR);
+        rows.narrow(1, off, n).copy_(r0c.reshape({BR, n}));
+        rows.narrow(1, off + n, n).copy_(r1c.reshape({BR, n}));
+        rows.narrow(1, off + 3 * n, n).copy_(eq0.reshape({BR, n}));
+        rows.narrow(1, off + 4 * n, n).copy_(eq1.reshape({BR, n}));
+    }
+    auto y = net->forward(feat_X_);                          // [L*BR, 2n]
+    for (long j = 0; j < L; ++j) {
+        auto pot = c0_.select(1, leaf_nodes_[static_cast<size_t>(j)]) * 2.0;
+        auto v = y.narrow(0, j * BR, BR)
+                     .reshape({B_, static_cast<long>(kCards), 2, n}) *
                  pot.view({B_, 1, 1, 1}) * runout_ok_.unsqueeze(3) *
                  mask_xc_.view({1, static_cast<long>(kCards), 1, n});
-        leaf_v_[j].copy_(v);
+        leaf_v_[static_cast<size_t>(j)].copy_(v);
     }
 }
 
