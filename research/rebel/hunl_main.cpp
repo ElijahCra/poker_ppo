@@ -16,6 +16,7 @@
 
 #include "config.h"
 #include "hunl_gpu.h"
+#include "hunl_gpu_turn.h"
 #include "hunl_kernels.h"
 #include "hunl_play.h"
 #include "hunl_solver.h"
@@ -779,6 +780,228 @@ int main(int argc, char** argv) {
                     "(LBR win rate %.3f, %.0fs)\n",
                     res.bb_per_hand, res.num_hands, res.lbr_win_rate,
                     res.wall_ms / 1000.0);
+        return 0;
+    }
+    if (mode == "turn_gpu_check") {
+        // BatchTurnSolver vs CPU HunlSolver on B lockstep turn subgames
+        // with NET leaves, both fed by HunlNetOracle::value_batch (feature
+        // and net parity by construction — only tree math differs).
+        //   phase A: leaves frozen after t=1 → tight arithmetic bars
+        //   phase B: live refresh every 5 → RM+ clamp order drift compounds
+        //            through leaf-belief feedback; judge by the MEAN
+        // usage: turn_gpu_check [B] [T]   (REBEL_CKPT required;
+        //        REBEL_PCFR=1 checks the PCFR+ variant on both sides)
+        const int B = argc > 2 ? std::atoi(argv[2]) : 4;
+        const int T = argc > 3 ? std::atoi(argv[3]) : 40;
+        const char* ck = std::getenv("REBEL_CKPT");
+        const bool pcfr = std::getenv("REBEL_PCFR") &&
+                          std::atoi(std::getenv("REBEL_PCFR")) != 0;
+        if (!ck || !*ck) {
+            std::fprintf(stderr, "turn_gpu_check needs REBEL_CKPT\n");
+            return 1;
+        }
+        {
+            const uint8_t warm[5] = {0, 5, 10, 15, 20};
+            (void)combo_rank(ComboTable::get().id[25][30], warm);
+        }
+        HunlValueNet net(1024, 2, false, true);
+        torch::load(net, ck);
+        torch::Device dev(torch::cuda::is_available() ? torch::kCUDA
+                                                      : torch::kCPU);
+        net->to(dev);
+        const double stack = static_cast<double>(
+            poker_ppo::kPokerConfig.game.initial_stack);
+        const std::vector<int> acts = {0, 1, 7, 13};
+        std::mt19937_64 rng(20260715);
+        std::uniform_real_distribution<double> u(0.0, 1.0);
+
+        // collect B envs at turn roots sharing ONE tree signature
+        std::vector<std::unique_ptr<poker_ppo::PokerEnvironment>> envs;
+        std::vector<TurnSpec> specs;
+        std::vector<std::unique_ptr<HunlSolver>> cpus;   // shape source
+        std::string sig;
+        HunlNetOracle shape_oracle(net, stack, dev);
+        for (int tries = 0; tries < 400 && static_cast<int>(envs.size()) < B;
+             ++tries) {
+            auto env = std::make_unique<poker_ppo::PokerEnvironment>(
+                poker_ppo::kPokerConfig, poker_ppo::config::kBetConfig,
+                31337 + 7 * tries);
+            std::mt19937 wrng(2222 + 3 * tries);
+            std::uniform_real_distribution<double> uw(0.0, 1.0);
+            env->reset();
+            while (!env->is_terminal() && env->round() < 2) {
+                int a = 1;
+                if (uw(wrng) < 0.3) {
+                    static const int kR[] = {4, 7, 10};
+                    a = kR[wrng() % 3];
+                }
+                auto mask = env->legal_action_mask();
+                auto ma = mask.accessor<float, 1>();
+                env->step(ma[a] > 0.5f ? a : 1);
+            }
+            if (env->is_terminal() || env->round() != 2) continue;
+            TurnSpec sp;
+            for (int i = 0; i < 4; ++i)
+                sp.board[static_cast<size_t>(i)] =
+                    static_cast<uint8_t>(env->community_card(i));
+            sp.r0.resize(kCombos);
+            sp.r1.resize(kCombos);
+            for (int i = 0; i < kCombos; ++i) {
+                sp.r0[static_cast<size_t>(i)] = std::pow(u(rng), 3.0);
+                sp.r1[static_cast<size_t>(i)] = std::pow(u(rng), 3.0);
+            }
+            HunlPBS beta;
+            beta.r0 = sp.r0;
+            beta.r1 = sp.r1;
+            auto s = std::make_unique<HunlSolver>(*env, beta, &shape_oracle,
+                                                  acts);
+            auto sh = TreeShape::from(*s);
+            if (sig.empty()) sig = sh.signature;
+            if (sh.signature != sig) continue;
+            sp.node_contrib0.resize(s->nodes().size());
+            sp.node_contrib1.resize(s->nodes().size());
+            for (size_t m = 0; m < s->nodes().size(); ++m) {
+                sp.node_contrib0[m] = s->nodes()[m].contrib[0];
+                sp.node_contrib1[m] = s->nodes()[m].contrib[1];
+            }
+            envs.push_back(std::move(env));
+            specs.push_back(std::move(sp));
+            cpus.push_back(std::move(s));
+        }
+        if (static_cast<int>(envs.size()) < B) {
+            std::fprintf(stderr, "only %zu/%d specs share a topology\n",
+                         envs.size(), B);
+            return 1;
+        }
+        auto shape = TreeShape::from(*cpus[0]);
+        int n_leaves = 0;
+        for (const auto& nd : shape.nodes)
+            if (nd.kind == HunlSolver::Node::StreetEnd) ++n_leaves;
+        std::printf("turn_gpu_check: B=%d T=%d nodes=%zu leaves=%d "
+                    "pcfr=%d device=%s dtype=f64\n", B, T,
+                    shape.nodes.size(), n_leaves, pcfr ? 1 : 0,
+                    dev.is_cuda() ? "cuda" : "cpu");
+
+        for (int phase = 0; phase < 2; ++phase) {
+            const int refresh = phase == 0 ? 1000000 : 5;
+            // ── CPU side: fresh solvers, tracked root values ──
+            std::vector<std::unique_ptr<HunlSolver>> cpu;
+            std::vector<std::unique_ptr<HunlNetOracle>> oracles;
+            for (int b = 0; b < B; ++b) {
+                HunlPBS beta;
+                beta.r0 = specs[static_cast<size_t>(b)].r0;
+                beta.r1 = specs[static_cast<size_t>(b)].r1;
+                oracles.push_back(std::make_unique<HunlNetOracle>(
+                    net, stack, dev));
+                auto s = std::make_unique<HunlSolver>(
+                    *envs[static_cast<size_t>(b)], beta,
+                    oracles.back().get(), acts);
+                s->refresh_every = refresh;
+                s->pcfr = pcfr;
+                s->track_root_values();
+                cpu.push_back(std::move(s));
+            }
+            for (int t = 1; t <= T; ++t)
+                for (int b = 0; b < B; ++b) cpu[static_cast<size_t>(b)]
+                    ->iterate(t);
+
+            // ── GPU side: one batch, oracle round-trip in the callback ──
+            BatchTurnSolver gpu(shape, specs, dev, torch::kDouble, pcfr);
+            std::vector<std::unique_ptr<HunlNetOracle>> gora;
+            for (int b = 0; b < B; ++b)
+                gora.push_back(std::make_unique<HunlNetOracle>(net, stack,
+                                                               dev));
+            auto refresh_cb = [&](int) {
+                const int L = static_cast<int>(gpu.leaf_nodes().size());
+                for (int j = 0; j < L; ++j) {
+                    std::vector<std::array<std::vector<double>, 2>> reach;
+                    gpu.leaf_reaches(j, reach);
+                    auto vals = torch::zeros(
+                        {B, static_cast<long>(kCards), 2,
+                         static_cast<long>(kCombos)},
+                        torch::TensorOptions().dtype(torch::kDouble));
+                    auto va = vals.accessor<double, 4>();
+                    for (int b = 0; b < B; ++b) {
+                        auto& env = *envs[static_cast<size_t>(b)];
+                        env.push_state();
+                        for (int a : gpu.leaf_path(j)) env.step(a);
+                        std::vector<uint8_t> cards;
+                        std::vector<HunlPBS> betas;
+                        const auto& bd = specs[static_cast<size_t>(b)].board;
+                        for (int c = 0; c < kCards; ++c) {
+                            bool on = false;
+                            for (int q = 0; q < 4; ++q)
+                                if (bd[static_cast<size_t>(q)] == c)
+                                    on = true;
+                            if (on) continue;
+                            HunlPBS lb;
+                            lb.r0 = reach[static_cast<size_t>(b)][0];
+                            lb.r1 = reach[static_cast<size_t>(b)][1];
+                            const auto& ctm = ComboTable::get();
+                            for (int x = 0; x < kCombos; ++x)
+                                if (ctm.cards[x][0] == c ||
+                                    ctm.cards[x][1] == c)
+                                    lb.r0[static_cast<size_t>(x)] =
+                                        lb.r1[static_cast<size_t>(x)] = 0.0;
+                            cards.push_back(static_cast<uint8_t>(c));
+                            betas.push_back(std::move(lb));
+                        }
+                        std::vector<std::array<std::vector<double>, 2>> outs;
+                        gora[static_cast<size_t>(b)]->value_batch(
+                            env, bd.data(), 4, cards, betas, outs);
+                        for (size_t q = 0; q < cards.size(); ++q)
+                            for (int p = 0; p < 2; ++p)
+                                for (int x = 0; x < kCombos; ++x)
+                                    va[b][cards[q]][p][x] =
+                                        outs[q][static_cast<size_t>(p)]
+                                            [static_cast<size_t>(x)];
+                        env.pop_state();
+                    }
+                    gpu.set_leaf_values(j, vals);
+                }
+            };
+            gpu.solve(T, refresh, refresh_cb);
+
+            // ── compare iterate-averaged root values ──
+            std::vector<std::array<std::vector<double>, 2>> gv, gm;
+            gpu.avg_root_values(gv, gm);
+            double mx = 0.0, mean = 0.0;
+            long cnt = 0;
+            for (int b = 0; b < B; ++b) {
+                std::array<std::vector<double>, 2> cv, cm;
+                cpu[static_cast<size_t>(b)]->avg_root_values(cv, cm);
+                const double pot = static_cast<double>(
+                    envs[static_cast<size_t>(b)]->pot());
+                for (int p = 0; p < 2; ++p)
+                    for (int x = 0; x < kCombos; ++x) {
+                        if (cm[static_cast<size_t>(p)]
+                              [static_cast<size_t>(x)] < 0.5 ||
+                            gm[static_cast<size_t>(b)]
+                              [static_cast<size_t>(p)]
+                              [static_cast<size_t>(x)] < 0.5)
+                            continue;
+                        const double d = std::abs(
+                            cv[static_cast<size_t>(p)]
+                              [static_cast<size_t>(x)] -
+                            gv[static_cast<size_t>(b)]
+                              [static_cast<size_t>(p)]
+                              [static_cast<size_t>(x)]) / pot;
+                        mx = std::max(mx, d);
+                        mean += d;
+                        ++cnt;
+                    }
+            }
+            mean = cnt ? mean / static_cast<double>(cnt) : 0.0;
+            const double bar_mean = phase == 0 ? 1e-6 : 1e-3;
+            const double bar_max = phase == 0 ? 1e-4 : 5e-2;
+            std::printf("  phase %s: |dv|/pot mean=%.3e max=%.3e  %s\n",
+                        phase == 0 ? "A (frozen leaves)"
+                                   : "B (live refresh) ",
+                        mean, mx,
+                        (mean <= bar_mean && mx <= bar_max) ? "PASS"
+                                                            : "FAIL");
+            std::fflush(stdout);
+        }
         return 0;
     }
     if (mode == "pcfr_bench") {

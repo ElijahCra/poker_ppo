@@ -149,6 +149,7 @@ add_executable(rebel_hunl
     research/rebel/hunl_kernels.cpp
     research/rebel/hunl_solver.cpp
     research/rebel/hunl_gpu.cpp
+    research/rebel/hunl_gpu_turn.cpp
     research/rebel/hunl_fused.cpp
     research/rebel/hunl_value.cpp
     research/rebel/hunl_play.cpp
