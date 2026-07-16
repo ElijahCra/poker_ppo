@@ -57,7 +57,13 @@ BatchTurnSolver::BatchTurnSolver(TreeShape shape, std::vector<TurnSpec> specs,
     for (const auto& nd : shape_.nodes)
         if (nd.kind == HunlSolver::Node::AllinShowdown) any_allin = true;
     use_allin_op_ = any_allin && !std::getenv("REBEL_NO_ALLIN_OP");
-    const bool build_runout = any_allin && !use_allin_op_;
+    // per-runout structures serve DOUBLE duty: the allin-showdown
+    // fallback AND the on-device featurizer's equity engine (equity =
+    // unit-pot showdown / compatible mass) — always built. Percentiles
+    // (beta-independent) come from the same sort, once per (spec, card).
+    const bool build_runout = true;
+    auto pct = torch::zeros({B_, kCards, n}, f);
+    auto fbase = torch::zeros({B_, kCards}, f);
     auto valid = torch::zeros({B_, n}, f);
     auto r0 = torch::zeros({B_, n}, f);
     auto r1 = torch::zeros({B_, n}, f);
@@ -76,7 +82,7 @@ BatchTurnSolver::BatchTurnSolver(TreeShape shape, std::vector<TurnSpec> specs,
     auto itotA = torch::zeros({BR, n}, l);
     auto itotB = torch::zeros({BR, n}, l);
 
-    for (int b = 0; b < B_; ++b) {
+    auto spec_work = [&](int b) {
         const auto& sp = specs[static_cast<size_t>(b)];
         std::vector<uint8_t> vb;
         board_valid(sp.board.data(), 4, vb);
@@ -106,6 +112,9 @@ BatchTurnSolver::BatchTurnSolver(TreeShape shape, std::vector<TurnSpec> specs,
             cc0[b][m] = static_cast<float>(sp.node_contrib0[m]);
             cc1[b][m] = static_cast<float>(sp.node_contrib1[m]);
         }
+        auto fb = fbase.accessor<float, 2>();
+        for (int bd = 0; bd < 4; ++bd)
+            fb[b][sp.board[static_cast<size_t>(bd)]] = 1.0f;
 
         auto ro = rok.accessor<float, 2>();
         for (int c = 0; c < kCards; ++c) {
@@ -144,6 +153,7 @@ BatchTurnSolver::BatchTurnSolver(TreeShape shape, std::vector<TurnSpec> specs,
             auto pp = perm.accessor<int64_t, 2>();
             auto pe = prev1.accessor<int64_t, 2>();
             auto se = segend.accessor<int64_t, 2>();
+            auto pca = pct.accessor<float, 3>();
             for (int pos = 0; pos < n; ++pos)
                 pp[row][pos] = order[static_cast<size_t>(pos)];
             int gstart = 0, pos = 0;
@@ -155,6 +165,12 @@ BatchTurnSolver::BatchTurnSolver(TreeShape shape, std::vector<TurnSpec> specs,
                 for (int k = pos; k < e; ++k) {
                     pe[row][k] = gstart;
                     se[row][k] = e;
+                    // RiverEval::percentile: mid-rank of the tie group
+                    // over valid combos
+                    if (nv > 1)
+                        pca[b][c][order[static_cast<size_t>(k)]] =
+                            static_cast<float>(
+                                (pos + 0.5 * (e - pos - 1)) / (nv - 1));
                 }
                 gstart = e;
                 pos = e;
@@ -197,8 +213,33 @@ BatchTurnSolver::BatchTurnSolver(TreeShape shape, std::vector<TurnSpec> specs,
                 tb[row][p] = Bc * 52 + 51;
             }
         }
+    };
+    // per-spec precompute is embarrassingly parallel (48 sorts + ranks
+    // per spec — the ctor cost that used to serialize)
+    {
+        const int W = std::max(
+            1, std::min(B_, static_cast<int>(
+                                std::thread::hardware_concurrency())));
+        if (W <= 1) {
+            for (int b = 0; b < B_; ++b) spec_work(b);
+        } else {
+            std::atomic<int> next{0};
+            std::vector<std::thread> pool;
+            for (int w = 0; w < W; ++w)
+                pool.emplace_back([&] {
+                    while (true) {
+                        const int b = next.fetch_add(1);
+                        if (b >= B_) break;
+                        spec_work(b);
+                    }
+                });
+            for (auto& th : pool) th.join();
+        }
     }
 
+    pct52_ = pct.to(dev_).to(dt_);
+    fbase_ = fbase.to(dev_).to(dt_);
+    eye52_ = torch::eye(kCards, f).to(dev_).to(dt_);
     inc_ = inc.to(dev_).to(dt_);
     card_a_ = ca.to(dev_);
     card_b_ = cb.to(dev_);
@@ -446,6 +487,101 @@ torch::Tensor BatchTurnSolver::street_end_cfv_t(int node, int upd,
                 Sc.index_select(2, card_b_) + opp52;
     auto v = leaf_v_[static_cast<size_t>(j)].select(2, upd); // [B, 52, n]
     return (v * mass * mask_xc_).sum(1) / 44.0 * valid_;
+}
+
+torch::Tensor BatchTurnSolver::runout_equity(const torch::Tensor& opp52) {
+    // equity_vs_range on every (spec, runout) at once: unit-pot showdown
+    // (2·win + tie − tot) over compatible mass (tot), via the sorted-
+    // prefix structures. Board-card rows produce garbage (zero-filled
+    // structures) — the caller masks them with runout_ok_.
+    const int n = kCombos;
+    auto ws = opp52.reshape({static_cast<long>(B_) * kCards, n})
+                  .gather(1, perm52_);
+    auto cs = ws.cumsum(1);
+    auto cs0 = torch::cat(
+        {torch::zeros({ws.size(0), 1}, ws.options()), cs}, 1);
+    auto wsc = ws.gather(1, poscard52_).reshape({ws.size(0), kCards, 51});
+    auto csc = wsc.cumsum(2);
+    auto csc0 = torch::cat(
+        {torch::zeros({ws.size(0), kCards, 1}, ws.options()), csc}, 2)
+                    .reshape({ws.size(0), kCards * 52});
+    auto lowT = cs0.gather(1, prev52_);
+    auto lowA = csc0.gather(1, ilowA52_);
+    auto lowB = csc0.gather(1, ilowB52_);
+    auto win = lowT - lowA - lowB;
+    auto endT = cs0.gather(1, seg52_);
+    auto endA = csc0.gather(1, iendA52_);
+    auto endB = csc0.gather(1, iendB52_);
+    auto tie = (endT - lowT) - (endA - lowA) - (endB - lowB) + ws;
+    auto S = cs.select(1, n - 1).unsqueeze(1);
+    auto ScA = csc0.gather(1, itotA52_);
+    auto ScB = csc0.gather(1, itotB52_);
+    auto tot = S - ScA - ScB + ws;
+    auto num = 2.0f * win + tie - tot;
+    auto eqs = torch::where(tot > 0, num / tot.clamp_min(1e-30),
+                            torch::zeros_like(num));
+    auto eq = torch::zeros_like(eqs);
+    eq.scatter_(1, perm52_, eqs);
+    return eq.reshape({B_, static_cast<long>(kCards), n});
+}
+
+void BatchTurnSolver::refresh_leaves_device(HunlValueNet& net,
+                                            double stack) {
+    torch::NoGradGuard ng;
+    TORCH_CHECK(dt_ == torch::kFloat,
+                "refresh_leaves_device: f32 solves only");
+    const long n = kCombos;
+    const long BR = static_cast<long>(B_) * kCards;
+    const long off = 4 + kCards + 1;
+    for (size_t j = 0; j < leaf_nodes_.size(); ++j) {
+        // average-profile reaches, never leaving the device
+        auto r0 = r0_.clone();
+        auto r1 = r1_.clone();
+        int node = 0;
+        for (int a : leaf_path_[j]) {
+            const auto& nd = shape_.nodes[static_cast<size_t>(node)];
+            int k = -1;
+            for (size_t q = 0; q < nd.acts.size(); ++q)
+                if (nd.acts[q] == a) k = static_cast<int>(q);
+            TORCH_CHECK(k >= 0, "refresh_leaves_device: bad path");
+            auto sig = policies(node, /*average=*/true).select(1, k);
+            (nd.player == 0 ? r0 : r1).mul_(sig);
+            node = nd.child[static_cast<size_t>(k)];
+        }
+        // per-runout masked RAW reaches — the CPU oracle path passes
+        // exactly these (unnormalized) as the range features
+        auto r0c = r0.unsqueeze(1) * mask_xc_;               // [B, 52, n]
+        auto r1c = r1.unsqueeze(1) * mask_xc_;
+        // dead combos (x∋c, invalid on the turn board, pads) must read
+        // eq=0 exactly as the CPU path writes them — the prefix pads
+        // produce nonzero garbage there otherwise
+        auto dead = mask_xc_ * valid_.unsqueeze(1);          // [B, 52, n]
+        auto eq0 = runout_equity(r1c) * dead;
+        auto eq1 = runout_equity(r0c) * dead;
+        auto X = torch::zeros({BR, HunlFeaturizer::kDim},
+                              r0.options());
+        X.narrow(1, 3, 1).fill_(1.0);   // street 3 (river-root queries)
+        auto bd = fbase_.unsqueeze(1).expand({B_, static_cast<long>(kCards),
+                                              static_cast<long>(kCards)}) +
+                  eye52_.unsqueeze(0);
+        X.narrow(1, 4, kCards).copy_(bd.reshape({BR, kCards}));
+        auto pot = c0_.select(1, leaf_nodes_[j]) * 2.0;      // [B]
+        X.narrow(1, 4 + kCards, 1)
+            .copy_((pot / stack)
+                       .unsqueeze(1)
+                       .expand({B_, static_cast<long>(kCards)})
+                       .reshape({BR, 1}));
+        X.narrow(1, off, n).copy_(r0c.reshape({BR, n}));
+        X.narrow(1, off + n, n).copy_(r1c.reshape({BR, n}));
+        X.narrow(1, off + 2 * n, n).copy_(pct52_.reshape({BR, n}));
+        X.narrow(1, off + 3 * n, n).copy_(eq0.reshape({BR, n}));
+        X.narrow(1, off + 4 * n, n).copy_(eq1.reshape({BR, n}));
+        auto y = net->forward(X);                            // [BR, 2n]
+        auto v = y.reshape({B_, static_cast<long>(kCards), 2, n}) *
+                 pot.view({B_, 1, 1, 1}) * runout_ok_.unsqueeze(3) *
+                 mask_xc_.view({1, static_cast<long>(kCards), 1, n});
+        leaf_v_[j].copy_(v);
+    }
 }
 
 torch::Tensor BatchTurnSolver::walk(int node, int upd, bool update,

@@ -266,10 +266,14 @@ bool RebelTarget::gpu_turn_solve(HunlSolver& s, int T) {
         BatchTurnSolver g(shape, specs, dev, torch::kFloat, cfg_.pcfr);
         HunlNetOracle oracle(net_, stack_, dev);
         std::vector<HunlNetOracle*> ora{&oracle};
-        // threads=1: gates run one agent per shard across many shards —
-        // nested pools would oversubscribe
+        // device featurization by default; CPU-oracle fallback keeps
+        // threads=1 (gates parallelize across shards, not within)
+        const bool dev_feat = !std::getenv("REBEL_NO_DEV_FEAT");
         g.solve(T, cfg_.refresh_every, [&](int) {
-            refresh_turn_leaves(g, specs, ora, /*threads=*/1, &gpu_ws_);
+            if (dev_feat)
+                g.refresh_leaves_device(net_, stack_);
+            else
+                refresh_turn_leaves(g, specs, ora, /*threads=*/1, &gpu_ws_);
         });
         for (size_t m = 0; m < nodes.size(); ++m) {
             if (nodes[m].kind != HunlSolver::Node::Decision) continue;

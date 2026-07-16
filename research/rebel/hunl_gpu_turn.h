@@ -35,6 +35,7 @@
 
 #include "hunl_gpu.h"
 #include "hunl_solver.h"
+#include "hunl_value.h"
 
 namespace rebel_hunl {
 
@@ -80,6 +81,15 @@ public:
     // board cards / combos containing the card are ignored by the walk.
     void set_leaf_values(int leaf_idx, const torch::Tensor& vals);
 
+    // ON-DEVICE refresh (f32): reaches, per-runout masked ranges, equity
+    // (unit-pot showdown / compat mass via the sorted-prefix structures),
+    // percentiles (precomputed per (spec, card)), feature assembly and
+    // the net forward all stay on the device — zero PCIe in the refresh
+    // loop. Replaces the leaf_reaches → oracle → set_leaf_values
+    // round-trip; feature semantics mirror HunlNetOracle's river-query
+    // path (raw masked reaches, f32 arithmetic).
+    void refresh_leaves_device(HunlValueNet& net, double stack);
+
     // One CFR iteration (both alternating update passes). Root values of
     // the CURRENT profile accumulate for avg_root_values.
     void iterate(int t);
@@ -116,6 +126,9 @@ private:
     // whole refresh windows per launch. -1 = unavailable (fallback).
     bool fused_setup();
     bool fused_window(int t_start, int t_end);
+    // equity for every (spec, runout) at once: [B, 52, n] from opp ranges
+    // [B, 52, n] (masked, unnormalized — equity is scale-invariant)
+    torch::Tensor runout_equity(const torch::Tensor& opp52);
     torch::Tensor policies(int node, bool average);       // [B, A, n]
     torch::Tensor fold_cfv_t(int node, int upd, const torch::Tensor& opp);
     torch::Tensor allin_cfv_t(int node, const torch::Tensor& opp);
@@ -169,6 +182,10 @@ private:
     int fused_state_ = 0;   // 0 unknown, 1 ready, -1 unavailable
     torch::Tensor f_kind_, f_actor_, f_arity_, f_cbase_, f_cflat_;
     torch::Tensor f_rptr_, f_cptr_, f_pptr_, f_lptr_, f_idpair_;
+    // on-device featurizer constants
+    torch::Tensor pct52_;    // [B, 52, n] percentile per (spec, runout)
+    torch::Tensor fbase_;    // [B, 52] base-board one-hot
+    torch::Tensor eye52_;    // [52, 52]
 };
 
 class HunlNetOracle;
