@@ -216,6 +216,11 @@ struct EndgameConfig {
     // sample alone is 1 target per ~35 core-seconds: sample-starved (this
     // regression needs 1e5-1e7 rows; DeepStack used ~1M river situations).
     int    harvest      = 8;
+    // false: turn episodes emit ONLY the street-2 root row — no t*-leaf
+    // or harvested river rows. The 10M-turn-row campaign switch: river
+    // data is saturated (1M+ banked) and every skipped river row saves
+    // 40KB of disk and an exact river solve.
+    bool   river_rows   = true;
     // train_river mode: direct river-situation sampling (DeepStack recipe) —
     // no turn solves at all; `episodes` = river targets per epoch.
     bool   river_only   = false;

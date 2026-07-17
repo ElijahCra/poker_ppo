@@ -113,7 +113,29 @@ void RebelTarget::alt_from_turn_leaf(PokerEnvironment& env) {
             if (ct.cards[i][0] == b5[4] || ct.cards[i][1] == b5[4])
                 lb.r0[i] = lb.r1[i] = 0.0;
         std::array<std::vector<double>, 2> out;
-        oracle_->value(env, b5, 5, lb, out);
+        if (cfg_.gadget_alt_exact) {
+            // price the entitlements with an EXACT river solve at the
+            // same beliefs — equilibrium values, no net error. The
+            // measured failure mode of net-priced alts was generosity:
+            // Terminate over-valued → the follow range skews strong →
+            // the re-solve over-folds (the gadget wash).
+            ExactStreetOracle exact(cfg_.t_alt, cfg_.actions_river);
+            exact.value(env, b5, 5, lb, out);
+        } else {
+            oracle_->value(env, b5, 5, lb, out);
+        }
+        if (cfg_.gadget_delta != 0.0) {
+            // empirical calibration: shift entitlements by a pot
+            // fraction (positive = less generous Terminate)
+            const double pot =
+                2.0 * (static_cast<double>(
+                           env.game_config().initial_stack) -
+                       env.stack(0));
+            for (int p = 0; p < 2; ++p)
+                for (int i = 0; i < kCombos; ++i)
+                    out[static_cast<size_t>(p)][static_cast<size_t>(i)] -=
+                        cfg_.gadget_delta * pot;
+        }
         alt_ = std::move(out);
         have_alt_ = true;
         return;

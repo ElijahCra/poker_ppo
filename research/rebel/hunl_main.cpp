@@ -766,7 +766,17 @@ int main(int argc, char** argv) {
         // skews strong and the solve over-folds. Sound machinery
         // (gadget_check converges), needs alt calibration to earn ON.
         pc.gadget  = env_i("REBEL_GADGET", 0) != 0;
-        std::printf("lbr: river gadget %s\n", pc.gadget ? "ON" : "off");
+        pc.gadget_alt_exact = env_i("REBEL_GADGET_ALT_EXACT", 1) != 0;
+        pc.t_alt = env_i("REBEL_T_ALT", 200);
+        if (const char* s = std::getenv("REBEL_GADGET_DELTA"))
+            pc.gadget_delta = std::atof(s);
+        if (pc.gadget)
+            std::printf("lbr: river gadget ON (alts=%s T_alt=%d "
+                        "delta=%.3f mix=%.2f)\n",
+                        pc.gadget_alt_exact ? "exact" : "net", pc.t_alt,
+                        pc.gadget_delta, pc.gadget_mix);
+        else
+            std::printf("lbr: river gadget off\n");
         const double stack = static_cast<double>(
             poker_ppo::kPokerConfig.game.initial_stack);
         std::printf("lbr: hands=%d threads=%d net=%s (%dx%d%s) T=%d/%d "
@@ -1388,6 +1398,8 @@ int main(int argc, char** argv) {
         env_int("REBEL_GPU_BATCH", cfg.gpu_batch);
         env_int("REBEL_GPU_TURN_BATCH", cfg.gpu_turn_batch);
         env_int("REBEL_HARVEST", cfg.harvest);
+        if (const char* s = std::getenv("REBEL_RIVER_ROWS"))
+            cfg.river_rows = std::atoi(s) != 0;
         env_int("REBEL_HIDDEN", cfg.hidden);
         env_int("REBEL_LAYERS", cfg.layers);
         env_int("REBEL_SGD_STEPS", cfg.sgd_steps);

@@ -1190,6 +1190,7 @@ void EndgameTrainer::self_play_episode(poker_ppo::PokerEnvironment& env,
     emit_root_sample(env, s, beta, b4, 4, 2, fresh);
 
     // Algorithm 1's t*-sampled continuation leaf (ε-explored coverage)
+    if (!cfg_.river_rows) return;   // turn-campaign mode: street-2 only
     if (have) {
         std::array<uint8_t, 5> b5 = s.board();
         b5[s.board_count()] = card;

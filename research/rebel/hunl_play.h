@@ -64,6 +64,14 @@ struct RebelPlayConfig {
     // turn solves stay model-based until flop-entry alternatives exist.
     bool   gadget     = true;
     double gadget_mix = 0.1;
+    // Alternative-value calibration (the gadget's measured failure was
+    // GENEROUS net-priced alts → over-folding). gadget_alt_exact prices
+    // entitlements with an exact t_alt-iteration river solve at the same
+    // beliefs (equilibrium values, ~0.5s/hand); gadget_delta shifts them
+    // by a pot fraction (positive = Terminate less attractive).
+    bool   gadget_alt_exact = true;
+    int    t_alt         = 200;
+    double gadget_delta  = 0.0;
     // false → blueprint plays the flop too (re-solving starts at the
     // turn). Measured 2026-07-09: flop solves at T=150 on the current
     // street-2 net ERASED the high-T gain (1.424 → 1.953; river share
