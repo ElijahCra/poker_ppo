@@ -321,6 +321,12 @@ private:
     void gpu_turn_epoch(
         std::vector<std::unique_ptr<poker_ppo::PokerEnvironment>>& envs,
         int W, int ep, std::vector<Sample>& fresh, int episodes);
+    // REBEL_GPU_CACHE=N: N replay rows live on the device; SGD batches
+    // assemble via index_select instead of per-step CPU gather + H2D.
+    // ~40 bytes/row/1000 on device (f32 feat+target, u8 mask): N=50000
+    // ≈ 2.0GB. Subset re-drawn per epoch; identical sampling when the
+    // replay fits entirely.
+    double train_net_cached(int want);
     // Random training range for the situation's board (nb=5 river, nb=4
     // turn). 70% DeepStack R(S,p): recursive mass splits over the valid
     // combos ORDERED BY HAND STRENGTH (weaker half / stronger half) —
@@ -372,6 +378,8 @@ private:
     std::vector<Sample> heldout_;   // fixed split from data_in (never trained)
     long                seen_ = 0;
     bool                circular_ = false;   // resolved from cfg_.circular
+    // device-resident sample cache (REBEL_GPU_CACHE)
+    torch::Tensor tc_feat_, tc_targ_, tc_mask_;
 };
 
 }  // namespace rebel_hunl

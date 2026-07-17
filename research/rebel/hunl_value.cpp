@@ -1638,8 +1638,85 @@ void EndgameTrainer::load_dataset(const std::string& path) {
     print_pot_hist(replay_, "data");
 }
 
+double EndgameTrainer::train_net_cached(int want) {
+    // GPU-resident sample cache: one chunked upload per epoch, batches
+    // assembled ON DEVICE via index_select — replaces the per-step CPU
+    // gather + ~40KB/row synchronous H2D (tens of GB per epoch). Cache =
+    // uniform subset of the replay re-drawn each epoch; when the replay
+    // fits entirely the sampling distribution is identical to the
+    // uncached path. Masks live as u8 (¼ the bytes), cast per batch.
+    const int n_out = 2 * kCombos;
+    const size_t C = std::min(replay_.size(), static_cast<size_t>(want));
+    auto opts = torch::TensorOptions().dtype(torch::kFloat).device(device_);
+    if (!tc_feat_.defined() || tc_feat_.size(0) != static_cast<long>(C)) {
+        tc_feat_ = torch::empty(
+            {static_cast<long>(C), HunlFeaturizer::kDim}, opts);
+        tc_targ_ = torch::empty({static_cast<long>(C), n_out}, opts);
+        tc_mask_ = torch::empty({static_cast<long>(C), n_out},
+                                opts.dtype(torch::kUInt8));
+    }
+    std::vector<size_t> idx(replay_.size());
+    std::iota(idx.begin(), idx.end(), static_cast<size_t>(0));
+    if (C < replay_.size())   // partial Fisher–Yates subset draw
+        for (size_t i = 0; i < C; ++i) {
+            std::uniform_int_distribution<size_t> d(i, idx.size() - 1);
+            std::swap(idx[i], idx[d(rng_)]);
+        }
+    const long CH = 4096;   // staging chunks keep CPU-side memory flat
+    auto sf = torch::empty({CH, HunlFeaturizer::kDim}, torch::kFloat);
+    auto st = torch::empty({CH, n_out}, torch::kFloat);
+    auto sm = torch::empty({CH, n_out}, torch::kUInt8);
+    for (long off = 0; off < static_cast<long>(C); off += CH) {
+        const long m = std::min(CH, static_cast<long>(C) - off);
+        for (long r = 0; r < m; ++r) {
+            const Sample& s = replay_[idx[static_cast<size_t>(off + r)]];
+            std::copy(s.feat.begin(), s.feat.end(),
+                      sf.data_ptr<float>() +
+                          static_cast<size_t>(r) * HunlFeaturizer::kDim);
+            std::copy(s.target.begin(), s.target.end(),
+                      st.data_ptr<float>() + static_cast<size_t>(r) * n_out);
+            uint8_t* mp =
+                sm.data_ptr<uint8_t>() + static_cast<size_t>(r) * n_out;
+            for (int j = 0; j < n_out; ++j)
+                mp[j] = s.mask[static_cast<size_t>(j)] > 0.5f ? 1 : 0;
+        }
+        tc_feat_.narrow(0, off, m).copy_(sf.narrow(0, 0, m));
+        tc_targ_.narrow(0, off, m).copy_(st.narrow(0, 0, m));
+        tc_mask_.narrow(0, off, m).copy_(sm.narrow(0, 0, m));
+    }
+    double last = 0.0;
+    const int B = std::min<int>(cfg_.batch, static_cast<int>(C));
+    auto iopt =
+        torch::TensorOptions().dtype(torch::kLong).device(device_);
+    for (int step = 0; step < cfg_.sgd_steps; ++step) {
+        auto bidx = torch::randint(static_cast<long>(C), {B}, iopt);
+        auto Xd = tc_feat_.index_select(0, bidx);
+        auto Yd = tc_targ_.index_select(0, bidx);
+        auto Md = tc_mask_.index_select(0, bidx).to(torch::kFloat);
+        opt_->zero_grad();
+        auto err = net_->forward(Xd) - Yd;
+        torch::Tensor pt;
+        if (cfg_.huber_delta > 0.0) {
+            const double d = cfg_.huber_delta;
+            auto a = err.abs();
+            pt = torch::where(a <= d, 0.5 * err * err, d * (a - 0.5 * d));
+        } else {
+            pt = err * err;
+        }
+        auto loss = (pt * Md).sum() / Md.sum().clamp_min(1.0);
+        loss.backward();
+        opt_->step();
+        if (step == cfg_.sgd_steps - 1) last = loss.item<double>();
+    }
+    return last;
+}
+
 double EndgameTrainer::train_net() {
     if (replay_.empty()) return 0.0;
+    if (device_.is_cuda())
+        if (const char* s = std::getenv("REBEL_GPU_CACHE"))
+            if (const int c = std::atoi(s); c > 0)
+                return train_net_cached(c);
     const int n_out = 2 * kCombos;
     std::uniform_int_distribution<size_t> pick(0, replay_.size() - 1);
     double last = 0.0;
