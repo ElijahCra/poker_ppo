@@ -24,9 +24,10 @@ OUT=${OUT:-turn10m.bin}
 CHUNK_EPISODES=${CHUNK_EPISODES:-20000}   # episodes per epoch
 EPOCHS_PER_RUN=${EPOCHS_PER_RUN:-25}      # one resumable chunk
 GPU_FRAC=${GPU_FRAC:-0.3}
-GPU_BATCH=${GPU_BATCH:-64}
-THREADS=${THREADS:-340}
+GPU_BATCH=${GPU_BATCH:-128}           # 5090: 128-192; 8GB cards: <=64
+THREADS=${THREADS:-0}                 # 0 = (cores - 8) / instances
 T_TURN=${T_TURN:-120}
+SEED_BASE=${SEED_BASE:-0}
 ROW=40008
 
 rows() {
@@ -36,11 +37,52 @@ rows() {
 }
 die() { echo "FATAL: $*" >&2; exit 1; }
 
+# ── multi-GPU launcher: one pinned instance per device ───────────────
+# Each shard writes its own OUT file with its own seed base (chunk
+# seeds MUST differ across shards or they generate identical
+# situations). Merge at mix-build time: cp shard0 mix && for the rest
+# tail -c +17 shard >> mix.
+NGPU=${NGPU:-$(nvidia-smi -L 2>/dev/null | wc -l)}
+[ "$NGPU" -ge 1 ] || NGPU=1
+if [ "$NGPU" -gt 1 ] && [ -z "${TURN10M_CHILD:-}" ]; then
+    [ -x "$BIN" ] || die "$BIN not found — run from cmake-build-release"
+    [ -s "$ORACLE" ] || die "$ORACLE missing"
+    pgrep -f 'rebel_hun[l]' >/dev/null \
+        && die "rebel_hunl already running — kill strays first"
+    cp -n "$ORACLE" gen_oracle.pt
+    per=$(( (TARGET_ROWS + NGPU - 1) / NGPU ))
+    cores=$(nproc)
+    tper=$(( cores / NGPU - 2 ))
+    echo "== launcher: $NGPU GPUs x $per rows, $tper CPU threads each"
+    pids=()
+    for g in $(seq 0 $(( NGPU - 1 ))); do
+        CUDA_VISIBLE_DEVICES=$g TURN10M_CHILD=1 NGPU=1 \
+        TARGET_ROWS=$per OUT="${OUT%.bin}_g$g.bin" THREADS=$tper \
+        SEED_BASE=$(( g * 997 )) GPU_FRAC=$GPU_FRAC GPU_BATCH=$GPU_BATCH \
+        bash "$0" > "launcher_g$g.log" 2>&1 &
+        pids+=("$!")
+    done
+    fail=0
+    for p in "${pids[@]}"; do wait "$p" || fail=1; done
+    echo "== GPU shards:"
+    for g in $(seq 0 $(( NGPU - 1 ))); do
+        echo "   ${OUT%.bin}_g$g.bin: $(rows "${OUT%.bin}_g$g.bin") rows"
+    done
+    [ "$fail" -eq 0 ] || die "a shard failed — see launcher_g*.log"
+    echo "== merge when building the training mix:"
+    echo "   cp ${OUT%.bin}_g0.bin mix.bin"
+    echo "   for g in \$(seq 1 $((NGPU-1))); do tail -c +17 ${OUT%.bin}_g\$g.bin >> mix.bin; done"
+    exit 0
+fi
+[ "$THREADS" -gt 0 ] 2>/dev/null || THREADS=$(( $(nproc) - 8 ))
+
 # ── gates ─────────────────────────────────────────────────────────────
 [ -x "$BIN" ] || die "$BIN not found — run from cmake-build-release"
 [ -s "$ORACLE" ] || die "$ORACLE missing — the champion ckpt prices leaves"
-pgrep -f 'rebel_hun[l]' >/dev/null \
-    && die "rebel_hunl already running — pkill -9 -f 'rebel_hun[l]' first"
+if [ -z "${TURN10M_CHILD:-}" ]; then   # children run beside siblings
+    pgrep -f 'rebel_hun[l]' >/dev/null \
+        && die "rebel_hunl already running — kill strays first"
+fi
 have=$(rows "$OUT")
 need_gb=$(( (TARGET_ROWS - have) * ROW / 1000000000 + 5 ))
 free_gb=$(df -BG --output=avail . | tail -1 | tr -dc 0-9)
@@ -66,7 +108,8 @@ while true; do
     fi
     echo "== chunk: $epochs x $eps episodes  ($have/$TARGET_ROWS rows, $(date '+%H:%M'))"
     REBEL_TF32=1 REBEL_PCFR=1 REBEL_RIVER_ROWS=0 REBEL_HARVEST=0 \
-    REBEL_SGD_STEPS=0 REBEL_PROBE_K=0 REBEL_SEED=$(( 7000 + have % 100000 )) \
+    REBEL_SGD_STEPS=0 REBEL_PROBE_K=0 \
+    REBEL_SEED=$(( 7000 + SEED_BASE + have % 100000 )) \
     REBEL_CKPT=gen_oracle.pt REBEL_DATA_OUT="$OUT" \
     REBEL_T_TURN_TRAIN=$T_TURN REBEL_THREADS=$THREADS \
     REBEL_GPU_TURN_BATCH=$GPU_BATCH REBEL_GPU_FRAC=$GPU_FRAC \
