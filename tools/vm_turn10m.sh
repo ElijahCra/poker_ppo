@@ -50,18 +50,36 @@ if [ "$NGPU" -gt 1 ] && [ -z "${TURN10M_CHILD:-}" ]; then
     pgrep -f 'rebel_hun[l]' >/dev/null \
         && die "rebel_hunl already running — kill strays first"
     cp -n "$ORACLE" gen_oracle.pt
-    per=$(( (TARGET_ROWS + NGPU - 1) / NGPU ))
     cores=$(nproc)
-    tper=$(( cores / NGPU - 2 ))
-    echo "== launcher: $NGPU GPUs x $per rows, $tper CPU threads each"
+    # DEDICATED lanes (measured locally: mixing lanes on one GPU loses
+    # ~2x — the fused kernel's persistent windows head-block the CPU
+    # workers' little oracle forwards). GPUs 0..N-2 run PURE fused lanes
+    # (support threads only); the LAST GPU hosts the pure CPU lane's
+    # small forwards and no fused kernels. CPUSHARE = CPU lane's slice
+    # of the row target.
+    CPUSHARE=${CPUSHARE:-0.15}
+    cpu_rows=$(awk -v t="$TARGET_ROWS" -v s="$CPUSHARE" \
+                   'BEGIN{printf "%d", t*s}')
+    gpu_rows=$(( (TARGET_ROWS - cpu_rows + NGPU - 2) / (NGPU - 1) ))
+    tsup=12
+    tcpu=$(( cores - tsup * (NGPU - 1) - 4 ))
+    [ "$tcpu" -ge 8 ] || tcpu=8
+    echo "== launcher: $((NGPU-1)) pure-GPU lanes x $gpu_rows rows" \
+         "($tsup thr each) + CPU lane $cpu_rows rows ($tcpu thr)"
     pids=()
-    for g in $(seq 0 $(( NGPU - 1 ))); do
+    for g in $(seq 0 $(( NGPU - 2 ))); do
         CUDA_VISIBLE_DEVICES=$g TURN10M_CHILD=1 NGPU=1 \
-        TARGET_ROWS=$per OUT="${OUT%.bin}_g$g.bin" THREADS=$tper \
-        SEED_BASE=$(( g * 997 )) GPU_FRAC=$GPU_FRAC GPU_BATCH=$GPU_BATCH \
+        TARGET_ROWS=$gpu_rows OUT="${OUT%.bin}_g$g.bin" THREADS=$tsup \
+        SEED_BASE=$(( g * 997 )) GPU_FRAC=1.0 GPU_BATCH=$GPU_BATCH \
         bash "$0" > "launcher_g$g.log" 2>&1 &
         pids+=("$!")
     done
+    g=$(( NGPU - 1 ))
+    CUDA_VISIBLE_DEVICES=$g TURN10M_CHILD=1 NGPU=1 \
+    TARGET_ROWS=$cpu_rows OUT="${OUT%.bin}_g$g.bin" THREADS=$tcpu \
+    SEED_BASE=$(( g * 997 )) GPU_FRAC=0.0 GPU_BATCH=0 \
+    bash "$0" > "launcher_g$g.log" 2>&1 &
+    pids+=("$!")
     fail=0
     for p in "${pids[@]}"; do wait "$p" || fail=1; done
     echo "== GPU shards:"
