@@ -224,9 +224,14 @@ std::pair<HunlSolver*, int> RebelTarget::solve_at(PokerEnvironment& env) {
         solver->pf_seed = cfg_.seed * 6364136223846793005ull + 1442695040888963407ull;
     if (river && cfg_.gadget && seat_ >= 0) {
         // a mid-street fresh solve (off-tree action) inherits alternatives
-        // from the deepest in-tree node of a previous river solve — the
-        // opponent's own deviation cannot raise its entitlement
-        if (!cache_.empty()) {
+        // from the deepest in-tree node of a previous RIVER solve — the
+        // opponent's own deviation cannot raise its entitlement. The
+        // board_count guard matters: since the preflop-root-reuse, the
+        // cache can hold the preserved PREFLOP solve, whose values
+        // silently replaced the calibrated entry alternatives (found via
+        // byte-identical delta arms in the local diagnostic).
+        if (!cache_.empty() &&
+            cache_.back().solver->board_count() == 5) {
             HunlSolver& prev = *cache_.back().solver;
             const auto& rlog = cache_.back().log_at_root;
             if (rlog.size() <= log.size() &&
