@@ -768,12 +768,14 @@ int main(int argc, char** argv) {
         pc.gadget  = env_i("REBEL_GADGET", 0) != 0;
         pc.gadget_alt_exact = env_i("REBEL_GADGET_ALT_EXACT", 1) != 0;
         pc.t_alt = env_i("REBEL_T_ALT", 200);
+        pc.gadget_alt_mode = env_i("REBEL_GADGET_ALT_MODE", 0);
         if (const char* s = std::getenv("REBEL_GADGET_DELTA"))
             pc.gadget_delta = std::atof(s);
         if (pc.gadget)
-            std::printf("lbr: river gadget ON (alts=%s T_alt=%d "
+            std::printf("lbr: river gadget ON (alts=%s mode=%d T_alt=%d "
                         "delta=%.3f mix=%.2f)\n",
-                        pc.gadget_alt_exact ? "exact" : "net", pc.t_alt,
+                        pc.gadget_alt_exact ? "exact" : "net",
+                        pc.gadget_alt_mode, pc.t_alt,
                         pc.gadget_delta, pc.gadget_mix);
         else
             std::printf("lbr: river gadget off\n");

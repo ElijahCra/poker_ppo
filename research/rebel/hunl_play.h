@@ -72,6 +72,12 @@ struct RebelPlayConfig {
     bool   gadget_alt_exact = true;
     int    t_alt         = 200;
     double gadget_delta  = 0.0;
+    // 0 = alternatives as priced; 1 = clamp at zero (a participation
+    // constraint: junk is entitled to 0, not its negative continuation
+    // value — solve as if the opponent never continues at a loss);
+    // 2 = all-zero alternatives (the contaminated-run configuration
+    // that measured LBR at -1.07 bb, reproduced deliberately)
+    int    gadget_alt_mode = 0;
     // false → blueprint plays the flop too (re-solving starts at the
     // turn). Measured 2026-07-09: flop solves at T=150 on the current
     // street-2 net ERASED the high-T gain (1.424 → 1.953; river share

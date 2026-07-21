@@ -136,6 +136,17 @@ void RebelTarget::alt_from_turn_leaf(PokerEnvironment& env) {
                     out[static_cast<size_t>(p)][static_cast<size_t>(i)] -=
                         cfg_.gadget_delta * pot;
         }
+        if (cfg_.gadget_alt_mode == 1) {
+            for (int p = 0; p < 2; ++p)
+                for (int i = 0; i < kCombos; ++i)
+                    if (out[static_cast<size_t>(p)]
+                           [static_cast<size_t>(i)] < 0.0)
+                        out[static_cast<size_t>(p)]
+                           [static_cast<size_t>(i)] = 0.0;
+        } else if (cfg_.gadget_alt_mode == 2) {
+            for (int p = 0; p < 2; ++p)
+                out[static_cast<size_t>(p)].assign(kCombos, 0.0);
+        }
         alt_ = std::move(out);
         have_alt_ = true;
         return;
