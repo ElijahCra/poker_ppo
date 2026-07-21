@@ -20,11 +20,15 @@
 #        g3_s1 preflop | g3_s1 preflop+gadget(exact alts) | g3_big preflop
 set -uo pipefail
 
-BIN=./rebel_hunl
+BIN=${BIN:-./rebel_hunl}
 CHAMPION=${CHAMPION:-cand_f1.pt}
 CHAMPION_SIZE=42470807
 TARGET_ROWS=${TARGET_ROWS:-10000000}
 RIVER_TARGET=${RIVER_TARGET:-1000000}
+RIVER_EPOCHS=${RIVER_EPOCHS:-40}
+RIVER_EPS=${RIVER_EPS:-25000}
+TRAIN_EPOCHS=${TRAIN_EPOCHS:-40}
+TRAIN_SGD=${TRAIN_SGD:-4000}
 FLOP_EPOCHS=${FLOP_EPOCHS:-25}
 FLOP_EPS=${FLOP_EPS:-500}
 FLOP_THREADS=${FLOP_THREADS:-40}
@@ -137,7 +141,7 @@ if [ "$(rows river_g3.bin)" -lt "$RIVER_TARGET" ]; then
     REBEL_TF32=1 REBEL_SEED=71 REBEL_CKPT= REBEL_PROBE_K=0 \
     REBEL_SGD_STEPS=0 REBEL_GPU_BATCH=8192 REBEL_GPU_FRAC=0.95 \
     REBEL_THREADS=8 REBEL_DATA_OUT=river_g3.bin \
-    $BIN train_river 40 25000 > river_g3.log 2>&1 &
+    $BIN train_river "$RIVER_EPOCHS" "$RIVER_EPS" > river_g3.log 2>&1 &
     RIVER_PID=$!
 else
     echo "== river lane: done ($(rows river_g3.bin) rows)"
@@ -184,8 +188,8 @@ if [ "$(rows mix.bin)" -eq 0 ]; then
     fi
     echo "== turn lane: complete"
 fi
-[ -n "$RIVER_PID" ] && { finish "$RIVER_PID" river_g3.log 40 "river lane" \
-    || die "river lane failed"; }
+[ -n "$RIVER_PID" ] && { finish "$RIVER_PID" river_g3.log "$RIVER_EPOCHS" \
+    "river lane" || die "river lane failed"; }
 [ -n "$FLOP_PID" ] && { finish "$FLOP_PID" flop_g3.log "$FLOP_EPOCHS" \
     "flop lane" || die "flop lane failed"; }
 
@@ -210,7 +214,8 @@ echo "== mix: $(rows mix.bin) rows"
 train_one() {  # <ckpt> <seed> <extra-env...>
     local ck=$1 sd=$2
     shift 2
-    grep -Eq "epoch +40 +replay=" "train_${ck%.pt}.log" 2>/dev/null && {
+    grep -Eq "epoch +${TRAIN_EPOCHS} +replay=" "train_${ck%.pt}.log" \
+        2>/dev/null && {
         echo "== $ck: already trained"
         return 0
     }
@@ -218,9 +223,9 @@ train_one() {  # <ckpt> <seed> <extra-env...>
     env "$@" REBEL_TF32=1 REBEL_GPU_CACHE=60000 REBEL_SEED="$sd" \
         REBEL_CKPT="$ck" REBEL_DATA_IN=mix.bin \
         REBEL_REPLAY_CAP=$REPLAY_CAP REBEL_PROBE_K=0 \
-        REBEL_SGD_STEPS=4000 REBEL_BATCH=2048 \
-        $BIN train_turn 40 0 > "train_${ck%.pt}.log" 2>&1
-    grep -Eq "epoch +40 +replay=" "train_${ck%.pt}.log" \
+        REBEL_SGD_STEPS=$TRAIN_SGD REBEL_BATCH=2048 \
+        $BIN train_turn "$TRAIN_EPOCHS" 0 > "train_${ck%.pt}.log" 2>&1
+    grep -Eq "epoch +${TRAIN_EPOCHS} +replay=" "train_${ck%.pt}.log" \
         || die "$ck training did not finish (train_${ck%.pt}.log)"
     grep -m1 'replay=' "train_${ck%.pt}.log" | grep -q 'replay= *0 ' \
         && die "$ck trained on EMPTY replay"
