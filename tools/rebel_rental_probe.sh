@@ -56,6 +56,7 @@ echo "$kernel_line" | grep -Eq \
 $BIN gpu_check 16 200
 REBEL_GPU_F64=1 $BIN gpu_check 16 200
 $BIN gadget_check 400
+$BIN allin_response_check
 
 if [ -s "${ORACLE:-cand_f1.pt}" ]; then
     echo "==================== turn solver validation/bench ===================="
@@ -127,6 +128,21 @@ echo "--- pipelined, balanced split:"
 REBEL_SEED=3 REBEL_CKPT= REBEL_PROBE_K=0 REBEL_HIDDEN=64 \
     REBEL_SGD_STEPS=5 REBEL_GPU_BATCH=4096 REBEL_GPU_FRAC=0.5 \
     $BIN train_river 2 4000 2>&1 | grep -E 'HUNL|epoch'
+
+echo "==================== mmap/GPU-cache integrity ===================="
+rm -f .rebel_cache_probe.bin
+REBEL_SEED=8128 REBEL_CKPT= REBEL_PROBE_K=0 REBEL_HIDDEN=64 \
+    REBEL_SGD_STEPS=0 REBEL_DATA_OUT=.rebel_cache_probe.bin \
+    $BIN train_river 1 128 >/dev/null
+cache_line=$(REBEL_SEED=8129 REBEL_CKPT= REBEL_PROBE_K=0 REBEL_HIDDEN=64 \
+    REBEL_MMAP_DATA=1 REBEL_GPU_CACHE=64 REBEL_GPU_CACHE_VERIFY=1 \
+    REBEL_REPLAY_CAP=128 REBEL_SGD_STEPS=2 REBEL_BATCH=32 \
+    REBEL_DATA_IN=.rebel_cache_probe.bin \
+    $BIN train_river 1 0 2>&1 | grep 'byte verification PASS')
+echo "$cache_line"
+[ -n "$cache_line" ] \
+    || { echo "FATAL: mmap/GPU cache verification failed"; exit 1; }
+rm -f .rebel_cache_probe.bin
 
 echo "==================== done ===================="
 date

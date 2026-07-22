@@ -357,22 +357,51 @@ with replacement within each random cache slab; the persistent shuffled slab
 order exposes the whole replay about every 11 epochs. In-memory masks are u8,
 making a packed
 row 40,008 bytes and the default mixed replay about 206 GiB of payload. Offline
-loading uses a uniform reservoir and spreads 8,192 heldout rows across the
-whole mix. Validation is measured after each update; the best checkpoint is
-published via atomic rename. =tools/rebel_rental_probe.sh= must pass on the
+loading uses a uniform reservoir per street (2%, capped at 2,048/street)
+across the whole mix. Validation reports every street and checkpoint
+selection minimizes macro normalized MSE, so rare flop roots can veto a
+turn-only improvement. Validation is measured after each update; the best
+checkpoint is published via atomic rename. =tools/rebel_rental_probe.sh= must pass on the
 rental before =tools/vm_gen3_test.sh= (which launches the full campaign after
 its toy smoke). The preflight is fail-closed on fused execution, CPU/GPU value
 masks, exported play strategy layout, and every GPU's PCFR+ result.
 
-Training intentionally stays on one GPU for this campaign. DDP would require
-one process per GPU and explicit input sharding; four copies of the current
-206-GiB object replay cannot fit in 256 GB. The trainer is also LibTorch C++,
-whose public frontend currently has no supported DDP wrapper; manual c10d or a
-Python trainer port would be a separate validation project. RTX 5090s have no
-NVLink, so the 42-MB baseline / 105-MB spec gradient payloads would reduce over
-PCIe each step. A future packed/mmap row store can make host pages shareable
-and remove millions of allocations, but DDP should follow that refactor and a
-measured single-GPU profile, not precede this paid generation run.
+The fixed v3 row file is now mapped read-only with =REBEL_MMAP_DATA=1=.
+Training retains only 64-bit row indices plus the small heldout copy: no
+millions of vector allocations and concurrent architecture arms share the
+Linux page cache instead of copying the 206-GiB corpus. Gen-3 trains the base
+and spec arms concurrently on separate GPUs. DDP remains a later, measured
+optimization: LibTorch C++ has no frontend DDP wrapper, 5090s have no NVLink,
+and the 42-MB baseline / 105-MB spec gradients would reduce over PCIe every
+step. The mmap prerequisite is now in place without putting unvalidated c10d
+logic on the paid run's critical path.
+
+After the paired analytic-LBR gates choose an arm, Gen-3 runs =train_root=
+with that selected model as its own oracle, fine-tuning against the real
+preflop→flop query distribution while retaining the mapped mixed replay. A
+paired champion tolerance is enforced; gadget soundness, early all-in
+responses, pot-pressure and shove probes are separate campaign gates.
+
+* Competitive play protocol
+
+=rebel_hunl play_server= is a line protocol for integrating the re-solving
+agent with a poker client. Set =REBEL_CKPT= and the checkpoint architecture
+variables, then send:
+
+- =start <hero-seat> <hole0> <hole1>= (card ids 0..51)
+- =board <c0> <c1> <c2> [turn] [river]= after the engine changes street
+- =step <action-index>= for an observed action by either seat
+- =act= when =current_player= is the hero; the JSON reply contains the action
+  and solve latency
+- =bench <hands>= for p50/p95/max latency by street on internal self-play
+
+The server validates card collisions, action legality, turn ownership and
+board synchronization. State replies include the currently legal indices;
+index 0 is fold, 1 check/call, 2..12 the configured pot fractions, and 13
+all-in. It uses sparse ={fold, call/check, pot, all-in}=
+continuations by default, matching target generation; half-pot river is an
+explicit =REBEL_RIVER_HALF_POT= experiment. This is fixed 100bb HUNL only—no
+rake, ICM, multiway pots or arbitrary stack-depth translation.
 
 * HUNL port map (stage 2)
 

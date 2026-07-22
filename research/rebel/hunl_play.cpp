@@ -1,7 +1,10 @@
 #include "hunl_play.h"
 
 #include <algorithm>
+#include <array>
+#include <cmath>
 #include <cstdio>
+#include <numeric>
 
 namespace rebel_hunl {
 
@@ -336,10 +339,146 @@ void RebelTarget::apply_range_update(int seat,
     for (int i = 0; i < kCombos; ++i) r[i] = r[i] * col[i] / s;
 }
 
+bool RebelTarget::early_allin_response(PokerEnvironment& env,
+                                       const torch::Tensor& mask) const {
+    if (env.community_count() >= 4 || env.amount_to_call() <= 0)
+        return false;
+    const int seat = env.current_player();
+    if (env.amount_to_call() < env.stack(seat)) return false;
+    if (mask.size(0) < 2) return false;
+    const auto m = mask.accessor<float, 1>();
+    if (m[0] <= 0.5f || m[1] <= 0.5f) return false;
+    // A true all-in response has no legal raise.  Keeping this guard makes
+    // the direct resolver fail closed if a future game configuration changes
+    // the action semantics.
+    for (long a = 2; a < mask.size(0); ++a)
+        if (m[a] > 0.5f) return false;
+    return true;
+}
+
+std::vector<double> RebelTarget::allin_equities(PokerEnvironment& env) const {
+    const int seat = env.current_player();
+    const std::vector<double>& opp = seat == 0 ? pbs_.r1 : pbs_.r0;
+    const int nb = env.community_count();
+    std::array<uint8_t, 5> board{};
+    std::array<uint8_t, kCards> deck{};
+    bool public_card[kCards] = {};
+    for (int b = 0; b < nb; ++b) {
+        board[static_cast<size_t>(b)] =
+            static_cast<uint8_t>(env.community_card(b));
+        public_card[board[static_cast<size_t>(b)]] = true;
+    }
+    int ndeck = 0;
+    for (int c = 0; c < kCards; ++c)
+        if (!public_card[c]) deck[static_cast<size_t>(ndeck++)] =
+            static_cast<uint8_t>(c);
+
+    std::vector<double> signed_mass(kCombos, 0.0);
+    std::vector<double> total_mass(kCombos, 0.0);
+    std::vector<double> part, mass;
+    auto tally = [&](const std::array<uint8_t, 5>& full_board) {
+        RiverEval eval(full_board.data());
+        // half_pot=1 makes `part` the opponent-mass-weighted showdown sign
+        // (win - loss).  The matching compatible mass supplies the exact
+        // denominator, including both hole-card and runout blockers.
+        eval.cfv(opp, 1.0, part);
+        compat_mass(opp, eval.valid(), mass);
+        for (int i = 0; i < kCombos; ++i) {
+            signed_mass[static_cast<size_t>(i)] += part[static_cast<size_t>(i)];
+            total_mass[static_cast<size_t>(i)] += mass[static_cast<size_t>(i)];
+        }
+    };
+
+    const int need = 5 - nb;
+    if (need == 0) {
+        tally(board);
+    } else if (need == 1) {
+        for (int a = 0; a < ndeck; ++a) {
+            board[4] = deck[static_cast<size_t>(a)];
+            tally(board);
+        }
+    } else if (need == 2) {
+        // Flop all-ins are fully enumerated.  For each fixed pair of hole
+        // cards exactly C(45,2)=990 compatible runouts contribute.
+        for (int a = 0; a < ndeck; ++a) {
+            board[3] = deck[static_cast<size_t>(a)];
+            for (int b = a + 1; b < ndeck; ++b) {
+                board[4] = deck[static_cast<size_t>(b)];
+                tally(board);
+            }
+        }
+    } else {
+        // Only preflop reaches this branch.  Common random boards let one
+        // RiverEval sweep price all 1,326 hero combos.  Accumulating the
+        // compatible mass separately makes the estimate conditional on each
+        // hero/villain pair surviving card removal rather than treating
+        // collided samples as ties.
+        std::array<uint8_t, kCards> sample_deck{};
+        std::iota(sample_deck.begin(), sample_deck.end(), uint8_t{0});
+        uint64_t seed = 0x9e3779b97f4a7c15ull;
+        for (int a : env.action_log())
+            seed = (seed ^ static_cast<uint64_t>(a + 0x100)) *
+                   0xbf58476d1ce4e5b9ull;
+        seed ^= static_cast<uint64_t>(env.pot()) << 17;
+        std::mt19937_64 sample_rng(seed);
+        const int samples = std::max(1, cfg_.allin_mc_samples);
+        for (int s = 0; s < samples; ++s) {
+            for (int k = 0; k < 5; ++k) {
+                std::uniform_int_distribution<int> pick(k, kCards - 1);
+                std::swap(sample_deck[static_cast<size_t>(k)],
+                          sample_deck[static_cast<size_t>(pick(sample_rng))]);
+                board[static_cast<size_t>(k)] =
+                    sample_deck[static_cast<size_t>(k)];
+            }
+            tally(board);
+        }
+    }
+
+    std::vector<double> equity(kCombos, 0.5);
+    for (int i = 0; i < kCombos; ++i) {
+        const double den = total_mass[static_cast<size_t>(i)];
+        if (den <= 1e-300) continue;
+        equity[static_cast<size_t>(i)] = std::clamp(
+            0.5 * (1.0 + signed_mass[static_cast<size_t>(i)] / den),
+            0.0, 1.0);
+    }
+    return equity;
+}
+
+torch::Tensor RebelTarget::allin_response_probs(
+    PokerEnvironment& env, const torch::Tensor& mask,
+    const std::vector<std::array<uint8_t, 2>>& holes) const {
+    const auto equity = allin_equities(env);
+    const auto& ct = ComboTable::get();
+    const long n = static_cast<long>(holes.size());
+    const long A = mask.size(0);
+    auto P = torch::zeros({n, A}, torch::kFloat);
+    auto acc = P.accessor<float, 2>();
+    const double call = static_cast<double>(env.amount_to_call());
+    const double final_pot = static_cast<double>(env.pot()) + call;
+    const double eps = 1e-12 * std::max(1.0, final_pot);
+    for (long r = 0; r < n; ++r) {
+        const auto& h = holes[static_cast<size_t>(r)];
+        const int combo = ct.id[h[0]][h[1]];
+        const double gain = equity[static_cast<size_t>(combo)] * final_pot - call;
+        if (gain > eps) {
+            acc[r][1] = 1.0f;
+        } else if (gain < -eps) {
+            acc[r][0] = 1.0f;
+        } else {
+            acc[r][0] = acc[r][1] = 0.5f;
+        }
+    }
+    return P;
+}
+
 torch::Tensor RebelTarget::probs_for_holes(
     PokerEnvironment& env, const torch::Tensor& mask,
     const std::vector<std::array<uint8_t, 2>>& holes) {
     seat_ = env.current_player();   // policy queries are about OUR node
+    sync_public(env);
+    if (early_allin_response(env, mask))
+        return allin_response_probs(env, mask, holes);
     if (env.round() < solve_from() && blueprint_)
         return blueprint_->probs_for_holes(env, mask, holes);
     if (env.round() < solve_from()) {
@@ -367,6 +506,17 @@ torch::Tensor RebelTarget::probs_for_holes(
 int RebelTarget::act(PokerEnvironment& env, const torch::Tensor& mask) {
     sync_public(env);
     seat_ = env.current_player();
+    if (early_allin_response(env, mask)) {
+        const auto h = env.hole_cards(env.current_player());
+        const std::vector<std::array<uint8_t, 2>> holes{{
+            static_cast<uint8_t>(h[0]), static_cast<uint8_t>(h[1])}};
+        auto P = allin_response_probs(env, mask, holes);
+        const auto p = P.accessor<float, 2>();
+        if (p[0][1] >= 1.0f) return 1;
+        if (p[0][0] >= 1.0f) return 0;
+        std::bernoulli_distribution call(static_cast<double>(p[0][1]));
+        return call(rng_) ? 1 : 0;
+    }
     if (env.round() < solve_from()) {
         if (blueprint_) return blueprint_->act(env, mask);
         CheckCallTarget stub;
@@ -395,6 +545,10 @@ int RebelTarget::act(PokerEnvironment& env, const torch::Tensor& mask) {
 void RebelTarget::note_action(PokerEnvironment& env, int action) {
     sync_public(env);
     const int seat = env.current_player();
+    // Fold or call ends the hand at this node, so there is no future belief
+    // state to update and, critically, no reason to construct the guarded
+    // multi-street all-in CFR terminal.
+    if (early_allin_response(env, env.legal_action_mask())) return;
     if (env.round() < solve_from()) {
         if (!blueprint_) return;   // check/call stub: uninformative update
         // blueprint model for the acting seat's range (all live combos)

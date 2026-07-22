@@ -7,7 +7,8 @@
 # Exercises every phase with the same code paths and the SAME artifact
 # names the real run uses: 2k turn rows across all GPUs, 1k river rows,
 # ~160 flop rows, tiny mix, both trainings (incl. the 1536x6 spec net), and
-# all six 50-hand gates (bounds are meaningless noise — mechanics
+# all model/final gates plus pressure and latency probes (bounds are
+# meaningless noise at toy scale — mechanics
 # only). On success every artifact is deleted and verified gone (a
 # leftover toy mix.bin would make the real run skip generation and
 # train on 4k rows), then the full campaign starts. On failure the
@@ -27,7 +28,9 @@ REBEL_CHUNK_PLAN_CHECK=1 TARGET_ROWS=1416667 SEED_BASE=200000000 \
     bash "$SELF_DIR/vm_turn10m.sh" | grep -q 'plan PASS:' || exit 1
 
 ARTIFACTS="mix.bin river_g3.bin flop_g3.bin turn_g0.bin turn_g1.bin \
-turn_g2.bin turn_g3.bin g3_s1.pt g3_spec.pt gen_oracle.pt flop_oracle.pt \
+turn_g2.bin turn_g3.bin g3_s1.pt g3_spec.pt g3_selected.pt g3_final.pt \
+g3_selected.meta g3_final.meta root_refine.bin root_refine.log \
+g3_latency.jsonl g3_latency.err gen_oracle.pt flop_oracle.pt \
 river_g3.log flop_g3.log .vm_gen3_seed_scheme"
 
 echo "==== GEN-3 TOY SMOKE ($(date '+%H:%M')) ===="
@@ -45,6 +48,8 @@ FLOP_EPOCHS=2 FLOP_EPS=20 FLOP_THREADS=20 \
 TRAIN_EPOCHS=2 TRAIN_SGD=50 REPLAY_CAP=100000 \
 GPU_CACHE=2000 \
 GATE_HANDS=50 GATE_THREADS=16 \
+GATE_MAX_REGRESSION=100 PRESSURE_HANDS=4 PRESSURE_THREADS=2 \
+ROOT_EPOCHS=1 ROOT_EPISODES=1 ROOT_SGD=20 ROOT_THREADS=2 LATENCY_HANDS=2 \
 bash "$SELF_DIR/vm_gen3.sh"
 rc=$?
 
@@ -91,11 +96,8 @@ echo "==== tearing down toy artifacts ===="
 rm -f $ARTIFACTS
 rm -f turn_g*_chunk*.log turn_launcher_g*.log
 rm -f train_g3_s1.log train_g3_spec.log
-rm -f gate_g3champ_cfr.log gate_g3s1_cfr.log gate_g3s1_pcfr.log \
-      gate_g3s1_cfr_gadget.log gate_g3spec_cfr.log gate_g3spec_pcfr.log
-rm -f gate_g3champ_cfr.csv* gate_g3s1_cfr.csv* gate_g3s1_pcfr.csv* \
-      gate_g3s1_cfr_gadget.csv* gate_g3spec_cfr.csv* gate_g3spec_pcfr.csv*
-for f in mix.bin river_g3.bin flop_g3.bin g3_s1.pt g3_spec.pt \
+rm -f gate_g3*.log gate_g3*.csv*
+for f in mix.bin river_g3.bin flop_g3.bin g3_s1.pt g3_spec.pt g3_final.pt \
          train_g3_s1.log gate_g3champ_cfr.log; do
     [ -e "$f" ] && {
         echo "FATAL: teardown left $f — real run NOT started" >&2

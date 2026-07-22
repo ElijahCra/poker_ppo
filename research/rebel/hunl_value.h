@@ -272,10 +272,10 @@ struct EndgameConfig {
     // process and every architecture experiment re-pays the solves.
     //   data_out: append every fresh sample (turn/flop targets retain the
     //             generating oracle's leaf-value provenance)
-    //   data_in:  load at startup — up to 8192 evenly spaced rows across
-    //             the complete file become a persistent heldout set
-    //             (comparable across configs); the rest uniformly reservoir-
-    //             fills replay, independent of the online replay policy.
+    //   data_in:  load at startup — a uniform per-street reservoir (2%,
+    //             capped at 2,048 each) becomes a persistent heldout set;
+    //             the rest uniformly fills replay. REBEL_MMAP_DATA=1 maps
+    //             the packed file read-only for allocation-free offline SGD.
     // data_in + episodes=0 = offline training: no sampling, epochs are
     // pure SGD on the loaded replay, judged on the fixed heldout split.
     std::string data_in, data_out;
@@ -285,12 +285,19 @@ struct EndgameConfig {
 class EndgameTrainer {
 public:
     EndgameTrainer(EndgameConfig cfg);
+    ~EndgameTrainer();
     void run();
 
 private:
     struct Sample {
         std::vector<float> feat, target;
         std::vector<uint8_t> mask;   // target/mask [2*kCombos]
+    };
+    struct HeldoutMetrics {
+        double global = 0.0;
+        double score = 0.0;  // macro-average normalized MSE across streets
+        std::array<double, 4> street{};
+        std::array<uint64_t, 4> entries{};
     };
 
     // env positioned at a random street root (random board, random pot via
@@ -355,10 +362,13 @@ private:
     void self_play_episode(poker_ppo::PokerEnvironment& env, std::mt19937& rng,
                            std::vector<Sample>& fresh);
     double train_net();
+    size_t replay_size() const;
+    void copy_replay_row(size_t i, float* feat, float* target,
+                         uint8_t* mask) const;
     // Masked MSE of the net on the given samples. Called on each epoch's
     // FRESH samples BEFORE they are trained on — a true out-of-sample
     // generalization probe (in-replay MSE is memorization at small scale).
-    double heldout_mse(const std::vector<Sample>& fresh);
+    HeldoutMetrics heldout_metrics(const std::vector<Sample>& fresh);
     // Internal exploitability of a turn solve on a FIXED probe situation
     // (one per seed) with the given oracle — comparing net leaves vs exact
     // leaves on the same root is the cross-validation of the trained net.
@@ -391,7 +401,19 @@ private:
     std::mt19937  rng_;
 
     std::vector<Sample> replay_;
+    // Optional read-only packed dataset mapping (Linux rental path). The
+    // fixed row file is already a packed format; mapping it removes millions
+    // of vector allocations and lets concurrent GPU training processes share
+    // the kernel page cache instead of each copying ~200GB into heap RAM.
+    const uint8_t* mapped_base_ = nullptr;
+    size_t mapped_bytes_ = 0;
+    int mapped_fd_ = -1;
+    std::vector<uint64_t> mapped_rows_;
     std::vector<Sample> heldout_;   // fixed split from data_in (never trained)
+    // Per-street masked target variance. Checkpoint selection uses
+    // macro-average normalized MSE, so millions of turn rows cannot hide a
+    // regression on the much rarer flop-root distribution.
+    std::array<double, 4> heldout_var_{};
     long                seen_ = 0;
     bool                circular_ = false;   // resolved from cfg_.circular
     // device-resident sample cache (REBEL_GPU_CACHE)
@@ -399,6 +421,7 @@ private:
     std::vector<size_t> tc_order_;
     size_t tc_cursor_ = 0;
     size_t tc_replay_size_ = 0;
+    bool tc_verified_ = false;
 };
 
 }  // namespace rebel_hunl

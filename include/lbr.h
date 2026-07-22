@@ -97,6 +97,10 @@ struct LBRConfig {
     // raises, so this probe is what exposes flop/turn fold-weakness). Adds
     // one extra target query per LBR node; off by default.
     bool     fold_probe        = false;
+    // Same measurement for an all-in raise. This is deliberately separate:
+    // early-street shove responses invoke exact flop runout equity (or the
+    // configured deterministic preflop sample) and are much more expensive.
+    bool     shove_probe       = false;
     // Raise pricing for streets before the river.
     //   0 = analytic checkdown, river raises only — EXACT, the default and
     //       the trustworthy bound.

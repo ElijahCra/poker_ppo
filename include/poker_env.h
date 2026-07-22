@@ -87,6 +87,13 @@ public:
     // villain_seat is the seat whose cards are being injected.
     void inject_rollout_cards(int villain_seat, int h0, int h1,
                               std::mt19937& rng);
+    // External-play bridge: pin the acting bot's real hole cards and the
+    // currently revealed board, then resample hidden opponent/future cards
+    // without conflicts. Betting state/action history are untouched, so a
+    // client can replay observed actions and replace chance cards street by
+    // street before asking the agent to act.
+    void inject_play_cards(int hero_seat, int h0, int h1,
+                           const std::vector<int>& board);
 
 private:
     void auto_advance_chance();

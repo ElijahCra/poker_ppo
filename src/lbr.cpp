@@ -124,6 +124,14 @@ int pot_raise_index(const PokerEnvironment& env, const torch::Tensor& mask) {
     return best;
 }
 
+int allin_raise_index(const PokerEnvironment& env, const torch::Tensor& mask) {
+    const int allin = 2 + static_cast<int>(
+        env.game_config().pot_fractions.size());
+    if (allin >= mask.size(0)) return -1;
+    const auto m = mask.accessor<float, 1>();
+    return m[allin] > 0.5f ? allin : -1;
+}
+
 // The pre-interface net path, verbatim: deployment filter (temper → drop
 // <min_p → renormalise), rm_plus regret readout, counterfactual-hole
 // batching. Behavior-identical to the old in-evaluate lambdas.
@@ -350,6 +358,7 @@ LBREvaluator::Result LBREvaluator::evaluate_target(ILBRTarget& target) {
     // Fold-probe: per street, n = LBR nodes where a raise was legal, mbb =
     // Σ belief-weighted P(target folds to a pot raise). avg = over-fold rate.
     std::array<Bucket, 4>         fold_probe{};
+    std::array<Bucket, 4>         shove_probe{};
     // Rollout calibration: mean predicted vs realised util on raise-hands
     // (validates the EV estimate is meaningful, not just non-crashing).
     double cal_pred = 0.0, cal_real = 0.0; long cal_n = 0;
@@ -453,6 +462,30 @@ LBREvaluator::Result LBREvaluator::evaluate_target(ILBRTarget& target) {
                     env_->pop_state();
                     const int s = env_->round();
                     if (s >= 0 && s < 4) { fold_probe[s].n++; fold_probe[s].mbb += pf; }
+                }
+            }
+            if (cfg_.shove_probe) {
+                const int ar = allin_raise_index(*env_, mask);
+                if (ar >= 0) {
+                    auto active = active_of(belief);
+                    env_->push_state();
+                    env_->step(ar);
+                    auto vmask = env_->legal_action_mask();
+                    double pf = 0.0;
+                    if (!active.empty()) {
+                        auto P  = active_probs(belief, active, vmask);
+                        auto ft = P.select(1, 0).contiguous();
+                        auto fa = ft.accessor<float, 1>();
+                        for (size_t r = 0; r < active.size(); ++r)
+                            pf += belief.weights[active[r]] *
+                                  static_cast<double>(fa[static_cast<long>(r)]);
+                    }
+                    env_->pop_state();
+                    const int s = env_->round();
+                    if (s >= 0 && s < 4) {
+                        shove_probe[s].n++;
+                        shove_probe[s].mbb += pf;
+                    }
                 }
             }
 
@@ -597,6 +630,18 @@ LBREvaluator::Result LBREvaluator::evaluate_target(ILBRTarget& target) {
                       << std::setw(10) << std::fixed << std::setprecision(1)
                       << (b.n > 0 ? 100.0 * b.mbb / b.n : 0.0)
                       << "% fold-to-raise\n";
+        }
+    }
+    if (cfg_.shove_probe) {
+        std::cout << "  ── target fold-rate to an all-in, by street "
+                  << "(forced-response and shove-pressure check) ──\n";
+        for (int s = 0; s < 4; ++s) {
+            const auto& b = shove_probe[s];
+            std::cout << "  " << std::setw(14) << std::left << sname[s]
+                      << std::right << std::setw(8) << b.n << " nodes"
+                      << std::setw(10) << std::fixed << std::setprecision(1)
+                      << (b.n > 0 ? 100.0 * b.mbb / b.n : 0.0)
+                      << "% fold-to-shove\n";
         }
     }
     if (cfg_.rollout_mode != 0 && cal_n > 0) {

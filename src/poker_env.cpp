@@ -7,6 +7,7 @@
 #include "GameState.hpp"
 #include "Utility/AllInEquity.hpp"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
@@ -282,6 +283,44 @@ void PokerEnvironment::inject_rollout_cards(int villain_seat, int h0, int h1,
         raw[slot] = static_cast<uint8_t>(rem[j]);
         rem[j] = rem[--nr];  // draw without replacement
     }
+}
+
+void PokerEnvironment::inject_play_cards(int hero_seat, int h0, int h1,
+                                         const std::vector<int>& board) {
+    TORCH_CHECK(hero_seat == 0 || hero_seat == 1,
+                "inject_play_cards: hero_seat must be 0 or 1");
+    TORCH_CHECK(static_cast<int>(board.size()) == community_count(),
+                "inject_play_cards: board count must match revealed street");
+    TORCH_CHECK(board.empty() || board.size() == 3 || board.size() == 4 ||
+                    board.size() == 5,
+                "inject_play_cards: board size must be 0, 3, 4, or 5");
+    bool dead[52] = {};
+    auto claim = [&](int c) {
+        TORCH_CHECK(c >= 0 && c < 52 && !dead[c],
+                    "inject_play_cards: duplicate or invalid card ", c);
+        dead[c] = true;
+    };
+    claim(h0);
+    claim(h1);
+    for (int c : board) claim(c);
+
+    auto& raw = game_->contextMut().cards.rawCards;
+    raw[hero_seat * 2] = static_cast<uint8_t>(h0);
+    raw[hero_seat * 2 + 1] = static_cast<uint8_t>(h1);
+    for (size_t i = 0; i < board.size(); ++i)
+        raw[4 + i] = static_cast<uint8_t>(board[i]);
+
+    std::vector<uint8_t> rem;
+    rem.reserve(52);
+    for (int c = 0; c < 52; ++c)
+        if (!dead[c]) rem.push_back(static_cast<uint8_t>(c));
+    std::shuffle(rem.begin(), rem.end(), rng_);
+    size_t at = 0;
+    const int villain = 1 - hero_seat;
+    raw[villain * 2] = rem[at++];
+    raw[villain * 2 + 1] = rem[at++];
+    for (size_t slot = 4 + board.size(); slot < raw.size(); ++slot)
+        raw[slot] = rem[at++];
 }
 
 void PokerEnvironment::auto_advance_chance() {

@@ -44,14 +44,13 @@ struct RebelPlayConfig {
     int t_flop        = 60;    // flop solves (net turn-root leaves)
     int refresh_every = 5;     // CFR-AVG leaf refresh cadence (turn)
     int refresh_flop  = 10;    // flop refreshes cost 49 turn-root queries
-    // Turn keeps the training abstraction (the net's leaf values assume
-    // it). River solves are exact to terminal — no net consistency to
-    // preserve — so the river set adds 0.5-pot (action 4): LBR's analytic
-    // raise menu is {~0.5-pot, ~pot, all-in}, and an off-tree raise both
-    // skips the belief update and leaves the response unpriced (measured:
-    // ALL residual LBR profit was river-ending hands).
+    // Turn and river keep the target-generation abstraction aligned. A
+    // denser exact river solve changes the continuation game that the turn
+    // net learned to price; REBEL_RIVER_HALF_POT enables it only for A/Bs.
     std::vector<int> actions       = {0, 1, 7, 13};
-    std::vector<int> actions_river = {0, 1, 4, 7, 13};
+    // Keep deployment continuation-consistent with training by default.
+    // REBEL_RIVER_HALF_POT is an explicit dense-river experiment.
+    std::vector<int> actions_river = {0, 1, 7, 13};
     // Flop trees exclude all-in: a called shove 2 cards early is a
     // multi-street AllinShowdown the solver deliberately guards (later
     // stage); LBR never raises pre-river in analytic mode, so no real
@@ -102,6 +101,11 @@ struct RebelPlayConfig {
     // to CPU (values_at needs CPU leaf values).
     bool   gpu_turn      = false;
     int    pf_samples    = 64;   // sampled flops per preflop leaf
+    // A preflop shove response has no future strategic decisions, so it is
+    // priced directly against the tracked opponent range instead of building
+    // a multi-street CFR chance tree.  Post-flop responses enumerate every
+    // runout exactly; this controls only the deterministic preflop sample.
+    int    allin_mc_samples = 1024;
     uint64_t seed     = 0;
 };
 
@@ -162,6 +166,17 @@ private:
     // multiply `seat`'s tracked range by P(action | node) under the given
     // per-combo policy column; no-op (revert) if the update zeroes it.
     void apply_range_update(int seat, const std::vector<double>& col);
+    // Equal-stack HUNL has a forced fold/call node after an opponent shove.
+    // Before the turn, resolving that node directly is exact on the flop and
+    // deterministic Monte Carlo preflop; it also keeps unsupported
+    // multi-street AllinShowdown terminals out of HunlSolver.
+    bool early_allin_response(poker_ppo::PokerEnvironment& env,
+                              const torch::Tensor& mask) const;
+    std::vector<double> allin_equities(
+        poker_ppo::PokerEnvironment& env) const;
+    torch::Tensor allin_response_probs(
+        poker_ppo::PokerEnvironment& env, const torch::Tensor& mask,
+        const std::vector<std::array<uint8_t, 2>>& holes) const;
 
     HunlValueNet  net_;
     double        stack_;

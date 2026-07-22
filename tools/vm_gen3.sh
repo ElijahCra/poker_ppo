@@ -6,7 +6,8 @@
 # Shaped for 4x5090 / 128 cores / 256GB RAM / 1TB disk. Phases, each
 # gated on verifiable on-disk state (rerun after any death — finished
 # phases are detected and skipped):
-#   0  sanity quartet (kernels, river GPU, feature context, fused turn GPU)
+#   0  sanity ladder (kernels, early all-ins, river GPU, feature context,
+#      fused turn GPU, safe gadget)
 #   1  generation:
 #        river + flop auxiliary banks start first; turn starts once the
 #        short river bank finishes and overlaps the longer flop CPU lane.
@@ -15,7 +16,7 @@
 #        GPU measured ~2x slower because persistent fused windows block the
 #        CPU lane's latency-sensitive forwards.
 #   2  transactional mix build (verified temp + atomic rename; sources kept)
-#   3  training, sequential (256GB fits ONE 5M-row replay at a time):
+#   3  training, concurrent mmap readers (shared Linux page cache):
 #        g3_s1   — continued from the champion (1024x2)
 #        g3_spec — fresh ReBeL-style 1536x6 GeLU+LayerNorm; the local
 #                  architecture screen's best heldout arm
@@ -54,6 +55,14 @@ T_TURN=${T_TURN:-120}
 REPLAY_CAP=${REPLAY_CAP:-5600000}      # keeps the full ~5.54M mixed bank
 GATE_HANDS=${GATE_HANDS:-20000}
 GATE_THREADS=${GATE_THREADS:-128}
+GATE_MAX_REGRESSION=${GATE_MAX_REGRESSION:-0.35}
+PRESSURE_HANDS=${PRESSURE_HANDS:-200}
+PRESSURE_THREADS=${PRESSURE_THREADS:-16}
+LATENCY_HANDS=${LATENCY_HANDS:-20}
+ROOT_EPOCHS=${ROOT_EPOCHS:-5}
+ROOT_EPISODES=${ROOT_EPISODES:-40}
+ROOT_SGD=${ROOT_SGD:-1000}
+ROOT_THREADS=${ROOT_THREADS:-96}
 SEED_BASE=${SEED_BASE:-0}
 # Each shard owns a disjoint seed interval.  The trainer currently reduces
 # several RNG seeds to uint32, so keep the real campaign below this stride
@@ -241,6 +250,8 @@ echo "$kernel_line"
 echo "$kernel_line" | grep -Eq \
     'root-weight err .*topology-key=exact +PASS$' \
     || die "kernels FAIL or stale rebel_hunl binary"
+$BIN allin_response_check 2>&1 | tail -1 | grep -q PASS \
+    || die "allin_response_check FAIL"
 $BIN gpu_check 4 60 2>&1 | tail -1 | grep -q PASS || die "gpu_check FAIL"
 flop_line=$($BIN flopctx_check 10 2>&1 | tail -1) || die "flopctx FAIL"
 echo "$flop_line"
@@ -252,6 +263,8 @@ turn_line=$(REBEL_CKPT="$CHAMPION" REBEL_PCFR=1 REBEL_TF32=1 \
 echo "$turn_line"
 [ "$turn_line" = "turn_gpu_check: PASS" ] \
     || die "fused PCFR+ turn_gpu_check FAIL or stale rebel_hunl binary"
+$BIN gadget_check 400 2>&1 | tail -1 | grep -q PASS \
+    || die "gadget_check FAIL"
 echo "   all PASS"
 
 # ── phase 1a: auxiliary river/flop banks ─────────────────────────────
@@ -446,10 +459,10 @@ cmp -n 16 "$header_ref" mix.bin >/dev/null || die "mix.bin header mismatch"
     || die "mix.bin row count $(rows mix.bin) != $expected_mix_rows"
 echo "== mix: $(rows mix.bin) rows (turn=$TARGET_ROWS river=$river_rows flop=$flop_rows)"
 
-# ── phase 3: training, sequential (RAM fits one replay) ─────────────
-train_one() {  # <ckpt> <seed> <extra-env...>
-    local ck=$1 sd=$2
-    shift 2
+# ── phase 3: mmap training arms (concurrent when >=2 GPUs) ─────────
+train_one() {  # <ckpt> <seed> <gpu> <extra-env...>
+    local ck=$1 sd=$2 gpu=$3
+    shift 3
     grep -Eq "epoch +${TRAIN_EPOCHS} +replay=" "train_${ck%.pt}.log" \
         2>/dev/null && {
         [ -s "$ck" ] || die "$ck log is complete but checkpoint is missing"
@@ -461,7 +474,9 @@ train_one() {  # <ckpt> <seed> <extra-env...>
     # device cache walks a shuffled permutation without replacement: 500k
     # exposes the complete ~5.54M mix every ~11 epochs (the old 60k random
     # redraws reached only about 38% of 5M rows over 40 epochs).
-    env REBEL_TF32=1 REBEL_GPU_CACHE=$GPU_CACHE REBEL_CIRCULAR=0 \
+    env CUDA_VISIBLE_DEVICES="$gpu" REBEL_TF32=1 \
+        REBEL_MMAP_DATA=1 REBEL_GPU_CACHE=$GPU_CACHE \
+        REBEL_GPU_CACHE_VERIFY=1 REBEL_CIRCULAR=0 \
         REBEL_ZERO_SUM=1 REBEL_HUBER_DELTA=1 \
         REBEL_HIDDEN=1024 REBEL_LAYERS=2 REBEL_GELU_LN=0 \
         REBEL_SEED="$sd" \
@@ -481,20 +496,33 @@ train_one() {  # <ckpt> <seed> <extra-env...>
     return 0
 }
 [ -f g3_s1.pt ] || cp "$CHAMPION" g3_s1.pt
-train_one g3_s1.pt 301 REBEL_LR=2e-4 REBEL_LR_FINAL=5e-5
-train_one g3_spec.pt 302 REBEL_LR=3e-4 REBEL_LR_FINAL=3e-5 \
-    REBEL_BATCH=1024 REBEL_HIDDEN=1536 REBEL_LAYERS=6 REBEL_GELU_LN=1
+if [ "$NGPU" -ge 2 ]; then
+    train_one g3_s1.pt 301 0 REBEL_LR=2e-4 REBEL_LR_FINAL=5e-5 &
+    train_pids=("$!")
+    train_one g3_spec.pt 302 1 REBEL_LR=3e-4 REBEL_LR_FINAL=3e-5 \
+        REBEL_BATCH=1024 REBEL_HIDDEN=1536 REBEL_LAYERS=6 REBEL_GELU_LN=1 &
+    train_pids+=("$!")
+    train_fail=0
+    for p in "${train_pids[@]}"; do wait "$p" || train_fail=1; done
+    [ "$train_fail" -eq 0 ] || die "a concurrent mmap training arm failed"
+else
+    train_one g3_s1.pt 301 0 REBEL_LR=2e-4 REBEL_LR_FINAL=5e-5
+    train_one g3_spec.pt 302 0 REBEL_LR=3e-4 REBEL_LR_FINAL=3e-5 \
+        REBEL_BATCH=1024 REBEL_HIDDEN=1536 REBEL_LAYERS=6 REBEL_GELU_LN=1
+fi
 
 # ── phase 4: gates, sequential, paired seed 1234 ────────────────────
 gate_one() {  # <name> <ckpt> <extra-env...>
     local name=$1 ck=$2
+    local gate_hands=${GATE_THIS_HANDS:-$GATE_HANDS}
+    local gate_threads=${GATE_THIS_THREADS:-$GATE_THREADS}
     shift 2
     grep -q 'LBR vs ReBeL agent:' "gate_$name.log" 2>/dev/null && {
         echo "== gate $name: done"
         return 0
     }
     rm -f "gate_$name.csv" "gate_$name.csv".*
-    echo "== gate $name ($GATE_HANDS hands @ $GATE_THREADS thr)"
+    echo "== gate $name ($gate_hands hands @ $gate_threads thr)"
     env -u REBEL_BLUEPRINT -u REBEL_BLUEPRINT_ONLY \
         REBEL_TF32=1 REBEL_PCFR=0 REBEL_GADGET=0 REBEL_GPU_TURN=0 \
         REBEL_GADGET_ALT_EXACT=1 REBEL_GADGET_ALT_MODE=0 \
@@ -503,7 +531,7 @@ gate_one() {  # <name> <ckpt> <extra-env...>
         REBEL_FLOP=1 REBEL_PREFLOP=1 REBEL_T_PREFLOP=40 REBEL_T_FLOP=60 \
         REBEL_T_TURN=240 REBEL_T_RIVER=800 REBEL_PF_SAMPLES=64 "$@" \
         REBEL_CKPT="$ck" REBEL_SEED=1234 REBEL_LBR_LOG="gate_$name.csv" \
-        $BIN lbr "$GATE_HANDS" "$GATE_THREADS" > "gate_$name.log" 2>&1
+        $BIN lbr "$gate_hands" "$gate_threads" > "gate_$name.log" 2>&1
     grep -q 'LBR vs ReBeL agent:' "gate_$name.log" \
         || die "gate $name did not finish"
 }
@@ -517,10 +545,120 @@ gate_one g3spec_pcfr     g3_spec.pt REBEL_PCFR=1 \
     REBEL_HIDDEN=1536 REBEL_LAYERS=6 \
     REBEL_GELU_LN=1
 
+# Pick on the trustworthy analytic LBR bound. The tolerance is deliberately
+# paired to the freshly remeasured champion and defaults to ~1.6 standard
+# errors for 20k HUNL hands; a rental can tighten it by raising GATE_HANDS.
+gate_score() {
+    grep 'LBR vs ReBeL agent:' "gate_$1.log" | tail -1 | awk '{print $5}'
+}
+champ_score=$(gate_score g3champ_cfr)
+best_name=g3s1_cfr
+best_score=$(gate_score "$best_name")
+for n in g3s1_pcfr g3spec_cfr g3spec_pcfr; do
+    s=$(gate_score "$n")
+    if awk -v a="$s" -v b="$best_score" 'BEGIN{exit !(a < b)}'; then
+        best_name=$n
+        best_score=$s
+    fi
+done
+awk -v b="$best_score" -v c="$champ_score" -v m="$GATE_MAX_REGRESSION" \
+    'BEGIN{exit !(b <= c + m)}' \
+    || die "best candidate $best_name=$best_score regresses champion=$champ_score by more than $GATE_MAX_REGRESSION bb/hand"
+
+case "$best_name" in
+    g3s1_cfr)   selected_ckpt=g3_s1.pt; selected_pcfr=0; selected_arch=base ;;
+    g3s1_pcfr)  selected_ckpt=g3_s1.pt; selected_pcfr=1; selected_arch=base ;;
+    g3spec_cfr) selected_ckpt=g3_spec.pt; selected_pcfr=0; selected_arch=spec ;;
+    g3spec_pcfr) selected_ckpt=g3_spec.pt; selected_pcfr=1; selected_arch=spec ;;
+    *) die "unknown selected gate $best_name" ;;
+esac
+if [ "$selected_arch" = spec ]; then
+    selected_env=(REBEL_HIDDEN=1536 REBEL_LAYERS=6 REBEL_GELU_LN=1)
+else
+    selected_env=(REBEL_HIDDEN=1024 REBEL_LAYERS=2 REBEL_GELU_LN=0)
+fi
+cp "$selected_ckpt" g3_selected.pt || die "cannot publish g3_selected.pt"
+printf 'gate=%s analytic_lbr=%s champion_lbr=%s pcfr=%s arch=%s actions=0,1,7,13\n' \
+    "$best_name" "$best_score" "$champ_score" "$selected_pcfr" \
+    "$selected_arch" > g3_selected.meta
+
+# Phase 5: Algorithm-1 closure from the real game root. This loads the full
+# mixed corpus, then lets the selected model generate its own preflop->flop
+# query distribution while it fine-tunes. It is intentionally after model
+# selection: using the old champion here would leave the deployed winner on
+# another model's leaf distribution.
+if ! grep -Eq "epoch +${ROOT_EPOCHS} +replay=" root_refine.log 2>/dev/null; then
+    [ ! -e root_refine.bin ] && [ ! -e g3_final.pt ] \
+        || die "partial root refinement exists; move root_refine.bin, root_refine.log and g3_final.pt aside before retry"
+    cp g3_selected.pt g3_final.pt || die "cannot stage g3_final.pt"
+    echo "== phase 5: selected-model root refinement ($ROOT_EPOCHS x $ROOT_EPISODES)"
+    env REBEL_TF32=1 REBEL_MMAP_DATA=1 REBEL_GPU_CACHE=$GPU_CACHE \
+        REBEL_GPU_CACHE_VERIFY=1 \
+        REBEL_CIRCULAR=0 \
+        REBEL_ZERO_SUM=1 REBEL_HUBER_DELTA=1 REBEL_PCFR=1 \
+        "${selected_env[@]}" REBEL_SEED=401 REBEL_CKPT=g3_final.pt \
+        REBEL_DATA_IN=mix.bin REBEL_DATA_OUT=root_refine.bin \
+        REBEL_REPLAY_CAP=$REPLAY_CAP REBEL_PROBE_K=0 \
+        REBEL_THREADS=$ROOT_THREADS REBEL_T_PREFLOP=40 REBEL_PF_SAMPLES=64 \
+        REBEL_T_FLOP=60 REBEL_T_TURN_TRAIN=$T_TURN REBEL_HARVEST=2 \
+        REBEL_SGD_STEPS=$ROOT_SGD REBEL_BATCH=1024 REBEL_LR=5e-5 \
+        REBEL_LR_FINAL=1e-5 \
+        $BIN train_root "$ROOT_EPOCHS" "$ROOT_EPISODES" \
+        > root_refine.log 2>&1 || {
+            tail -20 root_refine.log >&2
+            die "root refinement failed"
+        }
+fi
+grep -Eq "epoch +${ROOT_EPOCHS} +replay=" root_refine.log \
+    || die "root refinement did not finish"
+[ -s g3_final.pt ] || die "root refinement produced no checkpoint"
+
+GATE_THIS_HANDS=$GATE_HANDS GATE_THIS_THREADS=$GATE_THREADS \
+    gate_one g3final_cfr g3_final.pt "${selected_env[@]}"
+GATE_THIS_HANDS=$GATE_HANDS GATE_THIS_THREADS=$GATE_THREADS \
+    gate_one g3final_pcfr g3_final.pt REBEL_PCFR=1 "${selected_env[@]}"
+final_cfr=$(gate_score g3final_cfr)
+final_pcfr=$(gate_score g3final_pcfr)
+final_name=g3final_cfr
+final_score=$final_cfr
+if awk -v a="$final_pcfr" -v b="$final_cfr" 'BEGIN{exit !(a < b)}'; then
+    final_name=g3final_pcfr
+    final_score=$final_pcfr
+fi
+awk -v f="$final_score" -v c="$champ_score" -v m="$GATE_MAX_REGRESSION" \
+    'BEGIN{exit !(f <= c + m)}' \
+    || die "root-refined model=$final_score fails champion tolerance $champ_score+$GATE_MAX_REGRESSION"
+
+# Small, expensive diagnostic: exercise target responses to both pot raises
+# and all-ins on every street. Completion plus the allin_response_check above
+# is the coverage gate; exploitability acceptance remains the paired analytic
+# LBR threshold, not an arbitrary fold-frequency target.
+GATE_THIS_HANDS=$PRESSURE_HANDS GATE_THIS_THREADS=$PRESSURE_THREADS \
+    gate_one g3final_pressure g3_final.pt REBEL_FOLD_PROBE=1 \
+        REBEL_SHOVE_PROBE=1 REBEL_ALLIN_MC_SAMPLES=1024 "${selected_env[@]}"
+grep -q 'fold-rate to an all-in' gate_g3final_pressure.log \
+    || die "pressure gate did not exercise shove responses"
+
+final_pcfr=0
+[ "$final_name" = g3final_pcfr ] && final_pcfr=1
+printf 'gate=%s analytic_lbr=%s champion_lbr=%s pcfr=%s arch=%s actions=0,1,7,13 root_rows=%s\n' \
+    "$final_name" "$final_score" "$champ_score" "$final_pcfr" \
+    "$selected_arch" "$(rows root_refine.bin)" > g3_final.meta
+
+printf 'bench %s\n' "$LATENCY_HANDS" | env REBEL_TF32=1 \
+    REBEL_CKPT=g3_final.pt REBEL_PCFR=$final_pcfr REBEL_GADGET=0 \
+    REBEL_GPU_TURN=0 REBEL_PREFLOP=1 REBEL_FLOP=1 \
+    REBEL_T_PREFLOP=40 REBEL_T_FLOP=60 REBEL_T_TURN=240 \
+    REBEL_T_RIVER=800 REBEL_PF_SAMPLES=64 "${selected_env[@]}" \
+    $BIN play_server > g3_latency.jsonl 2> g3_latency.err \
+    || die "play-server latency benchmark failed"
+grep -q '"latency"' g3_latency.jsonl \
+    || die "play-server latency benchmark produced no street metrics"
+
 echo ""
 echo "== GEN-3 RESULTS ========================================="
 for n in g3champ_cfr g3s1_cfr g3s1_pcfr g3s1_cfr_gadget \
-         g3spec_cfr g3spec_pcfr; do
+         g3spec_cfr g3spec_pcfr g3final_cfr g3final_pcfr; do
     echo "  $n  $(grep 'LBR vs ReBeL agent:' "gate_$n.log" 2>/dev/null || echo INCOMPLETE)"
 done
-echo "compare candidates to g3champ_cfr above (same binary/config/seed)"
+echo "selected: $final_name ($final_score bb/hand), metadata g3_final.meta"

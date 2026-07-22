@@ -9,8 +9,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iostream>
 #include <limits>
 #include <random>
+#include <sstream>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -665,6 +668,269 @@ int run_gadget_check(int T) {
     return worst < bar ? 0 : 1;
 }
 
+int run_allin_response_check() {
+    // Regression for the competitive-play crash: an off-tree shove before
+    // the turn must be answered by the direct equity resolver, never by the
+    // guarded multi-street AllinShowdown CFR terminal.
+    HunlValueNet net(64, 2, false, true);
+    net->to(torch::kCPU);
+    RebelPlayConfig cfg;
+    cfg.flop_solve = true;
+    cfg.preflop_solve = false;
+    cfg.t_flop = 1;
+    cfg.t_turn = 1;
+    cfg.t_river = 1;
+    cfg.allin_mc_samples = 32;
+    cfg.seed = 99173;
+    const double stack =
+        static_cast<double>(poker_ppo::kPokerConfig.game.initial_stack);
+    bool ok = true;
+    for (int target_round : {0, 1}) {
+        PokerEnvironment env(poker_ppo::kPokerConfig,
+                             poker_ppo::config::kBetConfig,
+                             7300 + target_round);
+        if (target_round > 0) advance_to_round(env, target_round);
+        RebelTarget target(net, stack, torch::kCPU, cfg, nullptr);
+        target.on_hand_start(env);
+        const int shove = poker_ppo::config::kBetConfig.action_count() - 1;
+        auto before_tensor = env.legal_action_mask();
+        auto before = before_tensor.accessor<float, 1>();
+        if (shove < 2 || before[shove] <= 0.5f) {
+            ok = false;
+            continue;
+        }
+        target.note_action(env, shove);
+        env.step(shove);
+        if (env.is_terminal()) {
+            ok = false;
+            continue;
+        }
+        auto mask = env.legal_action_mask();
+        const int response = target.act(env, mask);
+        if (response != 0 && response != 1) ok = false;
+        target.note_action(env, response);
+        env.step(response);
+        if (!env.is_terminal()) ok = false;
+    }
+    // The deployment bridge must replace random internal chance cards with
+    // the externally observed deal without changing betting state.
+    {
+        PokerEnvironment env(poker_ppo::kPokerConfig,
+                             poker_ppo::config::kBetConfig, 7411);
+        env.reset();
+        env.inject_play_cards(0, 0, 1, {});
+        ok = ok && env.hole_cards(0) == std::array<int, 2>{0, 1};
+        advance_to_round(env, 1);
+        const std::vector<int> board{10, 11, 12};
+        env.inject_play_cards(0, 0, 1, board);
+        for (int i = 0; i < 3; ++i)
+            ok = ok && env.community_card(i) == board[static_cast<size_t>(i)];
+    }
+    std::printf("allin_response_check: preflop+flop forced responses %s\n",
+                ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+int run_play_server() {
+    auto env_i = [](const char* name, int fallback) {
+        if (const char* s = std::getenv(name)) return std::atoi(s);
+        return fallback;
+    };
+    const char* ck = std::getenv("REBEL_CKPT");
+    if (!ck || !*ck) {
+        std::fprintf(stderr, "play_server requires REBEL_CKPT\n");
+        return 1;
+    }
+    const int hidden = env_i("REBEL_HIDDEN", 1024);
+    const int layers = env_i("REBEL_LAYERS", 2);
+    const bool gelu = env_i("REBEL_GELU_LN", 0) != 0;
+    const bool zero_sum = env_i("REBEL_ZERO_SUM", 1) != 0;
+    HunlValueNet net(hidden, layers, gelu, zero_sum);
+    std::unordered_map<std::string, std::vector<int64_t>> want;
+    for (const auto& p : net->named_parameters())
+        want[p.key()] = p.value().sizes().vec();
+    try {
+        torch::load(net, ck);
+        for (const auto& p : net->named_parameters())
+            TORCH_CHECK(want.at(p.key()) == p.value().sizes().vec(),
+                        "checkpoint architecture mismatch");
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "play_server cannot load %s (%s)\n", ck,
+                     e.what());
+        return 1;
+    }
+    torch::Device device(torch::cuda::is_available() ? torch::kCUDA
+                                                     : torch::kCPU);
+    net->to(device);
+    net->eval();
+
+    RebelPlayConfig pc;
+    pc.preflop_solve = env_i("REBEL_PREFLOP", 1) != 0;
+    pc.flop_solve = env_i("REBEL_FLOP", 1) != 0;
+    pc.t_preflop = env_i("REBEL_T_PREFLOP", 40);
+    pc.t_flop = env_i("REBEL_T_FLOP", 60);
+    pc.t_turn = env_i("REBEL_T_TURN", 240);
+    pc.t_river = env_i("REBEL_T_RIVER", 800);
+    pc.pf_samples = env_i("REBEL_PF_SAMPLES", 64);
+    pc.allin_mc_samples = env_i("REBEL_ALLIN_MC_SAMPLES", 4096);
+    pc.pcfr = env_i("REBEL_PCFR", 0) != 0;
+    pc.gpu_turn = env_i("REBEL_GPU_TURN", 0) != 0;
+    pc.gadget = env_i("REBEL_GADGET", 0) != 0;
+    pc.seed = static_cast<uint64_t>(env_i("REBEL_SEED", 20260722));
+    if (env_i("REBEL_RIVER_HALF_POT", 0) != 0)
+        pc.actions_river = {0, 1, 4, 7, 13};
+
+    PokerEnvironment env(poker_ppo::kPokerConfig,
+                         poker_ppo::config::kBetConfig, pc.seed + 1);
+    const double stack = static_cast<double>(
+        poker_ppo::kPokerConfig.game.initial_stack);
+    RebelTarget target(net, stack, device, pc, nullptr);
+    int hero = -1, h0 = -1, h1 = -1;
+    std::vector<int> known_board;
+    bool started = false;
+    auto state = [&]() {
+        std::cout << "{\"ok\":true,\"terminal\":"
+                  << (env.is_terminal() ? "true" : "false")
+                  << ",\"round\":" << env.round()
+                  << ",\"current_player\":"
+                  << (env.is_terminal() ? -1 : env.current_player())
+                  << ",\"pot\":" << env.pot()
+                  << ",\"board_count\":" << env.community_count()
+                  << ",\"board_required\":"
+                  << (static_cast<int>(known_board.size()) !=
+                              env.community_count()
+                          ? "true" : "false")
+                  << ",\"legal\":[";
+        if (!env.is_terminal()) {
+            auto mask_tensor = env.legal_action_mask();
+            auto mask = mask_tensor.accessor<float, 1>();
+            bool first = true;
+            for (long a = 0; a < mask.size(0); ++a) {
+                if (mask[a] <= 0.5f) continue;
+                if (!first) std::cout << ',';
+                std::cout << a;
+                first = false;
+            }
+        }
+        std::cout << "]}\n" << std::flush;
+    };
+    std::cout << "{\"ready\":true,\"protocol\":1,\"commands\":"
+                 "[\"start seat h0 h1\",\"board c...\","
+                 "\"step action\",\"act\",\"bench hands\","
+                 "\"state\",\"quit\"]}\n"
+              << std::flush;
+    std::string line;
+    while (std::getline(std::cin, line)) {
+        std::istringstream in(line);
+        std::string cmd;
+        in >> cmd;
+        try {
+            if (cmd == "quit") return 0;
+            if (cmd == "bench") {
+                int hands = 0;
+                TORCH_CHECK(in >> hands && hands > 0,
+                            "usage: bench <positive-hands>");
+                std::array<std::vector<double>, 4> latency;
+                for (int hand = 0; hand < hands; ++hand) {
+                    env.reset();
+                    target.on_hand_start(env);
+                    while (!env.is_terminal()) {
+                        const int street = env.round();
+                        const auto t0 = std::chrono::steady_clock::now();
+                        const int action =
+                            target.act(env, env.legal_action_mask());
+                        latency[static_cast<size_t>(street)].push_back(
+                            std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - t0).count());
+                        target.note_action(env, action);
+                        env.step(action);
+                    }
+                }
+                started = false;
+                std::cout << "{\"ok\":true,\"latency\":[";
+                for (int street = 0; street < 4; ++street) {
+                    auto& v = latency[static_cast<size_t>(street)];
+                    std::sort(v.begin(), v.end());
+                    auto q = [&](double p) {
+                        if (v.empty()) return 0.0;
+                        const size_t i = static_cast<size_t>(
+                            p * static_cast<double>(v.size() - 1));
+                        return v[i];
+                    };
+                    if (street) std::cout << ',';
+                    std::cout << "{\"street\":" << street
+                              << ",\"n\":" << v.size()
+                              << ",\"p50_ms\":" << q(0.50)
+                              << ",\"p95_ms\":" << q(0.95)
+                              << ",\"max_ms\":" << q(1.0) << '}';
+                }
+                std::cout << "]}\n" << std::flush;
+            } else if (cmd == "start") {
+                TORCH_CHECK(in >> hero >> h0 >> h1,
+                            "usage: start <hero-seat> <hole0> <hole1>");
+                env.reset();
+                known_board.clear();
+                env.inject_play_cards(hero, h0, h1, known_board);
+                target.on_hand_start(env);
+                started = true;
+                state();
+            } else if (cmd == "board") {
+                TORCH_CHECK(started, "start a hand first");
+                known_board.clear();
+                int c;
+                while (in >> c) known_board.push_back(c);
+                env.inject_play_cards(hero, h0, h1, known_board);
+                state();
+            } else if (cmd == "step") {
+                TORCH_CHECK(started && !env.is_terminal(),
+                            "no active hand");
+                TORCH_CHECK(static_cast<int>(known_board.size()) ==
+                                env.community_count(),
+                            "send the revealed board before the next action");
+                int action = -1;
+                TORCH_CHECK(in >> action, "usage: step <action-index>");
+                auto mask_tensor = env.legal_action_mask();
+                auto mask = mask_tensor.accessor<float, 1>();
+                TORCH_CHECK(action >= 0 && action < mask.size(0) &&
+                                mask[action] > 0.5f,
+                            "illegal action ", action);
+                target.note_action(env, action);
+                env.step(action);
+                state();
+            } else if (cmd == "act") {
+                TORCH_CHECK(started && !env.is_terminal(),
+                            "no active hand");
+                TORCH_CHECK(env.current_player() == hero,
+                            "act requested when opponent is current player");
+                TORCH_CHECK(static_cast<int>(known_board.size()) ==
+                                env.community_count(),
+                            "send the revealed board before act");
+                const int street = env.round();
+                const auto t0 = std::chrono::steady_clock::now();
+                const int action = target.act(env, env.legal_action_mask());
+                const double ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - t0).count();
+                target.note_action(env, action);
+                env.step(action);
+                std::cout << "{\"ok\":true,\"action\":" << action
+                          << ",\"street\":" << street
+                          << ",\"latency_ms\":" << ms << "}\n"
+                          << std::flush;
+            } else if (cmd == "state") {
+                TORCH_CHECK(started, "start a hand first");
+                state();
+            } else {
+                throw std::runtime_error("unknown command");
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "play_server error: " << e.what() << "\n";
+            std::cout << "{\"ok\":false,\"error\":\"command failed; "
+                         "see stderr\"}\n" << std::flush;
+        }
+    }
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -679,6 +945,8 @@ int main(int argc, char** argv) {
     }
     const std::string mode = argc > 1 ? argv[1] : "kernels";
     if (mode == "kernels") return run_kernels();
+    if (mode == "allin_response_check") return run_allin_response_check();
+    if (mode == "play_server") return run_play_server();
     if (mode == "gadget_check")
         return run_gadget_check(argc > 2 ? std::atoi(argv[2]) : 400);
     if (mode == "gpu_check")
@@ -763,6 +1031,20 @@ int main(int argc, char** argv) {
         lc.num_hands = hands;      // trustworthy-bound defaults
         if (const char* s = std::getenv("REBEL_SEED"))
             lc.seed = std::strtoull(s, nullptr, 10);
+        lc.fold_probe = env_i("REBEL_FOLD_PROBE", 0) != 0;
+        lc.shove_probe = env_i("REBEL_SHOVE_PROBE", 0) != 0;
+        lc.rollout_mode = env_i("REBEL_LBR_ROLLOUT_MODE", 0);
+        lc.rollout_samples = env_i("REBEL_LBR_ROLLOUT_SAMPLES", 24);
+        lc.equity_mc_samples = env_i("REBEL_LBR_EQUITY_SAMPLES", 600);
+        if (lc.fold_probe)
+            std::printf("lbr: all-street pot-pressure fold probe ON\n");
+        if (lc.shove_probe)
+            std::printf("lbr: all-street shove-response probe ON\n");
+        if (lc.rollout_mode != 0)
+            std::printf("lbr: rollout mode %d, K=%d (%s)\n",
+                        lc.rollout_mode, lc.rollout_samples,
+                        lc.rollout_mode == 1 ? "river calibration"
+                                             : "experimental all-street");
         // per-hand CSV (shards suffix .N) — aggregate attribution across
         // ALL shards, not just shard 0's printed table
         if (const char* s = std::getenv("REBEL_LBR_LOG")) lc.log_path = s;
@@ -827,6 +1109,12 @@ int main(int argc, char** argv) {
         pc.preflop_solve = env_i("REBEL_PREFLOP", 0) != 0;
         pc.t_preflop     = env_i("REBEL_T_PREFLOP", 40);
         pc.pf_samples    = env_i("REBEL_PF_SAMPLES", 64);
+        pc.allin_mc_samples = env_i("REBEL_ALLIN_MC_SAMPLES", 1024);
+        if (env_i("REBEL_RIVER_HALF_POT", 0) != 0) {
+            pc.actions_river = {0, 1, 4, 7, 13};
+            std::printf("lbr: EXPERIMENTAL dense river action 0.5-pot ON "
+                        "(continuation abstraction differs from training)\n");
+        }
         if (pc.preflop_solve)
             std::printf("lbr: PREFLOP re-solving ON (T=%d, %d sampled "
                         "flops/leaf)\n", pc.t_preflop, pc.pf_samples);
@@ -1578,6 +1866,6 @@ int main(int argc, char** argv) {
     }
     std::fprintf(stderr,
                  "mode must be kernels|river|turn|train_turn|train_river|"
-                 "train_flop|lbr\n");
+                 "train_flop|train_root|lbr|play_server\n");
     return 1;
 }

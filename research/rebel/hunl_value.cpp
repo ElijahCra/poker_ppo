@@ -5,6 +5,7 @@
 
 #include <fcntl.h>
 #include <sys/file.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -15,12 +16,14 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <functional>
 #include <limits>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "config.h"
 
@@ -732,6 +735,41 @@ EndgameTrainer::EndgameTrainer(EndgameConfig cfg)
     if (cfg_.sgd_steps > 0)
         opt_ =
             std::make_unique<torch::optim::Adam>(net_->parameters(), cfg_.lr);
+}
+
+EndgameTrainer::~EndgameTrainer() {
+    if (mapped_base_ && mapped_bytes_ > 0)
+        ::munmap(const_cast<uint8_t*>(mapped_base_), mapped_bytes_);
+    if (mapped_fd_ >= 0) ::close(mapped_fd_);
+}
+
+size_t EndgameTrainer::replay_size() const {
+    return mapped_rows_.size() + replay_.size();
+}
+
+void EndgameTrainer::copy_replay_row(size_t i, float* feat, float* target,
+                                     uint8_t* mask) const {
+    const size_t n_out = 2 * static_cast<size_t>(kCombos);
+    if (i < mapped_rows_.size()) {
+        const size_t row_bytes =
+            sizeof(float) *
+                static_cast<size_t>(HunlFeaturizer::kDim + 2 * kCombos) +
+            n_out;
+        const uint64_t row = mapped_rows_[i];
+        const uint8_t* p = mapped_base_ + 4 * sizeof(uint32_t) +
+                           static_cast<size_t>(row) * row_bytes;
+        std::memcpy(feat, p,
+                    sizeof(float) * static_cast<size_t>(HunlFeaturizer::kDim));
+        p += sizeof(float) * static_cast<size_t>(HunlFeaturizer::kDim);
+        std::memcpy(target, p, sizeof(float) * n_out);
+        p += sizeof(float) * n_out;
+        std::memcpy(mask, p, n_out);
+        return;
+    }
+    const Sample& s = replay_[i - mapped_rows_.size()];
+    std::copy(s.feat.begin(), s.feat.end(), feat);
+    std::copy(s.target.begin(), s.target.end(), target);
+    std::copy(s.mask.begin(), s.mask.end(), mask);
 }
 
 bool EndgameTrainer::sample_street_root(poker_ppo::PokerEnvironment& env,
@@ -1505,9 +1543,17 @@ void EndgameTrainer::root_episode(poker_ppo::PokerEnvironment& env,
 
 void EndgameTrainer::replay_insert(Sample&& smp) {
     ++seen_;
-    if (static_cast<int>(replay_.size()) < cfg_.replay_cap) {
+    if (cfg_.replay_cap <= 0) return;
+    const size_t total = replay_size();
+    if (total < static_cast<size_t>(std::max(0, cfg_.replay_cap))) {
         replay_.push_back(std::move(smp));
     } else if (circular_) {
+        if (!mapped_rows_.empty()) {
+            std::fprintf(stderr,
+                         "  [mmap] circular online replay cannot overwrite "
+                         "read-only base rows; use REBEL_CIRCULAR=0\n");
+            std::exit(1);
+        }
         // ReBeL: circular buffer — overwrite the oldest (recency window,
         // tracks the net's evolving query distribution)
         replay_[static_cast<size_t>((seen_ - 1) % cfg_.replay_cap)] =
@@ -1516,8 +1562,14 @@ void EndgameTrainer::replay_insert(Sample&& smp) {
         // reservoir — uniform over all samples ever seen (stationary data)
         std::uniform_int_distribution<long> d(0, seen_ - 1);
         const long j = d(rng_);
-        if (j < static_cast<long>(replay_.size()))
-            replay_[static_cast<size_t>(j)] = std::move(smp);
+        if (j < static_cast<long>(mapped_rows_.size())) {
+            mapped_rows_[static_cast<size_t>(j)] = mapped_rows_.back();
+            mapped_rows_.pop_back();
+            replay_.push_back(std::move(smp));
+        } else if (j < static_cast<long>(total)) {
+            replay_[static_cast<size_t>(j) - mapped_rows_.size()] =
+                std::move(smp);
+        }
     }
 }
 
@@ -1625,36 +1677,154 @@ void EndgameTrainer::load_dataset(const std::string& path) {
                      path.c_str(),
                      static_cast<uintmax_t>(payload_bytes % row_bytes));
 
-    // Spread a deterministic validation set over the entire ordered file.
-    // The old row%50/cap rule stopped after row 409,550, so a 5M-row mix
-    // validated only its first shard.
-    const size_t heldout_room =
-        heldout_.size() < 8192 ? 8192 - heldout_.size() : 0;
-    const uint64_t heldout_goal = std::min<uint64_t>(
-        heldout_room, (total_rows + 49) / 50);
-    uint64_t heldout_i = 0;
-    auto next_validation_row = [&]() -> uint64_t {
-        if (heldout_i >= heldout_goal) return total_rows;
-        return ((2 * heldout_i + 1) * total_rows) / (2 * heldout_goal);
+    // A separate uniform reservoir per street prevents the 5M-row turn
+    // shard from drowning the much rarer flop roots. Each street keeps 2%
+    // of its rows up to 2,048; the reservoir spans the complete ordered file.
+    constexpr size_t kHeldoutPerStreet = 2048;
+    std::array<size_t, 4> existing{};
+    auto sample_street = [](const Sample& s) {
+        int street = 0;
+        for (int k = 1; k < 4; ++k)
+            if (s.feat[static_cast<size_t>(k)] >
+                s.feat[static_cast<size_t>(street)])
+                street = k;
+        return street;
     };
-    uint64_t next_heldout = next_validation_row();
+    for (const Sample& s : heldout_) ++existing[sample_street(s)];
+    std::array<uint64_t, 4> street_seen{};
+    std::array<std::vector<Sample>, 4> street_hold;
+    auto splitmix64 = [](uint64_t x) {
+        x += 0x9e3779b97f4a7c15ull;
+        x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ull;
+        x = (x ^ (x >> 27)) * 0x94d049bb133111ebull;
+        return x ^ (x >> 31);
+    };
+
+    uint64_t rows = 0;
+    bool mapped_load = false;
+    if (const char* mm = std::getenv("REBEL_MMAP_DATA");
+        mm && std::atoi(mm) != 0) {
+        if (mapped_base_) {
+            std::fprintf(stderr,
+                         "  [mmap] only one mapped data file is supported\n");
+            std::exit(1);
+        }
+        mapped_fd_ = ::open(path.c_str(), O_RDONLY);
+        if (mapped_fd_ < 0) {
+            std::fprintf(stderr, "  [mmap] cannot open %s: %s\n",
+                         path.c_str(), std::strerror(errno));
+            std::exit(1);
+        }
+        mapped_bytes_ = static_cast<size_t>(file_bytes);
+        void* p = ::mmap(nullptr, mapped_bytes_, PROT_READ, MAP_SHARED,
+                         mapped_fd_, 0);
+        if (p == MAP_FAILED) {
+            std::fprintf(stderr, "  [mmap] cannot map %s: %s\n",
+                         path.c_str(), std::strerror(errno));
+            std::exit(1);
+        }
+        mapped_base_ = static_cast<const uint8_t*>(p);
+
+        std::array<std::vector<uint64_t>, 4> hold_rows;
+        std::array<uint64_t, 4> seen{};
+        auto street_at = [&](uint64_t row) {
+            const uint8_t* rp = mapped_base_ + kHeaderBytes +
+                                static_cast<size_t>(row) * row_bytes;
+            const float* feat = reinterpret_cast<const float*>(rp);
+            int street = 0;
+            for (int k = 1; k < 4; ++k)
+                if (feat[k] > feat[street]) street = k;
+            return street;
+        };
+        for (uint64_t row = 0; row < total_rows; ++row) {
+            const int street = street_at(row);
+            const uint64_t n = ++seen[static_cast<size_t>(street)];
+            const size_t cap = existing[static_cast<size_t>(street)] <
+                                       kHeldoutPerStreet
+                ? kHeldoutPerStreet - existing[static_cast<size_t>(street)]
+                : 0;
+            auto& hs = hold_rows[static_cast<size_t>(street)];
+            if (hs.size() < cap) {
+                hs.push_back(row);
+            } else if (cap > 0) {
+                const uint64_t j = splitmix64(
+                    row ^ (static_cast<uint64_t>(street) << 61)) % n;
+                if (j < cap) hs[static_cast<size_t>(j)] = row;
+            }
+        }
+        std::unordered_set<uint64_t> hold_set;
+        for (int street = 0; street < 4; ++street) {
+            auto& hs = hold_rows[static_cast<size_t>(street)];
+            const size_t wanted = std::min<size_t>(
+                hs.size(), (seen[static_cast<size_t>(street)] + 49) / 50);
+            hs.resize(wanted);
+            for (uint64_t row : hs) hold_set.insert(row);
+        }
+
+        auto copy_mapped_sample = [&](uint64_t row) {
+            Sample s;
+            s.feat.resize(HunlFeaturizer::kDim);
+            s.target.resize(static_cast<size_t>(n_out));
+            s.mask.resize(static_cast<size_t>(n_out));
+            const uint8_t* rp = mapped_base_ + kHeaderBytes +
+                                static_cast<size_t>(row) * row_bytes;
+            std::memcpy(s.feat.data(), rp,
+                        sizeof(float) * HunlFeaturizer::kDim);
+            rp += sizeof(float) * HunlFeaturizer::kDim;
+            std::memcpy(s.target.data(), rp,
+                        sizeof(float) * static_cast<size_t>(n_out));
+            rp += sizeof(float) * static_cast<size_t>(n_out);
+            std::memcpy(s.mask.data(), rp, static_cast<size_t>(n_out));
+            heldout_.push_back(std::move(s));
+        };
+        std::vector<uint64_t> hold_sorted(hold_set.begin(), hold_set.end());
+        std::sort(hold_sorted.begin(), hold_sorted.end());
+        for (uint64_t row : hold_sorted) copy_mapped_sample(row);
+
+        const size_t cap = cfg_.replay_cap > 0
+            ? static_cast<size_t>(cfg_.replay_cap)
+            : 0;
+        mapped_rows_.reserve(std::min<size_t>(total_rows, cap));
+        uint64_t train_seen = 0;
+        for (uint64_t row = 0; row < total_rows; ++row) {
+            if (hold_set.count(row)) continue;
+            ++train_seen;
+            if (mapped_rows_.size() < cap) {
+                mapped_rows_.push_back(row);
+            } else if (cap > 0) {
+                const uint64_t j = splitmix64(row ^ 0xd1b54a32d192ed03ull) %
+                                   train_seen;
+                if (j < cap) mapped_rows_[static_cast<size_t>(j)] = row;
+            }
+        }
+        seen_ = static_cast<long>(train_seen);
+        rows = total_rows;
+        mapped_load = true;
+        std::printf("  [mmap] %s: %.2f GiB mapped read-only; %zu row "
+                    "indices (%.1f MiB), no per-row heap allocations\n",
+                    path.c_str(), static_cast<double>(mapped_bytes_) /
+                                          (1024.0 * 1024.0 * 1024.0),
+                    mapped_rows_.size(),
+                    static_cast<double>(mapped_rows_.capacity() *
+                                        sizeof(uint64_t)) /
+                        (1024.0 * 1024.0));
+    }
 
     // A fixed offline file should load independently of its row ordering.
     // Restore the online circular/recency policy after uniform reservoir
     // filling, so later self-play still follows the configured policy.
     const bool online_circular = circular_;
     circular_ = false;
-    if (cfg_.replay_cap > 0 &&
+    if (!mapped_load && cfg_.replay_cap > 0 &&
         replay_.size() < static_cast<size_t>(cfg_.replay_cap)) {
-        const uint64_t train_rows = total_rows - heldout_goal;
         const size_t room =
             static_cast<size_t>(cfg_.replay_cap) - replay_.size();
         replay_.reserve(replay_.size() +
-                        std::min<size_t>(train_rows, room));
+                        std::min<size_t>(total_rows, room));
     }
 
+    if (!mapped_load) {
     f.seekg(static_cast<std::streamoff>(kHeaderBytes));
-    uint64_t rows = 0;
     for (; rows < total_rows; ++rows) {
         Sample s;
         s.feat.resize(HunlFeaturizer::kDim);
@@ -1671,31 +1841,78 @@ void EndgameTrainer::load_dataset(const std::string& path) {
                          path.c_str(), static_cast<uintmax_t>(rows));
             break;
         }
-        if (rows == next_heldout) {
-            heldout_.push_back(std::move(s));
-            ++heldout_i;
-            next_heldout = next_validation_row();
+        const int street = sample_street(s);
+        const uint64_t seen = ++street_seen[static_cast<size_t>(street)];
+        const size_t cap = existing[static_cast<size_t>(street)] <
+                                   kHeldoutPerStreet
+            ? kHeldoutPerStreet - existing[static_cast<size_t>(street)]
+            : 0;
+        auto& hs = street_hold[static_cast<size_t>(street)];
+        if (hs.size() < cap) {
+            hs.push_back(std::move(s));
+        } else if (cap > 0) {
+            const uint64_t j = splitmix64(
+                rows ^ (static_cast<uint64_t>(street) << 61)) % seen;
+            if (j < cap) {
+                std::swap(s, hs[static_cast<size_t>(j)]);
+                replay_insert(std::move(s));
+            } else {
+                replay_insert(std::move(s));
+            }
         } else {
             replay_insert(std::move(s));
         }
+    }
+    // The working reservoirs use the full cap so they are uniform even when
+    // a street's final 2% quota was not known up front. Shrinking a uniform
+    // reservoir remains uniform; displaced rows return to training replay.
+    for (int street = 0; street < 4; ++street) {
+        auto& hs = street_hold[static_cast<size_t>(street)];
+        const size_t wanted = std::min<size_t>(
+            hs.size(), (street_seen[static_cast<size_t>(street)] + 49) / 50);
+        for (size_t k = wanted; k < hs.size(); ++k)
+            replay_insert(std::move(hs[k]));
+        hs.resize(wanted);
+        for (Sample& s : hs) heldout_.push_back(std::move(s));
+    }
     }
     circular_ = online_circular;
     // masked target variance of the heldout slice = the "predict the mean"
     // MSE baseline that makes heldout readable as explained variance
     double sum = 0.0, sq = 0.0, cnt = 0.0;
-    for (const Sample& s : heldout_)
+    std::array<double, 4> st_sum{}, st_sq{}, st_cnt{};
+    std::array<size_t, 4> st_rows{};
+    for (const Sample& s : heldout_) {
+        const int street = sample_street(s);
+        ++st_rows[static_cast<size_t>(street)];
         for (int j = 0; j < n_out; ++j)
             if (s.mask[j]) {
                 sum += s.target[j];
                 sq += static_cast<double>(s.target[j]) * s.target[j];
                 cnt += 1.0;
+                st_sum[static_cast<size_t>(street)] += s.target[j];
+                st_sq[static_cast<size_t>(street)] +=
+                    static_cast<double>(s.target[j]) * s.target[j];
+                st_cnt[static_cast<size_t>(street)] += 1.0;
             }
+    }
     const double var =
         cnt > 0 ? sq / cnt - (sum / cnt) * (sum / cnt) : 0.0;
+    for (int street = 0; street < 4; ++street) {
+        const double n = st_cnt[static_cast<size_t>(street)];
+        heldout_var_[static_cast<size_t>(street)] = n > 0
+            ? std::max(0.0, st_sq[static_cast<size_t>(street)] / n -
+                                std::pow(st_sum[static_cast<size_t>(street)] /
+                                             n,
+                                         2.0))
+            : 0.0;
+    }
     std::printf("  [data] %s: %ju rows -> replay %zu, heldout %zu "
-                "(uniform offline reservoir, target var %.3e)\n",
-                path.c_str(), static_cast<uintmax_t>(rows), replay_.size(),
-                heldout_.size(), var);
+                "(street reservoirs s1=%zu s2=%zu s3=%zu, target var "
+                "%.3e; vars %.3e/%.3e/%.3e)\n",
+                path.c_str(), static_cast<uintmax_t>(rows), replay_size(),
+                heldout_.size(), st_rows[1], st_rows[2], st_rows[3], var,
+                heldout_var_[1], heldout_var_[2], heldout_var_[3]);
     // Zero-sum residual of the TARGETS under the same weights the net's
     // outer correction uses (Σ r0·m0·v0 + Σ r1·m1·v1, per-entry units
     // s/2Z). Exact solver values satisfy the identity up to CFR
@@ -1755,7 +1972,8 @@ double EndgameTrainer::train_net_cached(int want) {
     // resident slab with replacement, as in the uncached path. Masks stay u8
     // until each batch.
     const int n_out = 2 * kCombos;
-    const size_t C = std::min(replay_.size(), static_cast<size_t>(want));
+    const size_t R = replay_size();
+    const size_t C = std::min(R, static_cast<size_t>(want));
     auto opts = torch::TensorOptions().dtype(torch::kFloat).device(device_);
     if (!tc_feat_.defined() || tc_feat_.size(0) != static_cast<long>(C)) {
         tc_feat_ = torch::empty(
@@ -1764,15 +1982,15 @@ double EndgameTrainer::train_net_cached(int want) {
         tc_mask_ = torch::empty({static_cast<long>(C), n_out},
                                 opts.dtype(torch::kUInt8));
     }
-    if (tc_replay_size_ != replay_.size()) {
-        tc_order_.resize(replay_.size());
+    if (tc_replay_size_ != R) {
+        tc_order_.resize(R);
         std::iota(tc_order_.begin(), tc_order_.end(), static_cast<size_t>(0));
         std::shuffle(tc_order_.begin(), tc_order_.end(), rng_);
         tc_cursor_ = 0;
-        tc_replay_size_ = replay_.size();
+        tc_replay_size_ = R;
         std::printf("  [gpu-cache] %zu/%zu rows (%.2f GiB), slab order "
                     "cycles without replacement\n",
-                    C, replay_.size(),
+                    C, R,
                     static_cast<double>(C) * 40008.0 /
                         (1024.0 * 1024.0 * 1024.0));
     }
@@ -1791,19 +2009,43 @@ double EndgameTrainer::train_net_cached(int want) {
     for (long off = 0; off < static_cast<long>(C); off += CH) {
         const long m = std::min(CH, static_cast<long>(C) - off);
         for (long r = 0; r < m; ++r) {
-            const Sample& s = replay_[idx[static_cast<size_t>(off + r)]];
-            std::copy(s.feat.begin(), s.feat.end(),
-                      sf.data_ptr<float>() +
-                          static_cast<size_t>(r) * HunlFeaturizer::kDim);
-            std::copy(s.target.begin(), s.target.end(),
-                      st.data_ptr<float>() + static_cast<size_t>(r) * n_out);
-            std::copy(s.mask.begin(), s.mask.end(),
-                      sm.data_ptr<uint8_t>() +
-                          static_cast<size_t>(r) * n_out);
+            copy_replay_row(
+                idx[static_cast<size_t>(off + r)],
+                sf.data_ptr<float>() +
+                    static_cast<size_t>(r) * HunlFeaturizer::kDim,
+                st.data_ptr<float>() + static_cast<size_t>(r) * n_out,
+                sm.data_ptr<uint8_t>() + static_cast<size_t>(r) * n_out);
         }
         tc_feat_.narrow(0, off, m).copy_(sf.narrow(0, 0, m));
         tc_targ_.narrow(0, off, m).copy_(st.narrow(0, 0, m));
         tc_mask_.narrow(0, off, m).copy_(sm.narrow(0, 0, m));
+    }
+    if (!tc_verified_ && std::getenv("REBEL_GPU_CACHE_VERIFY")) {
+        TORCH_CHECK(C > 0, "GPU cache verification has no rows");
+        std::vector<float> f(static_cast<size_t>(HunlFeaturizer::kDim));
+        std::vector<float> t(static_cast<size_t>(n_out));
+        std::vector<uint8_t> m(static_cast<size_t>(n_out));
+        for (size_t pos : {size_t{0}, C / 2, C - 1}) {
+            copy_replay_row(idx[pos], f.data(), t.data(), m.data());
+            auto gf = tc_feat_.select(0, static_cast<long>(pos))
+                          .to(torch::kCPU).contiguous();
+            auto gt = tc_targ_.select(0, static_cast<long>(pos))
+                          .to(torch::kCPU).contiguous();
+            auto gm = tc_mask_.select(0, static_cast<long>(pos))
+                          .to(torch::kCPU).contiguous();
+            TORCH_CHECK(std::memcmp(gf.data_ptr<float>(), f.data(),
+                                    sizeof(float) * f.size()) == 0,
+                        "GPU cache feature transfer mismatch at ", pos);
+            TORCH_CHECK(std::memcmp(gt.data_ptr<float>(), t.data(),
+                                    sizeof(float) * t.size()) == 0,
+                        "GPU cache target transfer mismatch at ", pos);
+            TORCH_CHECK(std::memcmp(gm.data_ptr<uint8_t>(), m.data(),
+                                    m.size()) == 0,
+                        "GPU cache mask transfer mismatch at ", pos);
+        }
+        tc_verified_ = true;
+        std::printf("  [gpu-cache] mmap/host/device byte verification PASS\n");
+        std::fflush(stdout);
     }
     double last = 0.0;
     const int B = std::min<int>(cfg_.batch, static_cast<int>(C));
@@ -1833,29 +2075,27 @@ double EndgameTrainer::train_net_cached(int want) {
 }
 
 double EndgameTrainer::train_net() {
-    if (replay_.empty()) return 0.0;
+    const size_t R = replay_size();
+    if (R == 0) return 0.0;
     if (device_.is_cuda())
         if (const char* s = std::getenv("REBEL_GPU_CACHE"))
             if (const int c = std::atoi(s); c > 0)
                 return train_net_cached(c);
     const int n_out = 2 * kCombos;
-    std::uniform_int_distribution<size_t> pick(0, replay_.size() - 1);
+    std::uniform_int_distribution<size_t> pick(0, R - 1);
     double last = 0.0;
     for (int step = 0; step < cfg_.sgd_steps; ++step) {
-        const int B = std::min<int>(cfg_.batch,
-                                    static_cast<int>(replay_.size()));
+        const int B = std::min<int>(cfg_.batch, static_cast<int>(R));
         auto X = torch::empty({B, HunlFeaturizer::kDim}, torch::kFloat);
         auto Y = torch::empty({B, n_out}, torch::kFloat);
         auto M = torch::empty({B, n_out}, torch::kUInt8);
         for (int b = 0; b < B; ++b) {
-            const Sample& s = replay_[pick(rng_)];
-            std::copy(s.feat.begin(), s.feat.end(),
-                      X.data_ptr<float>() +
-                          static_cast<size_t>(b) * HunlFeaturizer::kDim);
-            std::copy(s.target.begin(), s.target.end(),
-                      Y.data_ptr<float>() + static_cast<size_t>(b) * n_out);
-            std::copy(s.mask.begin(), s.mask.end(),
-                      M.data_ptr<uint8_t>() + static_cast<size_t>(b) * n_out);
+            copy_replay_row(
+                pick(rng_),
+                X.data_ptr<float>() +
+                    static_cast<size_t>(b) * HunlFeaturizer::kDim,
+                Y.data_ptr<float>() + static_cast<size_t>(b) * n_out,
+                M.data_ptr<uint8_t>() + static_cast<size_t>(b) * n_out);
         }
         opt_->zero_grad();
         auto Xd = X.to(device_), Yd = Y.to(device_);
@@ -1880,8 +2120,10 @@ double EndgameTrainer::train_net() {
     return last;
 }
 
-double EndgameTrainer::heldout_mse(const std::vector<Sample>& fresh) {
-    if (fresh.empty()) return 0.0;
+EndgameTrainer::HeldoutMetrics EndgameTrainer::heldout_metrics(
+    const std::vector<Sample>& fresh) {
+    HeldoutMetrics metrics;
+    if (fresh.empty()) return metrics;
     torch::NoGradGuard ng;
     const long N = static_cast<long>(fresh.size());
     auto X = torch::empty({N, HunlFeaturizer::kDim}, torch::kFloat);
@@ -1892,14 +2134,38 @@ double EndgameTrainer::heldout_mse(const std::vector<Sample>& fresh) {
     auto y = net_->forward(X.to(device_)).to(torch::kCPU).contiguous();
     auto acc = y.accessor<float, 2>();
     double se = 0.0, cnt = 0.0;
-    for (long r = 0; r < N; ++r)
+    std::array<double, 4> street_se{};
+    for (long r = 0; r < N; ++r) {
+        int street = 0;
+        for (int k = 1; k < 4; ++k)
+            if (fresh[static_cast<size_t>(r)].feat[static_cast<size_t>(k)] >
+                fresh[static_cast<size_t>(r)].feat[static_cast<size_t>(street)])
+                street = k;
         for (int j = 0; j < 2 * kCombos; ++j)
             if (fresh[r].mask[j]) {
                 const double e = acc[r][j] - fresh[r].target[j];
                 se += e * e;
                 cnt += 1.0;
+                street_se[static_cast<size_t>(street)] += e * e;
+                ++metrics.entries[static_cast<size_t>(street)];
             }
-    return cnt > 0 ? se / cnt : 0.0;
+    }
+    metrics.global = cnt > 0 ? se / cnt : 0.0;
+    double normalized = 0.0;
+    int present = 0;
+    for (int street = 0; street < 4; ++street) {
+        const uint64_t n = metrics.entries[static_cast<size_t>(street)];
+        if (n == 0) continue;
+        metrics.street[static_cast<size_t>(street)] =
+            street_se[static_cast<size_t>(street)] / static_cast<double>(n);
+        const double var = heldout_var_[static_cast<size_t>(street)];
+        normalized += var > 1e-12
+            ? metrics.street[static_cast<size_t>(street)] / var
+            : metrics.street[static_cast<size_t>(street)];
+        ++present;
+    }
+    metrics.score = present > 0 ? normalized / present : metrics.global;
+    return metrics;
 }
 
 double EndgameTrainer::probe_turn_expl(HunlValueOracle* oracle, int T,
@@ -1995,7 +2261,13 @@ void EndgameTrainer::run() {
         (void)combo_rank(ComboTable::get().id[25][30], warm);
     }
     if (!cfg_.data_in.empty()) load_dataset(cfg_.data_in);
-    if (cfg_.episodes == 0 && cfg_.sgd_steps > 0 && replay_.empty()) {
+    if (!mapped_rows_.empty() && cfg_.episodes > 0 && circular_) {
+        std::fprintf(stderr,
+                     "  [mmap] online refinement requires reservoir replay; "
+                     "set REBEL_CIRCULAR=0\n");
+        std::exit(1);
+    }
+    if (cfg_.episodes == 0 && cfg_.sgd_steps > 0 && replay_size() == 0) {
         std::fprintf(stderr,
                      "  [offline] no replay rows loaded; refusing empty "
                      "training run\n");
@@ -2016,16 +2288,20 @@ void EndgameTrainer::run() {
     }
 
     size_t generated_total = 0;
-    double best_heldout = std::numeric_limits<double>::infinity();
+    double best_score = std::numeric_limits<double>::infinity();
     if (cfg_.sgd_steps > 0 && !heldout_.empty()) {
-        best_heldout = heldout_mse(heldout_);
-        if (!std::isfinite(best_heldout)) {
+        const HeldoutMetrics baseline = heldout_metrics(heldout_);
+        best_score = baseline.score;
+        if (!std::isfinite(baseline.global) || !std::isfinite(best_score)) {
             std::fprintf(stderr,
                          "  [train] non-finite baseline heldout; refusing "
                          "to train\n");
             std::exit(1);
         }
-        std::printf("  [ckpt] baseline heldout %.3e\n", best_heldout);
+        std::printf("  [ckpt] baseline heldout %.3e "
+                    "(s1 %.3e s2 %.3e s3 %.3e, macro-nmse %.3e)\n",
+                    baseline.global, baseline.street[1], baseline.street[2],
+                    baseline.street[3], baseline.score);
         std::fflush(stdout);
     }
     for (int ep = 1; ep <= cfg_.epochs; ++ep) {
@@ -2116,15 +2392,17 @@ void EndgameTrainer::run() {
         // Fresh online rows must be judged before insertion. A persistent
         // offline split is never trained on, so judge it after this epoch's
         // update below; the old pre-update number was one checkpoint behind.
-        const double fresh_heldout =
-            heldout_.empty() ? heldout_mse(fresh) : 0.0;
+        const HeldoutMetrics fresh_heldout =
+            heldout_.empty() ? heldout_metrics(fresh) : HeldoutMetrics{};
         for (Sample& smp : fresh) replay_insert(std::move(smp));
         auto t_tr0 = clock::now();
         const double vloss = train_net();
         auto t_tr1 = clock::now();
-        const double heldout =
-            !heldout_.empty() ? heldout_mse(heldout_) : fresh_heldout;
-        if (!heldout_.empty() && !std::isfinite(heldout)) {
+        const HeldoutMetrics heldout =
+            !heldout_.empty() ? heldout_metrics(heldout_) : fresh_heldout;
+        if (!heldout_.empty() &&
+            (!std::isfinite(heldout.global) ||
+             !std::isfinite(heldout.score))) {
             std::fprintf(stderr,
                          "  [train] non-finite heldout after epoch %d; "
                          "refusing to publish checkpoint\n",
@@ -2142,9 +2420,12 @@ void EndgameTrainer::run() {
             net_expl = sum / cfg_.probe_k;
             t_probe = secs(t_pr0, clock::now());
         }
-        std::printf("  epoch %3d  replay=%5zu  vloss=%.3e  heldout=%.3e"
+        std::printf("  epoch %3d  replay=%5zu  vloss=%.3e  heldout=%.3e "
+                    "(s1 %.3e s2 %.3e s3 %.3e select=%.3e)"
                     "  [sp %.0fs train %.0fs",
-                    ep, replay_.size(), vloss, heldout,
+                    ep, replay_size(), vloss, heldout.global,
+                    heldout.street[1], heldout.street[2], heldout.street[3],
+                    heldout.score,
                     secs(t_sp0, t_sp1), secs(t_tr0, t_tr1));
         if (net_expl >= 0.0)
             std::printf(" probe %.0fs]  probe-turn-expl(net)=%.4f bb",
@@ -2159,12 +2440,13 @@ void EndgameTrainer::run() {
         // Online training has no persistent split, so it saves every epoch.
         if (cfg_.sgd_steps > 0 && !cfg_.ckpt.empty()) {
             const bool persistent_validation = !heldout_.empty();
-            if (!persistent_validation || heldout < best_heldout) {
-                if (persistent_validation) best_heldout = heldout;
+            if (!persistent_validation || heldout.score < best_score) {
+                if (persistent_validation) best_score = heldout.score;
                 save_net_atomic(net_, cfg_.ckpt);
                 if (persistent_validation) {
-                    std::printf("  [ckpt] best heldout %.3e -> %s\n",
-                                best_heldout, cfg_.ckpt.c_str());
+                    std::printf("  [ckpt] best macro-nmse %.3e "
+                                "(global %.3e) -> %s\n",
+                                best_score, heldout.global, cfg_.ckpt.c_str());
                     std::fflush(stdout);
                 }
             }
