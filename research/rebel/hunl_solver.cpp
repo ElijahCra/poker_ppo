@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 
 namespace rebel_hunl {
 
@@ -31,7 +32,100 @@ void mask_card(std::vector<double>& r, uint8_t c) {
     for (int i = 0; i < kCombos; ++i)
         if (ct.cards[i][0] == c || ct.cards[i][1] == c) r[i] = 0.0;
 }
+
+// Draw (h0,h1) from the joint range distribution with exact card removal:
+// P(h0=x) is proportional to r0[x] times compatible r1 mass, then h1 is
+// conditional on h0. Their product is proportional to r0[x]r1[y].
+bool sample_compatible_hands(const HunlPBS& root,
+                             const std::vector<uint8_t>& valid,
+                             std::mt19937& rng, int* h0, int* h1) {
+    const auto& ct = ComboTable::get();
+    std::vector<double> opp_mass;
+    compat_mass(root.r1, valid, opp_mass);
+    double hero_total = 0.0;
+    for (int x = 0; x < kCombos; ++x) {
+        if (!valid[static_cast<size_t>(x)]) continue;
+        const double w = root.r0[static_cast<size_t>(x)] *
+                         opp_mass[static_cast<size_t>(x)];
+        if (w > 0.0) hero_total += w;
+    }
+    if (hero_total <= kTiny) return false;
+
+    std::uniform_real_distribution<double> u01(0.0, 1.0);
+    double r = u01(rng) * hero_total, acc = 0.0;
+    *h0 = -1;
+    int last = -1;
+    for (int x = 0; x < kCombos; ++x) {
+        if (!valid[static_cast<size_t>(x)]) continue;
+        const double w = root.r0[static_cast<size_t>(x)] *
+                         opp_mass[static_cast<size_t>(x)];
+        if (w <= 0.0) continue;
+        last = x;
+        acc += w;
+        if (r < acc) {
+            *h0 = x;
+            break;
+        }
+    }
+    if (*h0 < 0) *h0 = last;   // rounding at the upper endpoint
+    if (*h0 < 0) return false;
+
+    const int a0 = ct.cards[static_cast<size_t>(*h0)][0];
+    const int b0 = ct.cards[static_cast<size_t>(*h0)][1];
+    r = u01(rng) * opp_mass[static_cast<size_t>(*h0)];
+    acc = 0.0;
+    *h1 = -1;
+    last = -1;
+    for (int y = 0; y < kCombos; ++y) {
+        if (!valid[static_cast<size_t>(y)] ||
+            root.r1[static_cast<size_t>(y)] <= 0.0)
+            continue;
+        const int a = ct.cards[static_cast<size_t>(y)][0];
+        const int b = ct.cards[static_cast<size_t>(y)][1];
+        if (a == a0 || a == b0 || b == a0 || b == b0) continue;
+        last = y;
+        acc += root.r1[static_cast<size_t>(y)];
+        if (r < acc) {
+            *h1 = y;
+            break;
+        }
+    }
+    if (*h1 < 0) *h1 = last;
+    return *h1 >= 0;
+}
 }  // namespace
+
+double compatible_hand_sampler_error(int draws) {
+    if (draws <= 0) return std::numeric_limits<double>::infinity();
+    const auto& ct = ComboTable::get();
+    const int hero_a = ct.id[0][1];
+    const int hero_b = ct.id[2][3];
+    const int villain_blocking_b = ct.id[2][4];
+    const int villain_neutral = ct.id[5][6];
+    HunlPBS root;
+    root.r0.assign(kCombos, 0.0);
+    root.r1.assign(kCombos, 0.0);
+    root.r0[static_cast<size_t>(hero_a)] = 1.0;
+    root.r0[static_cast<size_t>(hero_b)] = 1.0;
+    root.r1[static_cast<size_t>(villain_blocking_b)] = 9.0;
+    root.r1[static_cast<size_t>(villain_neutral)] = 1.0;
+    std::vector<uint8_t> valid(kCombos, 1);
+    std::mt19937 rng(20260722);
+    int count_a = 0;
+    for (int i = 0; i < draws; ++i) {
+        int h0 = -1, h1 = -1;
+        if (!sample_compatible_hands(root, valid, rng, &h0, &h1))
+            return std::numeric_limits<double>::infinity();
+        const auto& a = ct.cards[static_cast<size_t>(h0)];
+        const auto& b = ct.cards[static_cast<size_t>(h1)];
+        if (a[0] == b[0] || a[0] == b[1] ||
+            a[1] == b[0] || a[1] == b[1])
+            return std::numeric_limits<double>::infinity();
+        if (h0 == hero_a) ++count_a;
+    }
+    const double observed = static_cast<double>(count_a) / draws;
+    return std::fabs(observed - 10.0 / 11.0);
+}
 
 HunlSolver::HunlSolver(poker_ppo::PokerEnvironment& env, HunlPBS root,
                        HunlValueOracle* oracle,
@@ -438,11 +532,9 @@ std::vector<double> HunlSolver::walk(int i, int upd, int t, bool update,
             cfv_a[k] =
                 walk(nd.child[k], upd, t, update, child_reach, opp_reach);
         }
-        // PCFR+ pairs the predictive policy with QUADRATIC strategy
-        // averaging (t^2); CFR+ uses linear (t)
-        const double w_avg = (pcfr && pcfr_quad)
-                                 ? static_cast<double>(t) * t
-                                 : static_cast<double>(t);
+        // The paper/benchmark-selected PCFR+ variant uses QUADRATIC
+        // strategy averaging (t^2); CFR+ uses linear (t).
+        const double w_avg = solver_iteration_weight(t, pcfr, pcfr_quad);
         if (update && pcfr && nd.pred.empty())
             nd.pred.assign(nd.regret.size(), 0.0);
         for (int x = 0; x < kCombos; ++x) {
@@ -516,8 +608,11 @@ void HunlSolver::iterate(int t) {
             auto cfv = walk(0, upd, t, /*update=*/true, mine, opp);
             if (track_root_) {
                 if (rv_sum_[upd].empty()) rv_sum_[upd].assign(kCombos, 0.0);
-                for (int x = 0; x < kCombos; ++x) rv_sum_[upd][x] += cfv[x];
-                if (upd == 1) ++rv_n_;
+                const double w =
+                    solver_iteration_weight(t, pcfr, pcfr_quad);
+                for (int x = 0; x < kCombos; ++x)
+                    rv_sum_[upd][x] += w * cfv[x];
+                if (upd == 1) rv_weight_ += w;
             }
         }
         return;
@@ -553,7 +648,7 @@ void HunlSolver::iterate(int t) {
 bool HunlSolver::avg_root_values(std::array<std::vector<double>, 2>& v,
                                  std::array<std::vector<double>, 2>& mask)
     const {
-    if (!track_root_ || rv_n_ <= 0) return false;
+    if (!track_root_ || rv_weight_ <= 0.0) return false;
     for (int p = 0; p < 2; ++p) {
         if (rv_sum_[p].empty()) return false;
         const auto& opp = p == 0 ? root_.r1 : root_.r0;
@@ -564,7 +659,7 @@ bool HunlSolver::avg_root_values(std::array<std::vector<double>, 2>& v,
         mask[p].assign(kCombos, 0.0);
         for (int x = 0; x < kCombos; ++x) {
             if (!valid_[x] || own[x] <= kTiny || m[x] <= 1e-6) continue;
-            v[p][x] = rv_sum_[p][x] / static_cast<double>(rv_n_) / m[x];
+            v[p][x] = rv_sum_[p][x] / rv_weight_ / m[x];
             mask[p][x] = 1.0;
         }
     }
@@ -788,47 +883,8 @@ bool HunlSolver::sample_leaf(std::mt19937& rng, double eps, int explorer,
                              int* leaf_node, uint8_t* card, HunlPBS* beta) {
     std::uniform_real_distribution<double> u01(0.0, 1.0);
     const auto& ct = ComboTable::get();
-    // sample compatible (hero, villain) combos from the root ranges
-    double ws = 0.0;
-    for (int x = 0; x < kCombos; ++x) {
-        if (root_.r0[x] <= 0.0) continue;
-        // marginal weight: r0[x] * compatible r1 mass — cheap enough exactly
-        ws += root_.r0[x];
-    }
     int h0 = -1, h1 = -1;
-    for (int tries = 0; tries < 1000 && h1 < 0; ++tries) {
-        double r = u01(rng) * ws, acc = 0.0;
-        for (int x = 0; x < kCombos; ++x) {
-            acc += root_.r0[x];
-            if (r <= acc) {
-                h0 = x;
-                break;
-            }
-        }
-        if (h0 < 0) h0 = 0;
-        // rejection-sample villain compatible with hero
-        const int a0 = ct.cards[h0][0], b0 = ct.cards[h0][1];
-        double vs = 0.0;
-        for (int y = 0; y < kCombos; ++y) {
-            if (root_.r1[y] <= 0.0) continue;
-            const int a = ct.cards[y][0], b = ct.cards[y][1];
-            if (a == a0 || a == b0 || b == a0 || b == b0) continue;
-            vs += root_.r1[y];
-        }
-        if (vs <= 0.0) continue;
-        double rv = u01(rng) * vs, av = 0.0;
-        for (int y = 0; y < kCombos; ++y) {
-            if (root_.r1[y] <= 0.0) continue;
-            const int a = ct.cards[y][0], b = ct.cards[y][1];
-            if (a == a0 || a == b0 || b == a0 || b == b0) continue;
-            av += root_.r1[y];
-            if (rv <= av) {
-                h1 = y;
-                break;
-            }
-        }
-    }
-    if (h1 < 0) return false;
+    if (!sample_compatible_hands(root_, valid_, rng, &h0, &h1)) return false;
     const int hand[2] = {h0, h1};
 
     int i = 0;
@@ -877,7 +933,11 @@ bool HunlSolver::sample_leaf(std::mt19937& rng, double eps, int explorer,
         if (me == explorer && u01(rng) < eps) {
             k = static_cast<int>(rng() % A);
         } else {
-            auto pol = policy_row(nd, hand[me], /*average=*/true);
+            // Called before iterate(t*): sample the trajectory under the
+            // regret-matched policy entering that update.  The leaf PBS is
+            // built from the cumulative average available at this same
+            // pre-update boundary.
+            auto pol = policy_row(nd, hand[me], /*average=*/false);
             double r = u01(rng), acc = 0.0;
             for (int j = 0; j < A; ++j) {
                 acc += pol[j];

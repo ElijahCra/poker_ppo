@@ -4,7 +4,7 @@
 //   input  [street(4) | board multi-hot(52) | pot/stack | r0(1326) | r1(1326)]
 //   output [v0(1326) | v1(1326)]   values normalized by the initial stack
 // Trained on river-root targets generated the validated Leduc way: turn
-// subgames are solved with NET leaves; at a uniformly sampled iteration t*
+// subgames are solved with NET leaves; at a strategy-weighted iteration t*
 // the continuation leaf (river-root PBS) is sampled under the average
 // profile with ε-exploration (Algorithm 1); that river subgame is solved
 // EXACTLY (no further leaves) and its root values become the training
@@ -19,6 +19,7 @@
 #include <torch/torch.h>
 
 #include <array>
+#include <cstdint>
 #include <memory>
 #include <random>
 #include <unordered_map>
@@ -31,6 +32,9 @@ namespace rebel_hunl {
 class HunlFeaturizer {
 public:
     // [street(4) | board(52) | pot/stack | r0 | r1 | pct | eq0 | eq1]
+    // r0/r1 are normalized independently over board-compatible combos at
+    // this boundary, so likelihood-scaled solver reaches and saved root rows
+    // encode the same conditional public belief state.
     // pct/eq blocks are the hand-strength features (2026-07-07): raw card
     // one-hots force the net to learn hand evaluation implicitly — the
     // measured error floor after capacity (screen) and distribution
@@ -200,7 +204,10 @@ struct EndgameConfig {
     // Huber = MSE/2 in the quadratic regime).
     double huber_delta  = 1.0;
     double eps_explore  = 0.25;
-    int    replay_cap   = 300000;   // ~32KB/sample → ~10GB resident
+    // A packed row is 40,008 bytes (float features + targets, u8 mask).
+    // The three vectors add modest allocator overhead; 5M rows are about
+    // 186.3 GiB of payload, leaving useful headroom on a 256GB host.
+    int    replay_cap   = 300000;
     // turn probes are single-situation BR bounds — noisy. probe_k averages
     // over K fixed situations (K exact references solved once at startup);
     // 0 skips probes entirely (offline screens that only need heldout).
@@ -263,10 +270,12 @@ struct EndgameConfig {
     // Sample persistence. Every solver target costs ~0.2 core-seconds of
     // exact CFR; without a dataset file the whole stream dies with the
     // process and every architecture experiment re-pays the solves.
-    //   data_out: append every fresh sample (net-independent exact targets)
-    //   data_in:  load at startup — a fixed 2% slice (row % 50, cap 8192)
-    //             becomes a persistent heldout set (comparable across
-    //             configs), the rest reservoir-fills the replay.
+    //   data_out: append every fresh sample (turn/flop targets retain the
+    //             generating oracle's leaf-value provenance)
+    //   data_in:  load at startup — up to 8192 evenly spaced rows across
+    //             the complete file become a persistent heldout set
+    //             (comparable across configs); the rest uniformly reservoir-
+    //             fills replay, independent of the online replay policy.
     // data_in + episodes=0 = offline training: no sampling, epochs are
     // pure SGD on the loaded replay, judged on the fixed heldout split.
     std::string data_in, data_out;
@@ -280,7 +289,8 @@ public:
 
 private:
     struct Sample {
-        std::vector<float> feat, target, mask;   // target/mask [2*kCombos]
+        std::vector<float> feat, target;
+        std::vector<uint8_t> mask;   // target/mask [2*kCombos]
     };
 
     // env positioned at a random street root (random board, random pot via
@@ -308,7 +318,7 @@ private:
     // solve at uniform ranges, flop continuations at its own leaf PBSs
     void root_episode(poker_ppo::PokerEnvironment& env, std::mt19937& rng,
                       std::vector<Sample>& fresh);
-    // emit the solver's iterate-averaged ROOT values as a training row
+    // emit the solver's iteration-weighted ROOT values as a training row
     // (shared by the turn/flop episode paths). beta = raw root ranges.
     void emit_root_sample(poker_ppo::PokerEnvironment& env, HunlSolver& s,
                           const HunlPBS& beta, const uint8_t* board, int nb,
@@ -322,15 +332,16 @@ private:
         int W, int ep, std::vector<Sample>& fresh, int episodes);
     // GPU turn lane (train_turn): CPU workers build TurnSpecs, the
     // device solves signature-grouped lockstep batches, street-2 rows
-    // are emitted from iterate-averaged root values.
+    // are emitted from iteration-weighted root values.
     void gpu_turn_epoch(
         std::vector<std::unique_ptr<poker_ppo::PokerEnvironment>>& envs,
         int W, int ep, std::vector<Sample>& fresh, int episodes);
     // REBEL_GPU_CACHE=N: N replay rows live on the device; SGD batches
     // assemble via index_select instead of per-step CPU gather + H2D.
-    // ~40 bytes/row/1000 on device (f32 feat+target, u8 mask): N=50000
-    // ≈ 2.0GB. Subset re-drawn per epoch; identical sampling when the
-    // replay fits entirely.
+    // ~40 bytes/row/1000 on device (f32 feat+target, u8 mask): N=500000
+    // is about 18.6 GiB. Partial caches admit rows through a shuffled replay
+    // permutation without replacement before reshuffling, so every row
+    // enters a resident slab; batches sample within that slab with replacement.
     double train_net_cached(int want);
     // Random training range for the situation's board (nb=5 river, nb=4
     // turn). 70% DeepStack R(S,p): recursive mass splits over the valid
@@ -385,6 +396,9 @@ private:
     bool                circular_ = false;   // resolved from cfg_.circular
     // device-resident sample cache (REBEL_GPU_CACHE)
     torch::Tensor tc_feat_, tc_targ_, tc_mask_;
+    std::vector<size_t> tc_order_;
+    size_t tc_cursor_ = 0;
+    size_t tc_replay_size_ = 0;
 };
 
 }  // namespace rebel_hunl

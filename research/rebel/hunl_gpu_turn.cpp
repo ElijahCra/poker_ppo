@@ -17,6 +17,25 @@ namespace rebel_hunl {
 
 namespace {
 constexpr double kTiny = 1e-12;
+
+int gpu_prep_workers(int jobs) {
+    if (jobs <= 0) return 0;
+
+    auto requested = [](const char* name) {
+        const char* value = std::getenv(name);
+        if (!value || !*value) return 0L;
+        char* end = nullptr;
+        const long parsed = std::strtol(value, &end, 10);
+        return end != value && parsed > 0 ? parsed : 0L;
+    };
+
+    long workers = requested("REBEL_GPU_PREP_THREADS");
+    if (workers <= 0) workers = requested("REBEL_THREADS");
+    if (workers <= 0)
+        workers = static_cast<long>(std::thread::hardware_concurrency());
+    if (workers <= 0) workers = 1;
+    return static_cast<int>(std::min<long>(jobs, workers));
+}
 }
 
 BatchTurnSolver::~BatchTurnSolver() = default;
@@ -53,6 +72,9 @@ BatchTurnSolver::BatchTurnSolver(TreeShape shape, std::vector<TurnSpec> specs,
     }
 
     const int M = static_cast<int>(shape_.nodes.size());
+    // Bound constructor CPU work per GPU process so multi-GPU launches do not
+    // each consume every host core.
+    const int prep_workers = gpu_prep_workers(B_);
     bool any_allin = false;
     for (const auto& nd : shape_.nodes)
         if (nd.kind == HunlSolver::Node::AllinShowdown) any_allin = true;
@@ -217,9 +239,7 @@ BatchTurnSolver::BatchTurnSolver(TreeShape shape, std::vector<TurnSpec> specs,
     // per-spec precompute is embarrassingly parallel (48 sorts + ranks
     // per spec — the ctor cost that used to serialize)
     {
-        const int W = std::max(
-            1, std::min(B_, static_cast<int>(
-                                std::thread::hardware_concurrency())));
+        const int W = prep_workers;
         if (W <= 1) {
             for (int b = 0; b < B_; ++b) spec_work(b);
         } else {
@@ -335,9 +355,8 @@ BatchTurnSolver::BatchTurnSolver(TreeShape shape, std::vector<TurnSpec> specs,
                     op[i] *= scale;
             }
         };
-        int W = static_cast<int>(std::thread::hardware_concurrency());
-        W = std::max(1, std::min(W, B_));
-        if (W == 1) {
+        const int W = prep_workers;
+        if (W <= 1) {
             build();
         } else {
             std::vector<std::thread> pool;
@@ -345,7 +364,9 @@ BatchTurnSolver::BatchTurnSolver(TreeShape shape, std::vector<TurnSpec> specs,
             for (int w = 0; w < W; ++w) pool.emplace_back(build);
             for (auto& th : pool) th.join();
         }
-        allin_op_ = opT.to(dev_).to(dt_);
+        // Cast on the host so f32 solves upload four bytes per entry instead
+        // of transferring the double accumulator and casting on the GPU.
+        allin_op_ = opT.to(dt_).to(dev_);
     }
 
     regret_.resize(shape_.nodes.size());
@@ -579,10 +600,21 @@ void BatchTurnSolver::refresh_leaves_device(HunlValueNet& net,
             (nd.player == 0 ? r0 : r1).mul_(sig);
             node = nd.child[static_cast<size_t>(k)];
         }
-        // per-runout masked RAW reaches — the CPU oracle path passes
-        // exactly these (unnormalized) as the range features
-        auto r0c = r0.unsqueeze(1) * mask_xc_;               // [B, 52, n]
-        auto r1c = r1.unsqueeze(1) * mask_xc_;
+        // Per-runout reaches are likelihood-weighted. Convert them to the
+        // conditional range convention used by HunlFeaturizer before the
+        // net sees them. Uniform fallback mirrors the CPU feature boundary
+        // for unreachable leaves (their values are immaterial to the walk).
+        auto r0c = r0.unsqueeze(1) * dead;                   // [B, 52, n]
+        auto r1c = r1.unsqueeze(1) * dead;
+        auto nlive = dead.sum(2, /*keepdim=*/true).clamp_min(1.0);
+        auto uniform = dead / nlive;
+        auto conditional = [&](const torch::Tensor& range) {
+            auto mass = range.sum(2, /*keepdim=*/true);
+            return torch::where(mass > 1e-12,
+                                range / mass.clamp_min(1e-12), uniform);
+        };
+        r0c = conditional(r0c);
+        r1c = conditional(r1c);
         auto eq0 = runout_equity(r1c) * dead;
         auto eq1 = runout_equity(r0c) * dead;
         auto rows = feat_X_.narrow(0, j * BR, BR);
@@ -662,7 +694,7 @@ void BatchTurnSolver::iterate_body() {
         auto mine = upd == 0 ? r0_ : r1_;
         auto opp = upd == 0 ? r1_ : r0_;
         auto cfv = walk(0, upd, /*update=*/true, mine, opp);
-        root_acc_[static_cast<size_t>(upd)].add_(cfv);
+        root_acc_[static_cast<size_t>(upd)].add_(cfv * w_dev_);
     }
 }
 
@@ -670,7 +702,7 @@ void BatchTurnSolver::iterate(int t) {
     torch::NoGradGuard ng;
     w_dev_.fill_(weight(t));
     iterate_body();
-    ++rv_n_;
+    rv_weight_ += weight(t);
 }
 
 bool BatchTurnSolver::fused_setup() {
@@ -769,7 +801,10 @@ bool BatchTurnSolver::fused_window(int t_start, int t_end) {
     a.t_end = t_end;
     a.M = static_cast<int>(shape_.nodes.size());
     a.B = B_;
-    a.pcfr = pcfr_ ? 1 : 0;   // quadratic averaging implied (the pairing)
+    // Prediction and averaging are separate flags: pcfr_quad=false remains
+    // a valid linear-average A/B variant in the fused path.
+    a.pcfr = pcfr_ ? 1 : 0;
+    a.quad_avg = pcfr_ && pcfr_quad_ ? 1 : 0;
     a.kind = f_kind_.data_ptr<int>();
     a.actor = f_actor_.data_ptr<int>();
     a.arity = f_arity_.data_ptr<int>();
@@ -812,16 +847,14 @@ void BatchTurnSolver::solve(int T, int refresh_every,
                 : std::min(T, (ts / refresh_every + 1) * refresh_every - 1);
             torch::cuda::synchronize();   // leaf copies before raw launch
             ok = fused_window(ts, te);
-            if (ok) {
-                rv_n_ += te - ts + 1;
-                ts = te + 1;
-            }
-        }
-        if (ts > T) return;
-        fused_state_ = -1;   // launch failed mid-solve: finish eager
-        for (int t = ts; t <= T; ++t) {
-            if (sched(t) && t != ts) refresh(t);
-            iterate(t);
+            // A failed launch/synchronize may have partially mutated the
+            // solver. Replaying that window eagerly would double-update an
+            // unknown prefix and silently corrupt targets, so fail closed.
+            TORCH_CHECK(ok, "fused turn window failed; solver state may be "
+                            "partial, refusing eager replay");
+            ++fused_windows_;
+            for (int t = ts; t <= te; ++t) rv_weight_ += weight(t);
+            ts = te + 1;
         }
         return;
     }
@@ -857,18 +890,17 @@ void BatchTurnSolver::solve(int T, int refresh_every,
             if (sched(t)) refresh(t);
             w_dev_.fill_(weight(t));
             graph_->replay();
-            ++rv_n_;
+            rv_weight_ += weight(t);
         }
         torch::cuda::synchronize();
     } catch (const std::exception& e) {
-        std::fprintf(stderr,
-                     "[gpu-turn] CUDA graph capture failed (%s) — eager "
-                     "fallback\n", e.what());
         graph_.reset();
-        for (int t = 4; t <= T; ++t) {
-            if (sched(t)) refresh(t);
-            iterate(t);
-        }
+        // A replay failure can surface asynchronously after an unknown
+        // iteration prefix has already changed regrets/root accumulators.
+        // Replaying from t=4 would double-update that prefix, so the only
+        // correctness-preserving response is to discard this solver.
+        TORCH_CHECK(false, "CUDA graph turn solve failed; state may be "
+                      "partial, refusing eager replay: ", e.what());
     }
 }
 
@@ -1171,14 +1203,52 @@ void BatchTurnSolver::set_leaf_values(int leaf_idx,
                     vals.size(1) == kCards && vals.size(2) == 2 &&
                     vals.size(3) == kCombos,
                 "set_leaf_values: want [B, 52, 2, n]");
-    leaf_v_[static_cast<size_t>(leaf_idx)].copy_(
-        vals.to(dev_).to(dt_));
+    auto& dst = leaf_v_[static_cast<size_t>(leaf_idx)];
+    dst.copy_(vals.to(dev_).to(dt_));
+    // Enforce leaf invariants at the API boundary. In particular, a reused
+    // host workspace leaves board-card slots untouched; without this mask a
+    // later solve on a different board can consume stale values in fused
+    // StreetEnd math.
+    dst.mul_(runout_ok_.unsqueeze(3));
+    dst.mul_(mask_xc_.view({1, static_cast<long>(kCards), 1, kCombos}));
+    dst.mul_(valid_.view({B_, 1, 1, kCombos}));
+}
+
+void BatchTurnSolver::export_cum_strategy(HunlSolver& dst,
+                                          int batch_index) const {
+    TORCH_CHECK(batch_index >= 0 && batch_index < B_,
+                "export_cum_strategy: batch index out of range");
+    TORCH_CHECK(dst.nodes().size() == shape_.nodes.size(),
+                "export_cum_strategy: node-count mismatch");
+    for (size_t m = 0; m < shape_.nodes.size(); ++m) {
+        const auto& src_node = shape_.nodes[m];
+        const auto& dst_node = dst.nodes()[m];
+        TORCH_CHECK(static_cast<int>(dst_node.kind) == src_node.kind &&
+                        dst_node.player == src_node.player &&
+                        dst_node.acts == src_node.acts &&
+                        dst_node.child == src_node.child,
+                    "export_cum_strategy: topology mismatch at node ", m);
+        if (dst_node.kind != HunlSolver::Node::Decision) continue;
+        const int A = static_cast<int>(src_node.acts.size());
+        auto cum = cum_[m]
+                       .select(0, batch_index)
+                       .to(torch::kCPU)
+                       .to(torch::kDouble)
+                       .contiguous();   // [A, n]
+        const double* cp = cum.data_ptr<double>();
+        std::vector<double> row(static_cast<size_t>(A) * kCombos);
+        for (int x = 0; x < kCombos; ++x)
+            for (int k = 0; k < A; ++k)
+                row[static_cast<size_t>(x) * A + k] =
+                    cp[static_cast<size_t>(k) * kCombos + x];
+        dst.set_cum_strat(static_cast<int>(m), row);
+    }
 }
 
 bool BatchTurnSolver::avg_root_values(
     std::vector<std::array<std::vector<double>, 2>>& v,
     std::vector<std::array<std::vector<double>, 2>>& mask) {
-    if (rv_n_ <= 0) return false;
+    if (rv_weight_ <= 0.0) return false;
     v.assign(static_cast<size_t>(B_), {});
     mask.assign(static_cast<size_t>(B_), {});
     auto val = valid_.to(torch::kCPU).to(torch::kDouble);
@@ -1219,7 +1289,7 @@ bool BatchTurnSolver::avg_root_values(
                 if (ao[b][x] <= kTiny || m <= 1e-6) continue;
                 v[static_cast<size_t>(b)][static_cast<size_t>(p)]
                  [static_cast<size_t>(x)] =
-                     aa[b][x] / static_cast<double>(rv_n_) / m;
+                     aa[b][x] / rv_weight_ / m;
                 mask[static_cast<size_t>(b)][static_cast<size_t>(p)]
                     [static_cast<size_t>(x)] = 1.0;
             }

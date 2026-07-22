@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <thread>
 #include <cmath>
@@ -17,6 +18,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <limits>
 #include <mutex>
 #include <unordered_map>
 
@@ -34,10 +36,24 @@ int street_of(int nb) {
     }
 }
 
+int sample_solver_iteration(std::mt19937& rng, int T, bool pcfr,
+                            bool pcfr_quad = true) {
+    if (T <= 0) return 0;
+    std::vector<double> weights(static_cast<size_t>(T));
+    for (int t = 1; t <= T; ++t)
+        weights[static_cast<size_t>(t - 1)] =
+            solver_iteration_weight(t, pcfr, pcfr_quad);
+    std::discrete_distribution<int> pick(weights.begin(), weights.end());
+    return pick(rng) + 1;
+}
+
 // dataset file header — kdim/nout guard against silently loading rows
 // featurized by an older HunlFeaturizer
 constexpr uint32_t kDataMagic   = 0x444C4252u;   // "RBLD"
-constexpr uint32_t kDataVersion = 1;
+// v3 adds strategy-weighted root targets and matching continuation-iteration
+// sampling on top of v2's normalized ranges. Those target semantics cannot
+// be converted after the fact, so the guard requires fresh generation.
+constexpr uint32_t kDataVersion = 3;
 
 bool check_data_header(const std::string& path, int n_out) {
     std::ifstream f(path, std::ios::binary);
@@ -46,6 +62,19 @@ bool check_data_header(const std::string& path, int n_out) {
     return hdr[0] == kDataMagic && hdr[1] == kDataVersion &&
            hdr[2] == static_cast<uint32_t>(HunlFeaturizer::kDim) &&
            hdr[3] == static_cast<uint32_t>(n_out);
+}
+
+void save_net_atomic(HunlValueNet& net, const std::string& path) {
+    const std::string tmp = path + ".tmp." + std::to_string(::getpid());
+    torch::save(net, tmp);
+    if (::rename(tmp.c_str(), path.c_str()) != 0) {
+        const int err = errno;
+        ::unlink(tmp.c_str());
+        std::fprintf(stderr,
+                     "  [ckpt] cannot atomically replace %s (errno=%d)\n",
+                     path.c_str(), err);
+        std::exit(1);
+    }
 }
 }  // namespace
 
@@ -203,9 +232,38 @@ std::vector<float> HunlFeaturizer::features(int street, const uint8_t* board,
     for (int i = 0; i < nb; ++i) f[4 + board[i]] = 1.0f;
     f[4 + kCards] = static_cast<float>(pot / stack);
     const int off = 4 + kCards + 1;
+
+    // A PBS contains beliefs CONDITIONAL on reaching this public state.
+    // Solver leaf reaches are likelihood-weighted and therefore have an
+    // arbitrary per-player scale; exact values and the equity blocks are
+    // invariant to that scale, but a dense net's raw range inputs are not.
+    // Normalize here, at the one feature boundary shared by training rows
+    // and every CPU inference path. Also clear board-incompatible combos so
+    // callers cannot accidentally make their scale part of the input.
+    std::vector<uint8_t> valid;
+    board_valid(board, nb, valid);
+    double s0 = 0.0, s1 = 0.0;
+    int nvalid = 0;
     for (int i = 0; i < kCombos; ++i) {
-        f[off + i] = static_cast<float>(beta.r0[i]);
-        f[off + kCombos + i] = static_cast<float>(beta.r1[i]);
+        if (!valid[static_cast<size_t>(i)]) continue;
+        ++nvalid;
+        s0 += beta.r0[static_cast<size_t>(i)];
+        s1 += beta.r1[static_cast<size_t>(i)];
+    }
+    constexpr double kRangeTiny = 1e-12;
+    const double fallback = nvalid > 0 ? 1.0 / nvalid : 0.0;
+    for (int i = 0; i < kCombos; ++i) {
+        const bool live = valid[static_cast<size_t>(i)] != 0;
+        f[off + i] = live
+            ? static_cast<float>(s0 > kRangeTiny
+                                     ? beta.r0[static_cast<size_t>(i)] / s0
+                                     : fallback)
+            : 0.0f;
+        f[off + kCombos + i] = live
+            ? static_cast<float>(s1 > kRangeTiny
+                                     ? beta.r1[static_cast<size_t>(i)] / s1
+                                     : fallback)
+            : 0.0f;
         f[off + 2 * kCombos + i] = static_cast<float>(pct[i]);
         f[off + 3 * kCombos + i] = static_cast<float>(eq0[i]);
         f[off + 4 * kCombos + i] = static_cast<float>(eq1[i]);
@@ -447,12 +505,19 @@ int convert_dataset(const std::string& in, const std::string& out) {
     }
     uint32_t hdr[4];
     if (!fi.read(reinterpret_cast<char*>(hdr), sizeof hdr) ||
-        hdr[0] != kDataMagic || hdr[1] != kDataVersion ||
+        hdr[0] != kDataMagic ||
         hdr[2] != static_cast<uint32_t>(kOldDim) ||
         hdr[3] != static_cast<uint32_t>(n_out)) {
         std::fprintf(stderr,
                      "convert: %s is not a kdim=%d dataset (already "
                      "converted?)\n", in.c_str(), kOldDim);
+        return 1;
+    }
+    if (hdr[1] != kDataVersion) {
+        std::fprintf(stderr,
+                     "convert: %s is dataset v%u; v3 root-target/sampling "
+                     "semantics cannot be reconstructed — regenerate it\n",
+                     in.c_str(), hdr[1]);
         return 1;
     }
     std::ofstream fo(out, std::ios::binary | std::ios::trunc);
@@ -664,7 +729,9 @@ EndgameTrainer::EndgameTrainer(EndgameConfig cfg)
         std::printf("  [ckpt] loaded %s\n", cfg_.ckpt.c_str());
     }
     net_->to(device_);
-    opt_ = std::make_unique<torch::optim::Adam>(net_->parameters(), cfg_.lr);
+    if (cfg_.sgd_steps > 0)
+        opt_ =
+            std::make_unique<torch::optim::Adam>(net_->parameters(), cfg_.lr);
 }
 
 bool EndgameTrainer::sample_street_root(poker_ppo::PokerEnvironment& env,
@@ -727,14 +794,14 @@ bool EndgameTrainer::river_sample_at(poker_ppo::PokerEnvironment& env,
     const double pot_leaf = 2.0 * contrib;
     smp.feat = HunlFeaturizer::features(3, b5, 5, pot_leaf, stack_, nb);
     smp.target.assign(2 * kCombos, 0.0f);
-    smp.mask.assign(2 * kCombos, 0.0f);
+    smp.mask.assign(2 * kCombos, 0);
     for (int p = 0; p < 2; ++p) {
         const auto& own = p == 0 ? nb.r0 : nb.r1;
         for (int i = 0; i < kCombos; ++i) {
             if (!v5[i] || own[i] <= 0.0 || omass[p][i] <= 0.0) continue;
             smp.target[p * kCombos + i] =
                 static_cast<float>(v[p][i] / pot_leaf);   // pot units
-            smp.mask[p * kCombos + i] = 1.0f;
+            smp.mask[p * kCombos + i] = 1;
         }
     }
     out.push_back(std::move(smp));
@@ -854,13 +921,13 @@ void EndgameTrainer::gpu_river_epoch(
                 smp.feat = HunlFeaturizer::features(3, sp.board.data(), 5,
                                                     pot, stack_, nb);
                 smp.target.assign(2 * kCombos, 0.0f);
-                smp.mask.assign(2 * kCombos, 0.0f);
+                smp.mask.assign(2 * kCombos, 0);
                 for (int p = 0; p < 2; ++p)
                     for (int i = 0; i < kCombos; ++i) {
                         if (m[b][p][i] < 0.5) continue;
                         smp.target[p * kCombos + i] =
                             static_cast<float>(v[b][p][i] / pot);
-                        smp.mask[p * kCombos + i] = 1.0f;
+                        smp.mask[p * kCombos + i] = 1;
                     }
                 fresh.push_back(std::move(smp));
             }
@@ -944,7 +1011,7 @@ void EndgameTrainer::gpu_turn_epoch(
                      [&](int) { bs.refresh_leaves_device(net_, stack_); });
             std::vector<std::array<std::vector<double>, 2>> v, m;
             if (!bs.avg_root_values(v, m)) continue;
-            // street-2 rows (iterate-averaged TURN-ROOT values — the
+            // street-2 rows (iteration-weighted TURN-ROOT values — the
             // ReBeL target). The nb==4 featurizer (48 river evals/row)
             // is the emission cost: parallelize across the batch.
             const int EW = std::max(1, std::min(W * 4,
@@ -983,7 +1050,7 @@ void EndgameTrainer::gpu_turn_epoch(
                     smp.feat = HunlFeaturizer::features(
                         2, sp.board.data(), 4, pot, stack_, nb);
                     smp.target.assign(2 * kCombos, 0.0f);
-                    smp.mask.assign(2 * kCombos, 0.0f);
+                    smp.mask.assign(2 * kCombos, 0);
                     for (int p = 0; p < 2; ++p)
                         for (int i = 0; i < kCombos; ++i) {
                             if (m[static_cast<size_t>(b)]
@@ -995,7 +1062,7 @@ void EndgameTrainer::gpu_turn_epoch(
                                     v[static_cast<size_t>(b)]
                                      [static_cast<size_t>(p)]
                                      [static_cast<size_t>(i)] / pot);
-                            smp.mask[p * kCombos + i] = 1.0f;
+                            smp.mask[p * kCombos + i] = 1;
                         }
                     out_w[static_cast<size_t>(w)].push_back(
                         std::move(smp));
@@ -1137,14 +1204,14 @@ void EndgameTrainer::emit_root_sample(poker_ppo::PokerEnvironment& env,
     smp.feat = HunlFeaturizer::features(street, board, nb, pot_root, stack_,
                                         nbeta);
     smp.target.assign(2 * kCombos, 0.0f);
-    smp.mask.assign(2 * kCombos, 0.0f);
+    smp.mask.assign(2 * kCombos, 0);
     for (int p = 0; p < 2; ++p) {
         const auto& own = p == 0 ? nbeta.r0 : nbeta.r1;
         for (int i = 0; i < kCombos; ++i) {
             if (rm[p][i] < 0.5 || own[i] <= 0.0) continue;
             smp.target[p * kCombos + i] =
                 static_cast<float>(rv[p][i] / pot_root);
-            smp.mask[p * kCombos + i] = 1.0f;
+            smp.mask[p * kCombos + i] = 1;
         }
     }
     fresh.push_back(std::move(smp));
@@ -1169,27 +1236,28 @@ void EndgameTrainer::self_play_episode(poker_ppo::PokerEnvironment& env,
     s.pcfr = cfg_.pcfr;
     s.track_root_values();
 
-    std::uniform_int_distribution<int> dt(1, cfg_.t_turn);
-    const int tstar = dt(rng);
+    const int tstar = sample_solver_iteration(
+        rng, cfg_.t_turn, s.pcfr, s.pcfr_quad);
     const int explorer = static_cast<int>(rng() & 1);
     int leaf = -1;
     uint8_t card = 0;
     HunlPBS leaf_beta;
     bool have = false;
     for (int t = 1; t <= cfg_.t_turn; ++t) {
-        s.iterate(t);
         if (t == tstar)
             have = s.sample_leaf(rng, cfg_.eps_explore, explorer, &leaf,
                                  &card, &leaf_beta);
+        s.iterate(t);
     }
 
-    // Phase C: ReBeL's own value target for the solved subgame root —
-    // (1/T)·Σ_t v^{π^t}(β_root), bootstrapped through the net's river
-    // leaves. Street-2 rows teach the net TURN-ROOT values, the
+    // Phase C: ReBeL's own value target for the solved subgame root — the
+    // strategy-weighted mean of v^{π^t}(β_root), bootstrapped through the
+    // net's river leaves. Street-2 rows teach TURN-ROOT values, the
     // prerequisite for flop solves with net leaves.
     emit_root_sample(env, s, beta, b4, 4, 2, fresh);
 
-    // Algorithm 1's t*-sampled continuation leaf (ε-explored coverage)
+    // ReBeL's iteration-weighted t*-sampled continuation leaf
+    // (ε-explored coverage).
     if (!cfg_.river_rows) return;   // turn-campaign mode: street-2 only
     if (have) {
         std::array<uint8_t, 5> b5 = s.board();
@@ -1283,27 +1351,27 @@ void EndgameTrainer::flop_continue(poker_ppo::PokerEnvironment& env,
     s.pcfr = cfg_.pcfr;
     s.track_root_values();
 
-    std::uniform_int_distribution<int> dt(1, cfg_.t_flop);
-    const int tstar = dt(rng);
+    const int tstar = sample_solver_iteration(
+        rng, cfg_.t_flop, s.pcfr, s.pcfr_quad);
     const int explorer = static_cast<int>(rng() & 1);
     int leaf = -1;
     uint8_t card = 0;
     HunlPBS leaf_beta;
     bool have = false;
     for (int t = 1; t <= cfg_.t_flop; ++t) {
-        s.iterate(t);
         if (t == tstar)
             have = s.sample_leaf(rng, cfg_.eps_explore, explorer, &leaf,
                                  &card, &leaf_beta);
+        s.iterate(t);
     }
 
-    // street-1 row: iterate-averaged FLOP-ROOT values, bootstrapped
+    // street-1 row: iteration-weighted FLOP-ROOT values, bootstrapped
     // through the net's turn leaves — the training signal a preflop
     // solver needs at ITS leaves.
     emit_root_sample(env, s, beta, b3, 3, 1, fresh);
 
     // a harvested (leaf, card) turn PBS becomes one turn solve whose
-    // iterate-averaged root values are a street-2 row on the FLOP query
+    // iteration-weighted root values are a street-2 row on the FLOP query
     // distribution (self-consistency: turn rows so far came from
     // random-range roots, not from flop-solve leaf beliefs).
     const auto& nodes = s.nodes();
@@ -1373,18 +1441,18 @@ void EndgameTrainer::root_episode(poker_ppo::PokerEnvironment& env,
     // no track_root_values / no street-0 row: no solver ever queries
     // preflop-root values — the episode's yield is its continuations
 
-    std::uniform_int_distribution<int> dt(1, cfg_.t_preflop);
-    const int tstar = dt(rng);
+    const int tstar = sample_solver_iteration(
+        rng, cfg_.t_preflop, s.pcfr, s.pcfr_quad);
     const int explorer = static_cast<int>(rng() & 1);
     int leaf = -1;
     uint8_t f3[3] = {};
     HunlPBS leaf_beta;
     bool have = false;
     for (int t = 1; t <= cfg_.t_preflop; ++t) {
-        s.iterate(t);
         if (t == tstar)
             have = s.sample_leaf(rng, cfg_.eps_explore, explorer, &leaf,
                                  f3, &leaf_beta);
+        s.iterate(t);
     }
 
     const auto& nodes = s.nodes();
@@ -1519,19 +1587,21 @@ void EndgameTrainer::append_dataset(const std::string& path,
                                  static_cast<uint32_t>(n_out)};
         f.write(reinterpret_cast<const char*>(hdr), sizeof hdr);
     }
-    std::vector<uint8_t> m8(static_cast<size_t>(n_out));
     for (const Sample& s : fresh) {
         f.write(reinterpret_cast<const char*>(s.feat.data()),
                 sizeof(float) * HunlFeaturizer::kDim);
         f.write(reinterpret_cast<const char*>(s.target.data()),
                 sizeof(float) * static_cast<size_t>(n_out));
-        for (int j = 0; j < n_out; ++j) m8[j] = s.mask[j] > 0.5f ? 1 : 0;
-        f.write(reinterpret_cast<const char*>(m8.data()), n_out);
+        f.write(reinterpret_cast<const char*>(s.mask.data()), n_out);
     }
 }
 
 void EndgameTrainer::load_dataset(const std::string& path) {
     const int n_out = 2 * kCombos;
+    constexpr uintmax_t kHeaderBytes = 4 * sizeof(uint32_t);
+    const uintmax_t row_bytes =
+        sizeof(float) * static_cast<uintmax_t>(HunlFeaturizer::kDim + n_out) +
+        static_cast<uintmax_t>(n_out);
     std::ifstream f(path, std::ios::binary);
     if (!f) {
         std::printf("  [data] %s not found — starting empty\n", path.c_str());
@@ -1544,52 +1614,88 @@ void EndgameTrainer::load_dataset(const std::string& path) {
                      path.c_str());
         std::exit(1);
     }
-    f.seekg(4 * sizeof(uint32_t));
-    std::vector<uint8_t> m8(static_cast<size_t>(n_out));
-    long rows = 0;
-    while (true) {
+    const uintmax_t file_bytes = std::filesystem::file_size(path);
+    const uintmax_t payload_bytes = file_bytes - kHeaderBytes;
+    const uint64_t total_rows =
+        static_cast<uint64_t>(payload_bytes / row_bytes);
+    if (payload_bytes % row_bytes != 0)
+        std::fprintf(stderr,
+                     "  [data] %s: trailing %ju bytes do not form a row; "
+                     "ignoring them\n",
+                     path.c_str(),
+                     static_cast<uintmax_t>(payload_bytes % row_bytes));
+
+    // Spread a deterministic validation set over the entire ordered file.
+    // The old row%50/cap rule stopped after row 409,550, so a 5M-row mix
+    // validated only its first shard.
+    const size_t heldout_room =
+        heldout_.size() < 8192 ? 8192 - heldout_.size() : 0;
+    const uint64_t heldout_goal = std::min<uint64_t>(
+        heldout_room, (total_rows + 49) / 50);
+    uint64_t heldout_i = 0;
+    auto next_validation_row = [&]() -> uint64_t {
+        if (heldout_i >= heldout_goal) return total_rows;
+        return ((2 * heldout_i + 1) * total_rows) / (2 * heldout_goal);
+    };
+    uint64_t next_heldout = next_validation_row();
+
+    // A fixed offline file should load independently of its row ordering.
+    // Restore the online circular/recency policy after uniform reservoir
+    // filling, so later self-play still follows the configured policy.
+    const bool online_circular = circular_;
+    circular_ = false;
+    if (cfg_.replay_cap > 0 &&
+        replay_.size() < static_cast<size_t>(cfg_.replay_cap)) {
+        const uint64_t train_rows = total_rows - heldout_goal;
+        const size_t room =
+            static_cast<size_t>(cfg_.replay_cap) - replay_.size();
+        replay_.reserve(replay_.size() +
+                        std::min<size_t>(train_rows, room));
+    }
+
+    f.seekg(static_cast<std::streamoff>(kHeaderBytes));
+    uint64_t rows = 0;
+    for (; rows < total_rows; ++rows) {
         Sample s;
         s.feat.resize(HunlFeaturizer::kDim);
         s.target.resize(static_cast<size_t>(n_out));
         s.mask.resize(static_cast<size_t>(n_out));
         if (!f.read(reinterpret_cast<char*>(s.feat.data()),
-                    sizeof(float) * HunlFeaturizer::kDim)) {
-            if (f.gcount() != 0)
-                std::fprintf(stderr, "  [data] %s: truncated row %ld — "
-                             "keeping what loaded\n", path.c_str(), rows);
-            break;
-        }
-        if (!f.read(reinterpret_cast<char*>(s.target.data()),
+                    sizeof(float) * HunlFeaturizer::kDim) ||
+            !f.read(reinterpret_cast<char*>(s.target.data()),
                     sizeof(float) * static_cast<size_t>(n_out)) ||
-            !f.read(reinterpret_cast<char*>(m8.data()), n_out)) {
-            std::fprintf(stderr, "  [data] %s: truncated row %ld — keeping "
-                         "what loaded\n", path.c_str(), rows);
+            !f.read(reinterpret_cast<char*>(s.mask.data()), n_out)) {
+            std::fprintf(stderr,
+                         "  [data] %s: truncated row %ju — keeping what "
+                         "loaded\n",
+                         path.c_str(), static_cast<uintmax_t>(rows));
             break;
         }
-        for (int j = 0; j < n_out; ++j) s.mask[j] = m8[j] ? 1.0f : 0.0f;
-        // fixed, config-independent heldout slice: same rows for every
-        // run off this file, so heldout numbers compare across nets
-        if (rows % 50 == 0 && heldout_.size() < 8192)
+        if (rows == next_heldout) {
             heldout_.push_back(std::move(s));
-        else
+            ++heldout_i;
+            next_heldout = next_validation_row();
+        } else {
             replay_insert(std::move(s));
-        ++rows;
+        }
     }
+    circular_ = online_circular;
     // masked target variance of the heldout slice = the "predict the mean"
     // MSE baseline that makes heldout readable as explained variance
     double sum = 0.0, sq = 0.0, cnt = 0.0;
     for (const Sample& s : heldout_)
         for (int j = 0; j < n_out; ++j)
-            if (s.mask[j] > 0.5f) {
+            if (s.mask[j]) {
                 sum += s.target[j];
                 sq += static_cast<double>(s.target[j]) * s.target[j];
                 cnt += 1.0;
             }
     const double var =
         cnt > 0 ? sq / cnt - (sum / cnt) * (sum / cnt) : 0.0;
-    std::printf("  [data] %s: %ld rows -> replay %zu, heldout %zu "
-                "(target var %.3e)\n",
-                path.c_str(), rows, replay_.size(), heldout_.size(), var);
+    std::printf("  [data] %s: %ju rows -> replay %zu, heldout %zu "
+                "(uniform offline reservoir, target var %.3e)\n",
+                path.c_str(), static_cast<uintmax_t>(rows), replay_.size(),
+                heldout_.size(), var);
     // Zero-sum residual of the TARGETS under the same weights the net's
     // outer correction uses (Σ r0·m0·v0 + Σ r1·m1·v1, per-entry units
     // s/2Z). Exact solver values satisfy the identity up to CFR
@@ -1642,10 +1748,12 @@ void EndgameTrainer::load_dataset(const std::string& path) {
 double EndgameTrainer::train_net_cached(int want) {
     // GPU-resident sample cache: one chunked upload per epoch, batches
     // assembled ON DEVICE via index_select — replaces the per-step CPU
-    // gather + ~40KB/row synchronous H2D (tens of GB per epoch). Cache =
-    // uniform subset of the replay re-drawn each epoch; when the replay
-    // fits entirely the sampling distribution is identical to the
-    // uncached path. Masks live as u8 (¼ the bytes), cast per batch.
+    // gather + ~40KB/row synchronous H2D (tens of GB per epoch). A partial
+    // cache admits rows from one shuffled permutation without replacement
+    // before it reshuffles, guaranteeing cache exposure instead of repeatedly
+    // redrawing and missing most of a large replay. SGD samples within the
+    // resident slab with replacement, as in the uncached path. Masks stay u8
+    // until each batch.
     const int n_out = 2 * kCombos;
     const size_t C = std::min(replay_.size(), static_cast<size_t>(want));
     auto opts = torch::TensorOptions().dtype(torch::kFloat).device(device_);
@@ -1656,13 +1764,26 @@ double EndgameTrainer::train_net_cached(int want) {
         tc_mask_ = torch::empty({static_cast<long>(C), n_out},
                                 opts.dtype(torch::kUInt8));
     }
-    std::vector<size_t> idx(replay_.size());
-    std::iota(idx.begin(), idx.end(), static_cast<size_t>(0));
-    if (C < replay_.size())   // partial Fisher–Yates subset draw
-        for (size_t i = 0; i < C; ++i) {
-            std::uniform_int_distribution<size_t> d(i, idx.size() - 1);
-            std::swap(idx[i], idx[d(rng_)]);
+    if (tc_replay_size_ != replay_.size()) {
+        tc_order_.resize(replay_.size());
+        std::iota(tc_order_.begin(), tc_order_.end(), static_cast<size_t>(0));
+        std::shuffle(tc_order_.begin(), tc_order_.end(), rng_);
+        tc_cursor_ = 0;
+        tc_replay_size_ = replay_.size();
+        std::printf("  [gpu-cache] %zu/%zu rows (%.2f GiB), slab order "
+                    "cycles without replacement\n",
+                    C, replay_.size(),
+                    static_cast<double>(C) * 40008.0 /
+                        (1024.0 * 1024.0 * 1024.0));
+    }
+    std::vector<size_t> idx(C);
+    for (size_t i = 0; i < C; ++i) {
+        if (tc_cursor_ == tc_order_.size()) {
+            std::shuffle(tc_order_.begin(), tc_order_.end(), rng_);
+            tc_cursor_ = 0;
         }
+        idx[i] = tc_order_[tc_cursor_++];
+    }
     const long CH = 4096;   // staging chunks keep CPU-side memory flat
     auto sf = torch::empty({CH, HunlFeaturizer::kDim}, torch::kFloat);
     auto st = torch::empty({CH, n_out}, torch::kFloat);
@@ -1676,10 +1797,9 @@ double EndgameTrainer::train_net_cached(int want) {
                           static_cast<size_t>(r) * HunlFeaturizer::kDim);
             std::copy(s.target.begin(), s.target.end(),
                       st.data_ptr<float>() + static_cast<size_t>(r) * n_out);
-            uint8_t* mp =
-                sm.data_ptr<uint8_t>() + static_cast<size_t>(r) * n_out;
-            for (int j = 0; j < n_out; ++j)
-                mp[j] = s.mask[static_cast<size_t>(j)] > 0.5f ? 1 : 0;
+            std::copy(s.mask.begin(), s.mask.end(),
+                      sm.data_ptr<uint8_t>() +
+                          static_cast<size_t>(r) * n_out);
         }
         tc_feat_.narrow(0, off, m).copy_(sf.narrow(0, 0, m));
         tc_targ_.narrow(0, off, m).copy_(st.narrow(0, 0, m));
@@ -1726,7 +1846,7 @@ double EndgameTrainer::train_net() {
                                     static_cast<int>(replay_.size()));
         auto X = torch::empty({B, HunlFeaturizer::kDim}, torch::kFloat);
         auto Y = torch::empty({B, n_out}, torch::kFloat);
-        auto M = torch::empty({B, n_out}, torch::kFloat);
+        auto M = torch::empty({B, n_out}, torch::kUInt8);
         for (int b = 0; b < B; ++b) {
             const Sample& s = replay_[pick(rng_)];
             std::copy(s.feat.begin(), s.feat.end(),
@@ -1735,10 +1855,11 @@ double EndgameTrainer::train_net() {
             std::copy(s.target.begin(), s.target.end(),
                       Y.data_ptr<float>() + static_cast<size_t>(b) * n_out);
             std::copy(s.mask.begin(), s.mask.end(),
-                      M.data_ptr<float>() + static_cast<size_t>(b) * n_out);
+                      M.data_ptr<uint8_t>() + static_cast<size_t>(b) * n_out);
         }
         opt_->zero_grad();
-        auto Xd = X.to(device_), Yd = Y.to(device_), Md = M.to(device_);
+        auto Xd = X.to(device_), Yd = Y.to(device_);
+        auto Md = M.to(device_).to(torch::kFloat);
         auto err = net_->forward(Xd) - Yd;
         torch::Tensor pt;
         if (cfg_.huber_delta > 0.0) {
@@ -1773,7 +1894,7 @@ double EndgameTrainer::heldout_mse(const std::vector<Sample>& fresh) {
     double se = 0.0, cnt = 0.0;
     for (long r = 0; r < N; ++r)
         for (int j = 0; j < 2 * kCombos; ++j)
-            if (fresh[r].mask[j] > 0.5f) {
+            if (fresh[r].mask[j]) {
                 const double e = acc[r][j] - fresh[r].target[j];
                 se += e * e;
                 cnt += 1.0;
@@ -1874,6 +1995,12 @@ void EndgameTrainer::run() {
         (void)combo_rank(ComboTable::get().id[25][30], warm);
     }
     if (!cfg_.data_in.empty()) load_dataset(cfg_.data_in);
+    if (cfg_.episodes == 0 && cfg_.sgd_steps > 0 && replay_.empty()) {
+        std::fprintf(stderr,
+                     "  [offline] no replay rows loaded; refusing empty "
+                     "training run\n");
+        std::exit(1);
+    }
     // reference: the same probe turn solves with EXACT leaves (slow, once).
     // one situation per seed; the net probe below averages the SAME seeds.
     auto probe_seed = [](int k) { return 12345u + 1000u * static_cast<unsigned>(k); };
@@ -1888,9 +2015,22 @@ void EndgameTrainer::run() {
         std::fflush(stdout);
     }
 
+    size_t generated_total = 0;
+    double best_heldout = std::numeric_limits<double>::infinity();
+    if (cfg_.sgd_steps > 0 && !heldout_.empty()) {
+        best_heldout = heldout_mse(heldout_);
+        if (!std::isfinite(best_heldout)) {
+            std::fprintf(stderr,
+                         "  [train] non-finite baseline heldout; refusing "
+                         "to train\n");
+            std::exit(1);
+        }
+        std::printf("  [ckpt] baseline heldout %.3e\n", best_heldout);
+        std::fflush(stdout);
+    }
     for (int ep = 1; ep <= cfg_.epochs; ++ep) {
         auto t_sp0 = clock::now();
-        if (cfg_.lr_final > 0.0 && cfg_.epochs > 1) {
+        if (opt_ && cfg_.lr_final > 0.0 && cfg_.epochs > 1) {
             const double a = static_cast<double>(ep - 1) / (cfg_.epochs - 1);
             const double cur = cfg_.lr + (cfg_.lr_final - cfg_.lr) * a;
             for (auto& g : opt_->param_groups())
@@ -1960,15 +2100,37 @@ void EndgameTrainer::run() {
         auto t_sp1 = clock::now();
         if (ep == 1) print_pot_hist(fresh, "gen");
         if (!cfg_.data_out.empty()) append_dataset(cfg_.data_out, fresh);
-        // out-of-sample probe: the persistent split when a dataset was
-        // loaded (comparable across configs), else this epoch's fresh rows
-        // BEFORE they are trained on
-        const double heldout = !heldout_.empty() ? heldout_mse(heldout_)
-                                                 : heldout_mse(fresh);
+        generated_total += fresh.size();
+        if (cfg_.sgd_steps <= 0) {
+            // Dataset-generation runs use the loaded net as a read-only
+            // oracle. Do not spend a second forward over every fresh row,
+            // retain hundreds of MB/epoch in replay, or touch optimizer /
+            // checkpoint state. The epoch marker stays launcher-compatible
+            // and is printed only after append_dataset has returned.
+            std::printf("  epoch %3d  generated=%zu  total=%zu  [sp %.0fs]\n",
+                        ep, fresh.size(), generated_total,
+                        secs(t_sp0, t_sp1));
+            std::fflush(stdout);
+            continue;
+        }
+        // Fresh online rows must be judged before insertion. A persistent
+        // offline split is never trained on, so judge it after this epoch's
+        // update below; the old pre-update number was one checkpoint behind.
+        const double fresh_heldout =
+            heldout_.empty() ? heldout_mse(fresh) : 0.0;
         for (Sample& smp : fresh) replay_insert(std::move(smp));
         auto t_tr0 = clock::now();
         const double vloss = train_net();
         auto t_tr1 = clock::now();
+        const double heldout =
+            !heldout_.empty() ? heldout_mse(heldout_) : fresh_heldout;
+        if (!heldout_.empty() && !std::isfinite(heldout)) {
+            std::fprintf(stderr,
+                         "  [train] non-finite heldout after epoch %d; "
+                         "refusing to publish checkpoint\n",
+                         ep);
+            std::exit(1);
+        }
         double net_expl = -1.0, t_probe = 0.0;
         if (cfg_.probe_k > 0 && (ep % 5 == 0 || ep == cfg_.epochs)) {
             auto t_pr0 = clock::now();
@@ -1991,7 +2153,22 @@ void EndgameTrainer::run() {
             std::printf("]");
         std::printf("\n");
         std::fflush(stdout);
-        if (!cfg_.ckpt.empty()) torch::save(net_, cfg_.ckpt);
+        // Offline training publishes the best post-update validation model,
+        // rather than blindly overwriting it with the final epoch. Saves are
+        // temp+rename so interruption cannot destroy the previous winner.
+        // Online training has no persistent split, so it saves every epoch.
+        if (cfg_.sgd_steps > 0 && !cfg_.ckpt.empty()) {
+            const bool persistent_validation = !heldout_.empty();
+            if (!persistent_validation || heldout < best_heldout) {
+                if (persistent_validation) best_heldout = heldout;
+                save_net_atomic(net_, cfg_.ckpt);
+                if (persistent_validation) {
+                    std::printf("  [ckpt] best heldout %.3e -> %s\n",
+                                best_heldout, cfg_.ckpt.c_str());
+                    std::fflush(stdout);
+                }
+            }
+        }
     }
 }
 

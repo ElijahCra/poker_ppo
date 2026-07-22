@@ -20,16 +20,26 @@ BatchRiverSolver::~BatchRiverSolver() = default;
 TreeShape TreeShape::from(const HunlSolver& s) {
     TreeShape sh;
     sh.nodes.reserve(s.nodes().size());
+    // This is a production batching key, not a diagnostic label: every
+    // field that changes traversal or leaf positioning must participate.
+    // Build it before moving `n` into the vector (a moved-from std::vector
+    // commonly reports size zero, which previously collapsed distinct
+    // decision arities into the same batch).
     for (const auto& nd : s.nodes()) {
         TreeShape::Node n;
         n.kind = static_cast<int>(nd.kind);
         n.player = nd.player;
         n.acts = nd.acts;
         n.child = nd.child;
-        sh.nodes.push_back(std::move(n));
         sh.signature += std::to_string(n.kind) + ":" +
-                        std::to_string(n.player) + ":" +
-                        std::to_string(n.acts.size()) + ";";
+                        std::to_string(n.player) + ":a";
+        for (int a : n.acts)
+            sh.signature += std::to_string(a) + ",";
+        sh.signature += ":c";
+        for (int c : n.child)
+            sh.signature += std::to_string(c) + ",";
+        sh.signature += ";";
+        sh.nodes.push_back(std::move(n));
     }
     return sh;
 }
@@ -456,11 +466,13 @@ void BatchRiverSolver::solve(int T) {
         }
         torch::cuda::synchronize();
     } catch (const std::exception& e) {
-        std::fprintf(stderr,
-                     "[gpu] CUDA graph capture failed (%s) — eager "
-                     "fallback\n", e.what());
         graph_.reset();
-        for (int t = 4; t <= T; ++t) iterate(t);
+        // Capture/replay errors may be reported asynchronously after an
+        // unknown replay prefix has already mutated regrets.  Restarting at
+        // t=4 would then double-apply that prefix and silently corrupt the
+        // solve.  The caller must discard this solver and start clean.
+        TORCH_CHECK(false, "CUDA graph river solve failed; state may be "
+                      "partial, refusing eager replay: ", e.what());
     }
 }
 

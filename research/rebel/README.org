@@ -142,10 +142,10 @@ Built and validated on this machine (target =rebel_hunl=):
   from the situation seed (truly fixed) and =REBEL_PROBE_K= averages K
   situations with matching exact references (0 = skip probes).
   Sample persistence: =REBEL_DATA_OUT= appends every fresh target to a
-  dataset file (targets are net-independent exact solves — reusable
-  forever; ~24KB/row); =REBEL_DATA_IN= loads one (fixed row%50 heldout
-  split ≤8192 rows, comparable across configs; target-variance baseline
-  printed); =episodes=0= = offline mode — pure SGD epochs on the loaded
+  dataset file (~40KB/row in the current format); =REBEL_DATA_IN= loads one
+  (up to 8192 evenly spaced heldout rows, comparable across configs;
+  target-variance baseline printed); =episodes=0= = offline mode — pure
+  SGD epochs on the loaded
   data, so architecture screens run at train-speed, not resample-speed.
   New knobs: =REBEL_HIDDEN=, =REBEL_LAYERS= (2 = ckpt-compatible l1/l2/l3),
   =REBEL_SGD_STEPS=, =REBEL_BATCH=, =REBEL_LR=, =REBEL_LR_FINAL= (linear
@@ -155,10 +155,12 @@ Built and validated on this machine (target =rebel_hunl=):
 - paper-fidelity audit (2026-07-06, vs ReBeL arXiv:2007.13544 + DeepStack
   arXiv:1701.01724, both re-read): VERIFIED faithful — ε=25% with one
   randomly chosen explorer (paper: "one agent samples random actions with
-  probability ε... we set ε=25%"); t*~unif iteration sampling; CFR-AVG
-  next-root beliefs under the average policy (paper: "In CFR-AVG and FP
-  β'_r = β_z^π̄t" — sample_leaf matches); per-infostate values normalized
-  by opponent mass; raw 1326 beliefs as net input (ReBeL; DeepStack's
+  probability ε... we set ε=25%"); t* sampling matched to the solver's
+  averaging weights (t for Linear CFR, t² for PCFR+q). SampleLeaf runs at
+  the selected iteration's pre-update boundary: actions use the current
+  regret-matched profile and its returned PBS uses the cumulative CFR-AVG
+  profile available at that same boundary; per-infostate values normalized
+  by opponent mass; conditional 1326-combo beliefs as net input (ReBeL;
   1000-bucket encoding is the fallback if features cap out); pot-unit
   values (DeepStack: "fractions of the pot size"; ReBeL doesn't specify).
   GAPS worth adopting, all paper-grounded: (1) loss — both papers use
@@ -179,9 +181,9 @@ Built and validated on this machine (target =rebel_hunl=):
   DeepStack-style synthetic situations for endgame pretraining (ReBeL
   itself is "purely from self play without any additional heuristics
   guiding which PBSs are sampled" — train_turn is the ReBeL-proper phase);
-  exact river solves as targets instead of the paper's (1/T)Σ_t v^πt
-  iterate average (ground truth on rivers; use the iterate average when
-  bootstrapped turn-root targets arrive for the flop net); no policy-net
+  exact river solves as targets instead of a solver-iteration mean
+  (ground truth on rivers); bootstrapped turn/flop roots now use the same
+  Linear-CFR/PCFR weighting as their average policy. No policy-net
   warm start (paper Appendix J, optional); unsafe resolving (gadget
   pending). Non-issues: the paper's "bet occurred this round" input flag
   is constant-false at street roots (our only query points); DeepStack's
@@ -221,10 +223,8 @@ Built and validated on this machine (target =rebel_hunl=):
   already has DeepStack-grade heavy-tail coverage, no sampling change
   needed. Note: strength-polarized ranges raise target variance (~3.6e-1
   heldout target var vs old distribution) — judge heldout against the
-  printed baseline, not old runs. Still pending, tied to the flop-net
-  phase: iterate-averaged root targets ((1/T)Σ_t v^πt) — not applicable
-  until turn-root values become training targets (today all targets are
-  exact river solves); policy-net warm start; safe-resolving gadget.
+  printed baseline, not old runs. Still pending: policy-net warm start and
+  further safe-resolving calibration.
 - =hunl_value=: PBS value net (street/board/pot + both 1326-ranges →
   per-combo values both players) + Algorithm-1 endgame self-play
   (=rebel_hunl train_turn=): synthetic turn roots (random boards/pots via
@@ -337,6 +337,42 @@ LBR's off-abstraction raise sizes skip the belief update entirely. The
 safe-resolving gadget (Burch et al.) moves to the top of the queue;
 secondary levers: denser river abstraction (0.5-pot in-tree so LBR's
 raises stay on-tree), higher play-time T.
+
+* Gen-3 rental hardening (2026-07-22)
+
+The dataset format is now v3. Both players' ranges are normalized over
+board-compatible combos at the shared feature boundary (including fused-GPU
+leaf queries), and private hands are sampled from the compatible joint
+distribution. Linear-CFR root values and continuation iterations use weight
+=t=; the benchmark-selected PCFR+ variant uses =t^2=. The sampled public path
+uses the selected current iterate while its returned CFR-AVG PBS uses average
+reaches. Old v1/v2 rows are intentionally rejected: their range or target
+semantics differ, so do not combine or resume them.
+
+The 4x5090 launcher defaults to 5M turn + 500k river + about 37.5k flop rows.
+It uses collision-free absolute-row seeds, three pure fused-GPU lanes plus one
+CPU lane, a verified transactional mix, a 5.6M replay cap, and a 500k device
+cache whose slab admissions cycle without replacement. GPU batches sample
+with replacement within each random cache slab; the persistent shuffled slab
+order exposes the whole replay about every 11 epochs. In-memory masks are u8,
+making a packed
+row 40,008 bytes and the default mixed replay about 206 GiB of payload. Offline
+loading uses a uniform reservoir and spreads 8,192 heldout rows across the
+whole mix. Validation is measured after each update; the best checkpoint is
+published via atomic rename. =tools/rebel_rental_probe.sh= must pass on the
+rental before =tools/vm_gen3_test.sh= (which launches the full campaign after
+its toy smoke). The preflight is fail-closed on fused execution, CPU/GPU value
+masks, exported play strategy layout, and every GPU's PCFR+ result.
+
+Training intentionally stays on one GPU for this campaign. DDP would require
+one process per GPU and explicit input sharding; four copies of the current
+206-GiB object replay cannot fit in 256 GB. The trainer is also LibTorch C++,
+whose public frontend currently has no supported DDP wrapper; manual c10d or a
+Python trainer port would be a separate validation project. RTX 5090s have no
+NVLink, so the 42-MB baseline / 105-MB spec gradient payloads would reduce over
+PCIe each step. A future packed/mmap row store can make host pages shareable
+and remove millions of allocations, but DDP should follow that refactor and a
+measured single-GPU profile, not precede this paid generation run.
 
 * HUNL port map (stage 2)
 

@@ -34,11 +34,25 @@
 
 namespace rebel_hunl {
 
+// Weight used consistently for average strategies, ReBeL root-value
+// targets, and continuation-iteration sampling. CFR+ follows Linear CFR;
+// the locally selected predictive variant uses quadratic weighting.
+inline double solver_iteration_weight(int t, bool pcfr,
+                                      bool pcfr_quad = true) {
+    const double td = static_cast<double>(t);
+    return pcfr && pcfr_quad ? td * td : td;
+}
+
 struct HunlPBS {
     // Public state is carried by the ENV (board + pot + betting position);
     // the solver only needs the ranges.
     std::vector<double> r0, r1;   // combo weights (normalized over valid)
 };
+
+// Deterministic empirical guard for Algorithm-1's private-hand sampler.
+// Returns |observed - expected| for a crafted hero marginal whose compatible
+// opponent masses differ 10:1; infinity means an incompatible pair was drawn.
+double compatible_hand_sampler_error(int draws = 20000);
 
 struct HunlValueOracle {
     // env sits at the next-street root reached by path replay (its randomly
@@ -120,15 +134,15 @@ public:
     uint64_t pf_seed = 20260713;
     // Predictive CFR+ (Farina, Kroer & Sandholm 2021): the CURRENT policy
     // is regret-matched over [R + m]^+ where the prediction m is the last
-    // instantaneous regret (optimism), and the average strategy uses
-    // QUADRATIC iterate weights (t^2, vs CFR+'s linear t). Same fixed
-    // points, measurably fewer iterations to a given exploitability.
+    // instantaneous regret (optimism). Same fixed points, measurably fewer
+    // iterations to a given exploitability on our net-leaf subgames.
     // Opt-in: default false keeps every existing path bit-identical
     // (the GPU river kernels remain plain CFR+ — leave this off for any
     // solve that will be compared against them). Set before iterate(1).
     bool     pcfr = false;
-    // Averaging weight under PCFR+: t^2 (paper pairing) vs CFR+'s linear
-    // t. Measured per-street on our trees — see pcfr_bench.
+    // Averaging weight under PCFR+: t^2 (the paper's evaluated pairing and
+    // our locally benchmarked winner) vs CFR+'s linear t. Measured per
+    // street on our trees — see pcfr_bench.
     bool     pcfr_quad = true;
     // Subgame exploitability of the current average profile in chips/hand
     // (normalized by joint compatible mass; 0 at equilibrium). Exact when
@@ -151,9 +165,10 @@ public:
     void root_values(std::array<std::vector<double>, 2>& v,
                      std::array<std::vector<double>, 2>& mask);
 
-    // ── Iterate-averaged root values (ReBeL's value target) ────────────
-    // The paper trains v̂ on (1/T)·Σ_t v^{π^t}(β_r) — the running average
-    // of CURRENT-iterate root values, not the final average profile's
+    // ── Iteration-weighted root values (ReBeL's value target) ────────
+    // ReBeL's experimental Linear-CFR algorithm trains on the same weighted
+    // mean of CURRENT-iterate values used for its output policy (t for
+    // CFR+, t^2 for our PCFR+ variant), not the final average profile's
     // value. Call track_root_values() before the first iterate();
     // avg_root_values() returns per-combo values in the root_values
     // normalization, or false if nothing was tracked.
@@ -203,14 +218,16 @@ public:
     int board_count() const { return nb_root_; }
     const std::array<uint8_t, 5>& board() const { return board_; }
 
-    // Algorithm 1 SampleLeaf under the current AVERAGE profile (CFR-AVG
-    // pairing): samples compatible private hands from the root ranges, walks
-    // sampled actions (ε-uniform for `explorer`'s decisions), samples the
+    // ReBeL CFR-AVG SampleLeaf: called before the selected CFR update;
+    // samples compatible private hands and walks that boundary's CURRENT
+    // regret-matched actions
+    // (ε-uniform for `explorer`'s decisions), then samples the
     // next street's chance at a StreetEnd — one card, or the 3-card flop
     // when this is a preflop root (`card` must then point to 3 writable
     // bytes). Returns false if the walk hit a terminal (episode over); else
-    // fills leaf node id, card(s), and the leaf PBS (avg-policy Bayes
-    // posteriors, card-masked, normalized).
+    // fills leaf node id, card(s), and the leaf PBS (Bayes posteriors under
+    // the cumulative AVERAGE policy available at the same pre-update
+    // boundary, card-masked and normalized).
     bool sample_leaf(std::mt19937& rng, double eps, int explorer,
                      int* leaf_node, uint8_t* card, HunlPBS* beta);
 
@@ -244,7 +261,7 @@ private:
     double               gd_cumW_ = 0.0;
     bool                 track_root_ = false;
     std::array<std::vector<double>, 2> rv_sum_;
-    long                 rv_n_ = 0;
+    double               rv_weight_ = 0.0;
     int                  root_round_ = 0;
     int                  nb_root_ = 0;
     std::array<uint8_t, 5> board_{};

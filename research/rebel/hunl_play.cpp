@@ -313,22 +313,7 @@ bool RebelTarget::gpu_turn_solve(HunlSolver& s, int T) {
             else
                 refresh_turn_leaves(g, specs, ora, /*threads=*/1, &gpu_ws_);
         });
-        for (size_t m = 0; m < nodes.size(); ++m) {
-            if (nodes[m].kind != HunlSolver::Node::Decision) continue;
-            const int A = static_cast<int>(nodes[m].acts.size());
-            auto cum = g.cum_state(static_cast<int>(m))
-                           .select(0, 0)
-                           .to(torch::kCPU)
-                           .to(torch::kDouble)
-                           .contiguous();   // [A, n]
-            const double* cp = cum.data_ptr<double>();
-            std::vector<double> row(static_cast<size_t>(A) * kCombos);
-            for (int x = 0; x < kCombos; ++x)
-                for (int k = 0; k < A; ++k)
-                    row[static_cast<size_t>(x) * A + k] =
-                        cp[static_cast<size_t>(k) * kCombos + x];
-            s.set_cum_strat(static_cast<int>(m), row);
-        }
+        g.export_cum_strategy(s, 0);
         return true;
     } catch (const std::exception& e) {
         static bool warned = false;

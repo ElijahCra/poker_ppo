@@ -9,16 +9,21 @@
 # river data is saturated; every episode yields exactly one 40KB
 # street-2 row). Chunked + resumable: rerun after any death and it
 # continues from the on-disk row count. The champion ckpt prices the
-# net leaves (copied first — the trainer saves its ckpt path per epoch,
-# and the champion must never be written in place).
+# net leaves (copied first; zero-SGD generation keeps that staged oracle
+# immutable, and the champion is never used as a writable checkpoint).
 #
 # Tune GPU_FRAC once per box: run a short chunk, read the epoch wall
 # with the lane split, and set it to gpu_rate/(gpu_rate+cpu_rate).
 # Defaults assume a 5090 + ~380 vCPUs (GPU ~0.3 of throughput).
 set -uo pipefail
 
-BIN=./rebel_hunl
-ORACLE=${ORACLE:-cand_f1.pt}          # champion of record prices leaves
+BIN=${BIN:-./rebel_hunl}
+if [ -z "${ORACLE:-}" ]; then
+    if [ -s cand_f1.pt ]; then ORACLE=cand_f1.pt
+    elif [ -s ../cand_f1.pt ]; then ORACLE=../cand_f1.pt
+    else ORACLE=cand_f1.pt
+    fi
+fi                                      # champion of record prices leaves
 TARGET_ROWS=${TARGET_ROWS:-10000000}
 OUT=${OUT:-turn10m.bin}
 CHUNK_EPISODES=${CHUNK_EPISODES:-20000}   # episodes per epoch
@@ -28,6 +33,8 @@ GPU_BATCH=${GPU_BATCH:-128}           # 5090: 128-192; 8GB cards: <=64
 THREADS=${THREADS:-0}                 # 0 = (cores - 8) / instances
 T_TURN=${T_TURN:-120}
 SEED_BASE=${SEED_BASE:-0}
+SEED_STRIDE=${SEED_STRIDE:-100000000}
+CPUSHARE=${CPUSHARE:-0.15}
 ROW=40008
 
 rows() {
@@ -37,6 +44,58 @@ rows() {
 }
 die() { echo "FATAL: $*" >&2; exit 1; }
 
+# Choose an exact tail chunk when the remaining row count factors cleanly;
+# otherwise write full-size epochs followed by one small exact tail chunk.
+# Sets the caller's `epochs` and `eps` variables.
+plan_chunk() {  # <remaining>
+    local remaining=$1 e max_e
+    eps=$CHUNK_EPISODES
+    epochs=$EPOCHS_PER_RUN
+    [ $(( eps * epochs )) -le "$remaining" ] && return
+
+    max_e=$EPOCHS_PER_RUN
+    [ "$max_e" -gt "$remaining" ] && max_e=$remaining
+    for ((e=max_e; e>=1; --e)); do
+        if [ $(( remaining % e )) -eq 0 ] && \
+           [ $(( remaining / e )) -le "$CHUNK_EPISODES" ]; then
+            epochs=$e
+            eps=$(( remaining / e ))
+            return
+        fi
+    done
+
+    epochs=$(( remaining / CHUNK_EPISODES ))
+    [ "$epochs" -ge 1 ] || epochs=1
+    eps=$CHUNK_EPISODES
+}
+
+check_chunk_plan() {  # <target> <seed-base>
+    local target=$1 base=$2 total=0 last=-1 remaining made seed steps=0
+    [ "$target" -gt 0 ] || die "plan-check target must be positive"
+    while [ "$total" -lt "$target" ]; do
+        remaining=$(( target - total ))
+        plan_chunk "$remaining"
+        made=$(( epochs * eps ))
+        [ "$made" -gt 0 ] && [ "$made" -le "$remaining" ] \
+            || die "invalid chunk ${epochs}x${eps} for remaining=$remaining"
+        seed=$(( 7000 + base + total ))
+        [ "$seed" -gt "$last" ] && [ "$seed" -le 4294967295 ] \
+            || die "non-monotonic/out-of-range seed $seed"
+        printf 'plan chunk=%d rows=%d seed=%d\n' "$steps" "$made" "$seed"
+        total=$(( total + made ))
+        last=$seed
+        steps=$(( steps + 1 ))
+        [ "$steps" -lt 10000 ] || die "chunk planner did not converge"
+    done
+    [ "$total" -eq "$target" ] || die "chunk plan ended at $total, want $target"
+    echo "plan PASS: $steps chunks, $total rows"
+}
+
+if [ "${REBEL_CHUNK_PLAN_CHECK:-0}" = 1 ]; then
+    check_chunk_plan "$TARGET_ROWS" "$SEED_BASE"
+    exit 0
+fi
+
 # ── multi-GPU launcher: one pinned instance per device ───────────────
 # Each shard writes its own OUT file with its own seed base (chunk
 # seeds MUST differ across shards or they generate identical
@@ -44,12 +103,39 @@ die() { echo "FATAL: $*" >&2; exit 1; }
 # tail -c +17 shard >> mix.
 NGPU=${NGPU:-$(nvidia-smi -L 2>/dev/null | wc -l)}
 [ "$NGPU" -ge 1 ] || NGPU=1
+if [ -z "${TURN10M_CHILD:-}" ]; then
+    [ -x "$BIN" ] || die "$BIN not found — run from cmake-build-release"
+    [ -s "$ORACLE" ] || die "$ORACLE missing — the champion ckpt prices leaves"
+    kernel_line=$($BIN kernels 2>&1 | tail -1) || die "kernels FAIL"
+    echo "$kernel_line" | grep -Eq \
+        'root-weight err .*topology-key=exact +PASS$' \
+        || die "kernels FAIL or stale rebel_hunl binary"
+    command -v sha256sum >/dev/null 2>&1 || die "sha256sum is required for provenance"
+    command -v flock >/dev/null 2>&1 || die "flock is required for campaign locking"
+    exec 9>"${OUT%.bin}.campaign.lock"
+    flock -n 9 || die "another turn campaign owns ${OUT%.bin}.campaign.lock"
+    scheme_file="${OUT%.bin}.seed_scheme"
+    oracle_sha=$(sha256sum "$ORACLE" | awk '{print $1}')
+    binary_sha=$(sha256sum "$BIN" | awk '{print $1}')
+    scheme="absolute-row-v3 oracle=$oracle_sha binary=$binary_sha t_turn=$T_TURN pcfr=1 quad=1 root_weight=matched refresh=5 data_v=3 row=$ROW ngpu=$NGPU cpushare=$CPUSHARE gpu_batch=$GPU_BATCH seed_base=$SEED_BASE seed_stride=$SEED_STRIDE"
+    has_data=0
+    [ -e "$OUT" ] && has_data=1
+    compgen -G "${OUT%.bin}_g*.bin" >/dev/null && has_data=1
+    if [ "$has_data" -eq 1 ]; then
+        [ -f "$scheme_file" ] && [ "$(cat "$scheme_file")" = "$scheme" ] \
+            || die "existing turn-data provenance differs; move it aside and regenerate"
+    else
+        printf '%s\n' "$scheme" > "$scheme_file" \
+            || die "cannot write $scheme_file"
+    fi
+fi
 if [ "$NGPU" -gt 1 ] && [ -z "${TURN10M_CHILD:-}" ]; then
     [ -x "$BIN" ] || die "$BIN not found — run from cmake-build-release"
     [ -s "$ORACLE" ] || die "$ORACLE missing"
     pgrep -f 'rebel_hun[l]' >/dev/null \
         && die "rebel_hunl already running — kill strays first"
-    cp -n "$ORACLE" gen_oracle.pt
+    # sgd_steps=0 makes this a read-only generation oracle.
+    cp "$ORACLE" gen_oracle.pt || die "cannot stage gen_oracle.pt"
     cores=$(nproc)
     # DEDICATED lanes (measured locally: mixing lanes on one GPU loses
     # ~2x — the fused kernel's persistent windows head-block the CPU
@@ -57,27 +143,34 @@ if [ "$NGPU" -gt 1 ] && [ -z "${TURN10M_CHILD:-}" ]; then
     # (support threads only); the LAST GPU hosts the pure CPU lane's
     # small forwards and no fused kernels. CPUSHARE = CPU lane's slice
     # of the row target.
-    CPUSHARE=${CPUSHARE:-0.15}
     cpu_rows=$(awk -v t="$TARGET_ROWS" -v s="$CPUSHARE" \
                    'BEGIN{printf "%d", t*s}')
-    gpu_rows=$(( (TARGET_ROWS - cpu_rows + NGPU - 2) / (NGPU - 1) ))
+    gpu_total=$(( TARGET_ROWS - cpu_rows ))
+    gpu_base=$(( gpu_total / (NGPU - 1) ))
+    gpu_extra=$(( gpu_total % (NGPU - 1) ))
     tsup=12
     tcpu=$(( cores - tsup * (NGPU - 1) - 4 ))
     [ "$tcpu" -ge 8 ] || tcpu=8
-    echo "== launcher: $((NGPU-1)) pure-GPU lanes x $gpu_rows rows" \
+    echo "== launcher: $((NGPU-1)) pure-GPU lanes share $gpu_total rows" \
          "($tsup thr each) + CPU lane $cpu_rows rows ($tcpu thr)"
     pids=()
     for g in $(seq 0 $(( NGPU - 2 ))); do
+        lane_rows=$gpu_base
+        [ "$g" -lt "$gpu_extra" ] && lane_rows=$(( lane_rows + 1 ))
         CUDA_VISIBLE_DEVICES=$g TURN10M_CHILD=1 NGPU=1 \
-        TARGET_ROWS=$gpu_rows OUT="${OUT%.bin}_g$g.bin" THREADS=$tsup \
-        SEED_BASE=$(( g * 997 )) GPU_FRAC=1.0 GPU_BATCH=$GPU_BATCH \
+        TARGET_ROWS=$lane_rows OUT="${OUT%.bin}_g$g.bin" THREADS=$tsup \
+        SEED_BASE=$(( SEED_BASE + g * SEED_STRIDE )) \
+        SEED_STRIDE=$SEED_STRIDE GPU_FRAC=1.0 GPU_BATCH=$GPU_BATCH \
+        BIN="$BIN" ORACLE="$ORACLE" \
         bash "$0" > "launcher_g$g.log" 2>&1 &
         pids+=("$!")
     done
     g=$(( NGPU - 1 ))
     CUDA_VISIBLE_DEVICES=$g TURN10M_CHILD=1 NGPU=1 \
     TARGET_ROWS=$cpu_rows OUT="${OUT%.bin}_g$g.bin" THREADS=$tcpu \
-    SEED_BASE=$(( g * 997 )) GPU_FRAC=0.0 GPU_BATCH=0 \
+    SEED_BASE=$(( SEED_BASE + g * SEED_STRIDE )) \
+    SEED_STRIDE=$SEED_STRIDE GPU_FRAC=0.0 GPU_BATCH=0 \
+    BIN="$BIN" ORACLE="$ORACLE" \
     bash "$0" > "launcher_g$g.log" 2>&1 &
     pids+=("$!")
     fail=0
@@ -93,6 +186,8 @@ if [ "$NGPU" -gt 1 ] && [ -z "${TURN10M_CHILD:-}" ]; then
     exit 0
 fi
 [ "$THREADS" -gt 0 ] 2>/dev/null || THREADS=$(( $(nproc) - 8 ))
+[ "$TARGET_ROWS" -lt "$SEED_STRIDE" ] \
+    || die "TARGET_ROWS must be < SEED_STRIDE ($SEED_STRIDE)"
 
 # ── gates ─────────────────────────────────────────────────────────────
 [ -x "$BIN" ] || die "$BIN not found — run from cmake-build-release"
@@ -111,23 +206,30 @@ if [ "$have" -gt 0 ]; then
         || die "$OUT misaligned (torn rows) — move it aside"
     echo "== resuming: $have/$TARGET_ROWS rows present"
 fi
-cp -n "$ORACLE" gen_oracle.pt   # never write the champion in place
+if [ -z "${TURN10M_CHILD:-}" ]; then
+    # sgd_steps=0 suppresses trainer checkpoint saves; refresh the staged
+    # oracle so a stale/corrupt copy cannot survive a prior crash.
+    cp "$ORACLE" gen_oracle.pt || die "cannot stage gen_oracle.pt"
+fi
 
 # ── generation loop (chunked, resumable) ─────────────────────────────
 while true; do
     have=$(rows "$OUT")
     [ "$have" -ge "$TARGET_ROWS" ] && break
     remaining=$(( TARGET_ROWS - have ))
-    # ~1 row per episode; don't overshoot the last chunk
-    eps=$CHUNK_EPISODES
-    epochs=$EPOCHS_PER_RUN
-    if [ $(( eps * epochs )) -gt "$remaining" ]; then
-        epochs=$(( (remaining + eps - 1) / eps ))
-    fi
-    echo "== chunk: $epochs x $eps episodes  ($have/$TARGET_ROWS rows, $(date '+%H:%M'))"
-    REBEL_TF32=1 REBEL_PCFR=1 REBEL_RIVER_ROWS=0 REBEL_HARVEST=0 \
+    # One street-2 row per episode; make the final chunks exact.
+    plan_chunk "$remaining"
+    seed=$(( 7000 + SEED_BASE + have ))
+    [ "$seed" -le 4294967295 ] \
+        || die "derived seed $seed exceeds uint32; lower SEED_BASE/NGPU"
+    planned=$(( epochs * eps ))
+    echo "== chunk: $epochs x $eps episodes  ($have/$TARGET_ROWS rows," \
+         "seed=$seed, $(date '+%H:%M'))"
+    REBEL_TF32=1 REBEL_PCFR=1 REBEL_ZERO_SUM=1 \
+    REBEL_HIDDEN=1024 REBEL_LAYERS=2 REBEL_GELU_LN=0 \
+    REBEL_RIVER_ROWS=0 REBEL_HARVEST=0 \
     REBEL_SGD_STEPS=0 REBEL_PROBE_K=0 \
-    REBEL_SEED=$(( 7000 + SEED_BASE + have % 100000 )) \
+    REBEL_SEED=$seed \
     REBEL_CKPT=gen_oracle.pt REBEL_DATA_OUT="$OUT" \
     REBEL_T_TURN_TRAIN=$T_TURN REBEL_THREADS=$THREADS \
     REBEL_GPU_TURN_BATCH=$GPU_BATCH REBEL_GPU_FRAC=$GPU_FRAC \
@@ -149,6 +251,14 @@ while true; do
         }
         sleep 60
     done
+    [ $(( ($(stat -c%s "$OUT") - 16) % ROW )) -eq 0 ] \
+        || die "$OUT misaligned after chunk at row $have"
+    after=$(rows "$OUT")
+    [ "$after" -gt "$have" ] || die "$OUT chunk at row $have produced no rows"
+    [ $(( after - have )) -le "$planned" ] \
+        || die "$OUT grew by more than its $planned-row chunk (second writer?)"
+    cmp -s "$ORACLE" gen_oracle.pt \
+        || die "gen_oracle.pt was rewritten — rebuild rebel_hunl with zero-SGD save suppression"
 done
 
 echo "== DONE: $(rows "$OUT") rows in $OUT"
@@ -159,7 +269,8 @@ cat <<'EOF'
 #   cp turn10m.bin mix10m.bin && tail -c +17 river_hs_vm.bin >> mix10m.bin
 # single seed first (preflop solving buffers the net lottery):
 #   cp cand_f1.pt g3_s1.pt
-#   REBEL_TF32=1 REBEL_GPU_CACHE=60000 REBEL_SEED=301 REBEL_CKPT=g3_s1.pt \
+#   REBEL_TF32=1 REBEL_GPU_CACHE=500000 REBEL_CIRCULAR=0 \
+#   REBEL_SEED=301 REBEL_CKPT=g3_s1.pt \
 #   REBEL_DATA_IN=mix10m.bin REBEL_REPLAY_CAP=6000000 REBEL_PROBE_K=0 \
 #   REBEL_LR=2e-4 REBEL_LR_FINAL=5e-5 REBEL_SGD_STEPS=4000 REBEL_BATCH=2048 \
 #   ./rebel_hunl train_turn 40 0

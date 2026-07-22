@@ -91,7 +91,7 @@ public:
     void refresh_leaves_device(HunlValueNet& net, double stack);
 
     // One CFR iteration (both alternating update passes). Root values of
-    // the CURRENT profile accumulate for avg_root_values.
+    // the CURRENT profile accumulate with the strategy-averaging weight.
     void iterate(int t);
 
     // Full solve: refresh(t) fires exactly on the CPU solver's schedule
@@ -101,7 +101,7 @@ public:
     void solve(int T, int refresh_every,
                const std::function<void(int)>& refresh);
 
-    // Iterate-averaged root values (ReBeL's training target), same
+    // Iteration-weighted root values (ReBeL's training target), same
     // normalization and masking as HunlSolver::avg_root_values.
     bool avg_root_values(
         std::vector<std::array<std::vector<double>, 2>>& v,
@@ -114,20 +114,23 @@ public:
     const torch::Tensor& cum_state(int node) const {
         return cum_[static_cast<size_t>(node)];
     }
+    // Adopt one batch member's final cumulative strategy into an equivalent
+    // CPU tree. This is the play-time state-transfer boundary and performs
+    // exact topology/shape checks before copying the [B,A,n] device layout.
+    void export_cum_strategy(HunlSolver& dst, int batch_index) const;
+    bool fused_succeeded() const { return fused_windows_ > 0; }
 
 private:
     double weight(int t) const {
-        return pcfr_ && pcfr_quad_
-            ? static_cast<double>(t) * static_cast<double>(t)
-            : static_cast<double>(t);
+        return solver_iteration_weight(t, pcfr_, pcfr_quad_);
     }
     void iterate_body();   // both update passes + root-value accumulation
     // persistent fused kernel: device tables + bounds audit (once), then
     // whole refresh windows per launch. -1 = unavailable (fallback).
     bool fused_setup();
     bool fused_window(int t_start, int t_end);
-    // equity for every (spec, runout) at once: [B, 52, n] from opp ranges
-    // [B, 52, n] (masked, unnormalized — equity is scale-invariant)
+    // equity for every (spec, runout) at once from conditional opponent
+    // ranges [B, 52, n] (masked and normalized by the feature path)
     torch::Tensor runout_equity(const torch::Tensor& opp52);
     torch::Tensor policies(int node, bool average);       // [B, A, n]
     torch::Tensor fold_cfv_t(int node, int upd, const torch::Tensor& opp);
@@ -174,12 +177,13 @@ private:
     // per-decision-node learning state [B, A, n]
     std::vector<torch::Tensor> regret_, cum_, pred_;
     torch::Tensor w_dev_;             // averaging weight (t or t²)
-    // iterate-averaged root values
+    // iteration-weighted root-value numerator
     std::array<torch::Tensor, 2> root_acc_{};
-    long rv_n_ = 0;
+    double rv_weight_ = 0.0;
     std::unique_ptr<at::cuda::CUDAGraph> graph_;
     // fused-kernel device tables
     int fused_state_ = 0;   // 0 unknown, 1 ready, -1 unavailable
+    int fused_windows_ = 0;
     torch::Tensor f_kind_, f_actor_, f_arity_, f_cbase_, f_cflat_;
     torch::Tensor f_rptr_, f_cptr_, f_pptr_, f_lptr_, f_idpair_;
     // on-device featurizer constants

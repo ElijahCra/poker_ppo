@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <stdexcept>
 #include <string>
 
 namespace rebel_hunl {
@@ -430,7 +431,7 @@ const char* kTurnSrc = R"CU(
 #define MAXA 4
 
 extern "C" __global__ void cfr_turn(
-    int tStart, int tEnd, int M, int pcfr,
+    int tStart, int tEnd, int M, int pcfr, int quadAvg,
     const int* kind, const int* actor, const int* arity,
     const int* childBase, const int* childFlat,
     const long long* regretPtr, const long long* cumPtr,
@@ -586,7 +587,7 @@ extern "C" __global__ void cfr_turn(
           }
           if (actor[m] == upd) {
             float* CM = (float*)cumPtr[m] + (size_t)b * A * N;
-            const float wv = pcfr ? (float)t * (float)t : (float)t;
+            const float wv = quadAvg ? (float)t * (float)t : (float)t;
             for (int j = 0; j < PC; ++j) {
               const int i = tid + j * NT; if (i >= N) continue;
               const float w = wv * reach[upd][d][j];
@@ -651,11 +652,12 @@ extern "C" __global__ void cfr_turn(
         --d;
       }
     }
-    // iterate-averaged root values of the current profile
+    // strategy-weighted mean numerator of current-profile root values
     float* RACC = (upd == 0 ? racc0g : racc1g) + (size_t)b * N;
+    const float rootW = quadAvg ? (float)t * (float)t : (float)t;
     for (int j = 0; j < PC; ++j) {
       const int i = tid + j * NT;
-      if (i < N) RACC[i] += vacc[0][j];
+      if (i < N) RACC[i] += rootW * vacc[0][j];
     }
     __syncthreads();
   }
@@ -690,7 +692,17 @@ bool fused_river_solve(const FusedRiverArgs& a) {
         std::fprintf(stderr, "[fused] cuLaunchKernel rc=%d\n", rc);
         return false;
     }
-    return k_.api.ctx_sync() == 0;
+    const int sync_rc = k_.api.ctx_sync();
+    if (sync_rc != 0) {
+        // The launch was accepted, so an arbitrary iteration prefix may
+        // already have changed regret/cumulative state.  Returning false
+        // would invite the caller to run the graph fallback on top of that
+        // partial solve.
+        throw std::runtime_error(
+            "fused river kernel failed after launch (sync rc=" +
+            std::to_string(sync_rc) + ")");
+    }
+    return true;
 }
 
 bool fused_turn_solve(const FusedTurnArgs& a) {
@@ -698,6 +710,7 @@ bool fused_turn_solve(const FusedTurnArgs& a) {
     void* args[] = {
         const_cast<int*>(&a.t_start), const_cast<int*>(&a.t_end),
         const_cast<int*>(&a.M), const_cast<int*>(&a.pcfr),
+        const_cast<int*>(&a.quad_avg),
         const_cast<int32_t**>(&a.kind), const_cast<int32_t**>(&a.actor),
         const_cast<int32_t**>(&a.arity),
         const_cast<int32_t**>(&a.child_base),

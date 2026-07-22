@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <random>
 #include <string>
 #include <thread>
@@ -73,9 +74,83 @@ int run_kernels() {
         for (int i = 0; i < kCombos; ++i)
             worst = std::max(worst, std::fabs(a[i] - b[i]));
     }
-    std::printf("kernels: max |fast - brute| over 20 boards = %.3e  %s\n",
-                worst, worst < 1e-9 ? "PASS" : "FAIL");
-    return worst < 1e-9 ? 0 : 1;
+    // Regression for ReBeL/Linear-CFR target weighting. Isolate iteration
+    // 1 and iteration 2, then require the two-iteration export to equal the
+    // explicitly weighted mean (1:2 for CFR+, 1:4 for PCFR+q).
+    auto root_weight_error = [&](bool pcfr) {
+        PokerEnvironment env(poker_ppo::kPokerConfig,
+                             poker_ppo::config::kBetConfig,
+                             pcfr ? 9202 : 9201);
+        advance_to_round(env, 3);
+        HunlPBS beta;
+        beta.r0 = random_range(rng);
+        beta.r1 = random_range(rng);
+        const std::vector<int> acts = {0, 1, 7, 13};
+        auto run = [&](int first, int last) {
+            HunlSolver s(env, beta, nullptr, acts);
+            s.pcfr = pcfr;
+            for (int t = 1; t < first; ++t) s.iterate(t);
+            s.track_root_values();
+            for (int t = first; t <= last; ++t) s.iterate(t);
+            std::array<std::vector<double>, 2> v, m;
+            TORCH_CHECK(s.avg_root_values(v, m),
+                        "root weighting regression produced no values");
+            return std::make_pair(std::move(v), std::move(m));
+        };
+        auto [v1, m1] = run(1, 1);
+        auto [v2, m2] = run(2, 2);
+        auto [vb, mb] = run(1, 2);
+        const double w1 = solver_iteration_weight(1, pcfr);
+        const double w2 = solver_iteration_weight(2, pcfr);
+        double err = 0.0;
+        long n = 0;
+        for (int p = 0; p < 2; ++p)
+            for (int x = 0; x < kCombos; ++x) {
+                const bool live = m1[p][x] >= 0.5 && m2[p][x] >= 0.5 &&
+                                  mb[p][x] >= 0.5;
+                if (!live) continue;
+                const double want = (w1 * v1[p][x] + w2 * v2[p][x]) /
+                                    (w1 + w2);
+                err = std::max(err, std::abs(vb[p][x] - want));
+                ++n;
+            }
+        return n > 0 ? err : std::numeric_limits<double>::infinity();
+    };
+    const double root_cfr_err = root_weight_error(false);
+    const double root_pcfr_err = root_weight_error(true);
+
+    // Regression for the production batch key: require the exact canonical
+    // serialization, including action ids and child topology.
+    PokerEnvironment sig_env(poker_ppo::kPokerConfig,
+                             poker_ppo::config::kBetConfig, 9301);
+    advance_to_round(sig_env, 3);
+    HunlPBS sig_beta;
+    sig_beta.r0 = random_range(rng);
+    sig_beta.r1 = random_range(rng);
+    HunlSolver sig_a(sig_env, sig_beta, nullptr, {0, 1, 7, 13});
+    std::string expected_key;
+    for (const auto& nd : sig_a.nodes()) {
+        expected_key += std::to_string(static_cast<int>(nd.kind)) + ":" +
+                        std::to_string(nd.player) + ":a";
+        for (int a : nd.acts) expected_key += std::to_string(a) + ",";
+        expected_key += ":c";
+        for (int c : nd.child) expected_key += std::to_string(c) + ",";
+        expected_key += ";";
+    }
+    const bool topology_key_ok =
+        TreeShape::from(sig_a).signature == expected_key;
+
+    const double sample_err = compatible_hand_sampler_error();
+    const bool ok = worst < 1e-9 && sample_err < 0.02 &&
+                    root_cfr_err < 1e-10 && root_pcfr_err < 1e-10 &&
+                    topology_key_ok;
+    std::printf("kernels: max |fast - brute| over 20 boards = %.3e; "
+                "hand-sampler marginal err = %.3e; root-weight err "
+                "CFR+=%.1e PCFR+=%.1e; topology-key=%s  %s\n",
+                worst, sample_err, root_cfr_err, root_pcfr_err,
+                topology_key_ok ? "exact" : "INCOMPLETE",
+                ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
 }
 
 // Encoding cross-check: the solver's terminal payoff model (contribs +
@@ -756,7 +831,8 @@ int main(int argc, char** argv) {
             std::printf("lbr: PREFLOP re-solving ON (T=%d, %d sampled "
                         "flops/leaf)\n", pc.t_preflop, pc.pf_samples);
         pc.pcfr = env_i("REBEL_PCFR", 0) != 0;
-        if (pc.pcfr) std::printf("lbr: PCFR+ ON (all play-time solves)\n");
+        if (pc.pcfr)
+            std::printf("lbr: PCFR+ ON (non-river play-time solves)\n");
         pc.gpu_turn = env_i("REBEL_GPU_TURN", 0) != 0;
         if (pc.gpu_turn)
             std::printf("lbr: GPU TURN solves ON (B=1 state transfer)\n");
@@ -822,6 +898,10 @@ int main(int argc, char** argv) {
                           std::atoi(std::getenv("REBEL_PCFR")) != 0;
         if (!ck || !*ck) {
             std::fprintf(stderr, "turn_gpu_check needs REBEL_CKPT\n");
+            return 1;
+        }
+        if (!torch::cuda::is_available()) {
+            std::fprintf(stderr, "turn_gpu_check requires CUDA\n");
             return 1;
         }
         {
@@ -906,6 +986,7 @@ int main(int argc, char** argv) {
                     shape.nodes.size(), n_leaves, pcfr ? 1 : 0,
                     dev.is_cuda() ? "cuda" : "cpu");
 
+        bool all_pass = true;
         for (int phase = 0; phase < 3; ++phase) {
             // 0: f64 frozen leaves; 1: f64 live refresh; 2: f32 live
             const int refresh = phase == 0 ? 1000000 : 5;
@@ -951,11 +1032,12 @@ int main(int argc, char** argv) {
                     refresh_turn_leaves(gpu, specs, gop, 0, &wsp);
             });
 
-            // ── compare iterate-averaged root values ──
+            // ── compare iteration-weighted root values ──
             std::vector<std::array<std::vector<double>, 2>> gv, gm;
             gpu.avg_root_values(gv, gm);
             double mx = 0.0, mean = 0.0;
             long cnt = 0;
+            bool masks_match = true;
             for (int b = 0; b < B; ++b) {
                 std::array<std::vector<double>, 2> cv, cm;
                 cpu[static_cast<size_t>(b)]->avg_root_values(cv, cm);
@@ -963,11 +1045,15 @@ int main(int argc, char** argv) {
                     envs[static_cast<size_t>(b)]->pot());
                 for (int p = 0; p < 2; ++p)
                     for (int x = 0; x < kCombos; ++x) {
-                        if (cm[static_cast<size_t>(p)]
-                              [static_cast<size_t>(x)] < 0.5 ||
+                        const bool cmask =
+                            cm[static_cast<size_t>(p)]
+                              [static_cast<size_t>(x)] >= 0.5;
+                        const bool gmask =
                             gm[static_cast<size_t>(b)]
                               [static_cast<size_t>(p)]
-                              [static_cast<size_t>(x)] < 0.5)
+                              [static_cast<size_t>(x)] >= 0.5;
+                        if (cmask != gmask) masks_match = false;
+                        if (!cmask || !gmask)
                             continue;
                         const double d = std::abs(
                             cv[static_cast<size_t>(p)]
@@ -990,13 +1076,62 @@ int main(int argc, char** argv) {
             static const char* kPhase[] = {"A (f64 frozen leaves)",
                                            "B (f64 live refresh)",
                                            "C (f32 live refresh)"};
-            std::printf("  phase %s: |dv|/pot mean=%.3e max=%.3e  %s\n",
+            bool transfer_ok = true;
+            double transfer_mx = 0.0;
+            long transfer_cnt = 0;
+            if (phase == 2) {
+                for (int b = 0; b < B; ++b) {
+                    gpu.export_cum_strategy(
+                        *cpu[static_cast<size_t>(b)], b);
+                    for (size_t m = 0; m < shape.nodes.size(); ++m) {
+                        const auto& nd = shape.nodes[m];
+                        if (nd.kind != HunlSolver::Node::Decision) continue;
+                        const int A = static_cast<int>(nd.acts.size());
+                        auto raw = gpu.cum_state(static_cast<int>(m))
+                                       .select(0, b)
+                                       .to(torch::kCPU)
+                                       .to(torch::kDouble)
+                                       .contiguous();
+                        const double* rp = raw.data_ptr<double>();
+                        for (int x = 0; x < kCombos; ++x) {
+                            double z = 0.0;
+                            for (int k = 0; k < A; ++k)
+                                z += rp[static_cast<size_t>(k) * kCombos + x];
+                            const auto got =
+                                cpu[static_cast<size_t>(b)]->avg_policy(
+                                    static_cast<int>(m), x);
+                            for (int k = 0; k < A; ++k) {
+                                const double want = z > 1e-12
+                                    ? rp[static_cast<size_t>(k) * kCombos + x] / z
+                                    : 1.0 / A;
+                                const double d = std::abs(got[k] - want);
+                                transfer_ok = transfer_ok && std::isfinite(d);
+                                transfer_mx = std::max(transfer_mx, d);
+                                ++transfer_cnt;
+                            }
+                        }
+                    }
+                }
+                transfer_ok = transfer_ok && transfer_cnt > 0 &&
+                              transfer_mx <= 1e-12;
+            }
+            const bool fused_ok = phase != 2 || gpu.fused_succeeded();
+            const bool pass = cnt > 0 && masks_match && fused_ok &&
+                              transfer_ok && std::isfinite(mean) &&
+                              std::isfinite(mx) && mean <= bar_mean &&
+                              mx <= bar_max;
+            all_pass = all_pass && pass;
+            std::printf("  phase %s: |dv|/pot mean=%.3e max=%.3e "
+                        "mask=%s fused=%s xfer=%.1e  %s\n",
                         kPhase[phase], mean, mx,
-                        (mean <= bar_mean && mx <= bar_max) ? "PASS"
-                                                            : "FAIL");
+                        masks_match ? "ok" : "BAD",
+                        phase == 2 ? (fused_ok ? "yes" : "NO") : "n/a",
+                        phase == 2 ? transfer_mx : 0.0,
+                        pass ? "PASS" : "FAIL");
             std::fflush(stdout);
         }
-        return 0;
+        std::printf("turn_gpu_check: %s\n", all_pass ? "PASS" : "FAIL");
+        return all_pass ? 0 : 1;
     }
     if (mode == "turn_gpu_bench") {
         // Throughput: one batched GPU turn solve (graphed iterations +
@@ -1325,7 +1460,7 @@ int main(int argc, char** argv) {
         HunlNetOracle oracle(net, stack, torch::kCPU);
         std::mt19937_64 rng(4242);
         std::uniform_real_distribution<double> u(0.0, 1.0);
-        float maxd = 0.0f, maxp = 0.0f;
+        float maxd = 0.0f, maxp = 0.0f, maxs = 0.0f;
         for (int k = 0; k < K; ++k) {
             uint8_t deck[52];
             for (int c = 0; c < 52; ++c) deck[c] = static_cast<uint8_t>(c);
@@ -1348,19 +1483,31 @@ int main(int argc, char** argv) {
             const auto f4 =
                 HunlFeaturizer::features(1, perm, 3, pot, stack, beta);
             const auto f5 = oracle.flop_features(perm, pot, beta);
+            HunlPBS scaled = beta;
+            for (int i = 0; i < kCombos; ++i) {
+                scaled.r0[static_cast<size_t>(i)] *= 8.0;
+                scaled.r1[static_cast<size_t>(i)] *= 0.125;
+            }
+            const auto f6 =
+                HunlFeaturizer::features(1, flop, 3, pot, stack, scaled);
+            const auto f7 = oracle.flop_features(flop, pot, scaled);
             for (int i = 0; i < HunlFeaturizer::kDim; ++i) {
                 maxd = std::max(maxd, std::abs(f1[i] - f2[i]));
                 maxd = std::max(maxd, std::abs(f1[i] - f3[i]));
                 maxp = std::max(maxp, std::abs(f1[i] - f4[i]));
                 maxp = std::max(maxp, std::abs(f1[i] - f5[i]));
+                maxs = std::max(maxs, std::abs(f1[i] - f6[i]));
+                maxs = std::max(maxs, std::abs(f1[i] - f7[i]));
             }
         }
         std::printf("flopctx_check: K=%d  cached-vs-uncached max|dF|=%g  "
-                    "order-invariance max|dF|=%g  %s\n",
-                    K, maxd, maxp,
-                    (maxd == 0.0f && maxp == 0.0f) ? "PASS (bit-exact)"
-                                                   : "FAIL");
-        return (maxd == 0.0f && maxp == 0.0f) ? 0 : 1;
+                    "order-invariance max|dF|=%g  "
+                    "range-scale-invariance max|dF|=%g  %s\n",
+                    K, maxd, maxp, maxs,
+                    (maxd == 0.0f && maxp == 0.0f && maxs <= 1e-6f)
+                        ? "PASS"
+                        : "FAIL");
+        return (maxd == 0.0f && maxp == 0.0f && maxs <= 1e-6f) ? 0 : 1;
     }
     if (mode == "convert_data") {
         if (argc < 4) {

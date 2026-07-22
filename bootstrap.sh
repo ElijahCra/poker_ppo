@@ -11,8 +11,9 @@
 #
 # Assumes the base image already has CUDA + a Python with the matching
 # torch installed (the build links against `python3 -c torch.cmake_prefix_path`).
-# A pip torch 2.4.x is fine to BUILD against; for the CUDA-graph speedup at
-# runtime see the allocator note printed at the end.
+# RTX 50-series / Blackwell needs a torch build backed by CUDA >= 12.8
+# (PyTorch >= 2.7). Older cu121/cu126 wheels may build successfully but
+# cannot execute kernels on sm_120.
 #
 # Usage:
 #   ./bootstrap.sh                       # defaults below
@@ -40,7 +41,7 @@ echo "==> installing build toolchain (apt)"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
 apt-get install -y --no-install-recommends \
-    build-essential cmake git ca-certificates
+    build-essential cmake git ca-certificates tmux
 
 # cmake must be >= 3.18 (project requirement).
 cmake_ver=$(cmake --version | head -1 | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?')
@@ -48,8 +49,8 @@ echo "    cmake $cmake_ver, g++ $(g++ -dumpversion)"
 
 # Soft checks for the build's external deps (not apt-installed here).
 command -v nvcc  >/dev/null 2>&1 || echo "    WARN: nvcc not found — CUDA toolkit may be missing"
-python3 -c 'import torch; print("    torch", torch.__version__, "cuda", torch.version.cuda)' \
-    || echo "    WARN: python3 has no torch — the CMake torch discovery will fail"
+python3 -c 'import sys,torch; cv=tuple(map(int,(torch.version.cuda or "0.0").split(".")[:2])); caps=[torch.cuda.get_device_capability(i) for i in range(torch.cuda.device_count())]; arch=torch.cuda.get_arch_list(); print("    torch",torch.__version__,"cuda",torch.version.cuda,"devices",len(caps),"arch",arch); [print("      ",i,torch.cuda.get_device_name(i),"sm","".join(map(str,caps[i]))) for i in range(len(caps))]; sys.exit("CUDA is unavailable in this torch build") if not torch.cuda.is_available() else None; sys.exit("Blackwell requires a CUDA >=12.8 torch wheel") if any(c >= (12,0) for c in caps) and cv < (12,8) else None; sys.exit("torch wheel lacks sm_120 kernels") if any(c >= (12,0) for c in caps) and "sm_120" not in arch else None' \
+    || { echo "FATAL: install a CUDA-compatible PyTorch before building" >&2; exit 1; }
 
 # ── 2. clone / update + checkout branch ─────────────────────────────────────
 if [ -d "$REPO_DIR/.git" ]; then
@@ -66,8 +67,9 @@ echo "    HEAD: $(git rev-parse --short HEAD) $(git log -1 --format=%s)"
 # ── 3. configure + build (no tests) ─────────────────────────────────────────
 echo "==> configuring (tests OFF)"
 cmake -S . -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=OFF
-echo "==> building poker_ppo + generate_table"
-cmake --build "$BUILD_DIR" -j "$JOBS" --target poker_ppo generate_table
+echo "==> building poker_ppo + ReBeL HUNL + generate_table"
+cmake --build "$BUILD_DIR" -j "$JOBS" --target \
+    poker_ppo rebel_hunl generate_table
 
 # ── 4. generate HandRanks.dat (run from repo root → ./HandRanks.dat) ─────────
 GEN="$BUILD_DIR/Game/Utility/TwoPlusTwoHandEvaluator/generate_table"
@@ -112,6 +114,10 @@ Start training (native Linux survives SSH disconnect via tmux):
     tmux new -s train
     [ -f tune.env ] && source tune.env      # POKER_PPO_STEP_THREADS from autotune
     ./$BUILD_DIR/poker_ppo 2>&1 | tee train.log
+
+For the ReBeL HUNL campaign, run the hardware/solver probe first:
+    bash tools/rebel_rental_probe.sh
+Then run the toy-gated campaign launcher described in tools/vm_gen3_test.sh.
 
 Bigger GPU (H100/H200): the rollout shape + threads are auto-tuned above,
 but those are dynamics-NEUTRAL. To actually spend an H100's headroom, scale

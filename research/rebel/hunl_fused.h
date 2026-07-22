@@ -41,8 +41,10 @@ struct FusedRiverArgs {
     const int64_t* cardB = nullptr;       // [n]
 };
 
-// false = unavailable (no NVRTC/driver, compile failure, bounds exceeded)
-// — caller falls back to the graphed torch path. Compile happens once per
+// false = safely unavailable before launch (no NVRTC/driver, compile
+// failure, bounds exceeded, or launch rejected) — caller may fall back to
+// the graphed torch path. A post-launch synchronization failure throws,
+// because solver state may already be partial. Compile happens once per
 // process; failures are logged to stderr once.
 bool fused_river_solve(const FusedRiverArgs& a);
 
@@ -51,10 +53,10 @@ bool fused_river_solve(const FusedRiverArgs& a);
 // antisymmetric precomputed operator (op[x][y] = −op[y][x], so coalesced
 // row reads need no transposed copy), StreetEnd via net-value tensors +
 // the closed-form compatible mass (bins + pair-combo lookups). CFR+ or
-// PCFR+ (pred buffers + quadratic averaging). Root values of the current
-// profile accumulate into root_acc.
+// PCFR+ (pred buffers, independently selectable linear/quadratic averaging).
+// Current-profile root values accumulate with the same averaging weights.
 struct FusedTurnArgs {
-    int t_start = 1, t_end = 0, M = 0, B = 0, pcfr = 0;
+    int t_start = 1, t_end = 0, M = 0, B = 0, pcfr = 0, quad_avg = 0;
     const int32_t* kind = nullptr;        // [M]
     const int32_t* actor = nullptr;       // [M]
     const int32_t* arity = nullptr;       // [M]
