@@ -319,8 +319,11 @@ void PokerEnvironment::inject_play_cards(int hero_seat, int h0, int h1,
     const int villain = 1 - hero_seat;
     raw[villain * 2] = rem[at++];
     raw[villain * 2 + 1] = rem[at++];
-    for (size_t slot = 4 + board.size(); slot < raw.size(); ++slot)
+    const size_t first_hidden_board = 4 + board.size();
+    for (size_t slot = 0; slot < raw.size(); ++slot) {
+        if (slot < first_hidden_board) continue;
         raw[slot] = rem[at++];
+    }
 }
 
 void PokerEnvironment::auto_advance_chance() {

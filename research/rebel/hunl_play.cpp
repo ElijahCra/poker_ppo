@@ -360,13 +360,16 @@ std::vector<double> RebelTarget::allin_equities(PokerEnvironment& env) const {
     const int seat = env.current_player();
     const std::vector<double>& opp = seat == 0 ? pbs_.r1 : pbs_.r0;
     const int nb = env.community_count();
+    TORCH_CHECK(nb >= 0 && nb <= 5,
+                "allin_equities: invalid community-card count ", nb);
     std::array<uint8_t, 5> board{};
     std::array<uint8_t, kCards> deck{};
     bool public_card[kCards] = {};
-    for (int b = 0; b < nb; ++b) {
-        board[static_cast<size_t>(b)] =
-            static_cast<uint8_t>(env.community_card(b));
-        public_card[board[static_cast<size_t>(b)]] = true;
+    for (size_t b = 0; b < board.size(); ++b) {
+        if (b >= static_cast<size_t>(nb)) break;
+        board[b] = static_cast<uint8_t>(
+            env.community_card(static_cast<int>(b)));
+        public_card[board[b]] = true;
     }
     int ndeck = 0;
     for (int c = 0; c < kCards; ++c)

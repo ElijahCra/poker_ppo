@@ -154,7 +154,7 @@ private:
     // per-spec
     torch::Tensor valid_;             // [B, n] (valid on the 4-card board)
     torch::Tensor r0_, r1_;           // [B, n] normalized root ranges
-    torch::Tensor r0c_, r1c_;         // CPU float copies (reach walks)
+    torch::Tensor r0c_, r1c_;         // CPU copies, solver dtype (reach walks)
     torch::Tensor runout_ok_;         // [B, 52, 1]: card off the board
     torch::Tensor c0_, c1_;           // [B, nodes] contribs
     // AllinShowdown as a precomputed linear operator: cfv = Op · opp,

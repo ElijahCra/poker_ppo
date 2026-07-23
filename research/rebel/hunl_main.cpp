@@ -690,27 +690,50 @@ int run_allin_response_check() {
                              poker_ppo::config::kBetConfig,
                              7300 + target_round);
         if (target_round > 0) advance_to_round(env, target_round);
+        else                  env.reset();
         RebelTarget target(net, stack, torch::kCPU, cfg, nullptr);
         target.on_hand_start(env);
         const int shove = poker_ppo::config::kBetConfig.action_count() - 1;
         auto before_tensor = env.legal_action_mask();
         auto before = before_tensor.accessor<float, 1>();
         if (shove < 2 || before[shove] <= 0.5f) {
+            std::fprintf(stderr,
+                         "allin_response_check: round=%d shove=%d is not "
+                         "legal (round=%d pot=%d stack=%d/%d call=%d)\n",
+                         target_round, shove, env.round(), env.pot(),
+                         env.stack(0), env.stack(1), env.amount_to_call());
             ok = false;
             continue;
         }
         target.note_action(env, shove);
         env.step(shove);
         if (env.is_terminal()) {
+            std::fprintf(stderr,
+                         "allin_response_check: round=%d shove terminated "
+                         "before opponent response\n", target_round);
             ok = false;
             continue;
         }
         auto mask = env.legal_action_mask();
         const int response = target.act(env, mask);
-        if (response != 0 && response != 1) ok = false;
+        if (response != 0 && response != 1) {
+            std::fprintf(stderr,
+                         "allin_response_check: round=%d returned illegal "
+                         "forced response=%d (call=%d stack=%d)\n",
+                         target_round, response, env.amount_to_call(),
+                         env.stack(env.current_player()));
+            ok = false;
+        }
         target.note_action(env, response);
         env.step(response);
-        if (!env.is_terminal()) ok = false;
+        if (!env.is_terminal()) {
+            std::fprintf(stderr,
+                         "allin_response_check: round=%d response=%d did not "
+                         "terminate (round=%d pot=%d call=%d)\n",
+                         target_round, response, env.round(), env.pot(),
+                         env.amount_to_call());
+            ok = false;
+        }
     }
     // The deployment bridge must replace random internal chance cards with
     // the externally observed deal without changing betting state.
@@ -1274,8 +1297,20 @@ int main(int argc, char** argv) {
                     shape.nodes.size(), n_leaves, pcfr ? 1 : 0,
                     dev.is_cuda() ? "cuda" : "cpu");
 
+        // The f64 phases judge solver arithmetic, so give the CPU and
+        // batched refreshes deterministic IEEE f32 oracle outputs.  TF32
+        // GEMMs can vary slightly with forward batch shape (the scalar CPU
+        // reference and batched refresh deliberately use different shapes),
+        // which otherwise pollutes a 1e-6 arithmetic gate.  Phase C restores
+        // the requested production TF32 setting and validates that complete
+        // fused path with its calibrated f32 tolerance.
+        const bool tf32_requested = std::getenv("REBEL_TF32") &&
+            std::atoi(std::getenv("REBEL_TF32")) != 0;
         bool all_pass = true;
         for (int phase = 0; phase < 3; ++phase) {
+            const bool phase_tf32 = phase == 2 && tf32_requested;
+            at::globalContext().setAllowTF32CuBLAS(phase_tf32);
+            at::globalContext().setAllowTF32CuDNN(phase_tf32);
             // 0: f64 frozen leaves; 1: f64 live refresh; 2: f32 live
             const int refresh = phase == 0 ? 1000000 : 5;
             const auto gdt = phase == 2 ? torch::kFloat : torch::kDouble;

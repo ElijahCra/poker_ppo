@@ -13,6 +13,8 @@
 # leftover toy mix.bin would make the real run skip generation and
 # train on 4k rows), then the full campaign starts. On failure the
 # artifacts stay for inspection and the real run does NOT start.
+# Set REBEL_SMOKE_ONLY=1 to stop after a successful toy teardown instead of
+# immediately entering the paid/full campaign.
 set -uo pipefail
 cd "$(dirname "$0")/../cmake-build-release" 2>/dev/null || true
 
@@ -104,5 +106,9 @@ for f in mix.bin river_g3.bin flop_g3.bin g3_s1.pt g3_spec.pt g3_final.pt \
         exit 1
     }
 done
+if [ "${REBEL_SMOKE_ONLY:-0}" = 1 ]; then
+    echo "==== smoke-only requested — real campaign NOT started ===="
+    exit 0
+fi
 echo "==== clean — launching the REAL campaign ===="
 exec bash "$SELF_DIR/vm_gen3.sh"

@@ -425,9 +425,14 @@ LBREvaluator::Result LBREvaluator::evaluate_target(ILBRTarget& target) {
             }
             const auto h  = env_->hole_cards(lbr_seat);
             const int  nb = env_->community_count();
-            uint8_t board[5];
-            for (int i = 0; i < nb; ++i)
-                board[i] = static_cast<uint8_t>(env_->community_card(i));
+            TORCH_CHECK(nb >= 0 && nb <= 5,
+                        "LBR: invalid community-card count ", nb);
+            std::array<uint8_t, 5> board{};
+            for (size_t i = 0; i < board.size(); ++i) {
+                if (i >= static_cast<size_t>(nb)) break;
+                board[i] = static_cast<uint8_t>(
+                    env_->community_card(static_cast<int>(i)));
+            }
 
             const double pot0 = static_cast<double>(env_->pot());
             const int    c    = env_->amount_to_call();
@@ -435,7 +440,7 @@ LBREvaluator::Result LBREvaluator::evaluate_target(ILBRTarget& target) {
             // Call/check baseline: ΔEV vs folding = e·(pot0+c) − c.
             const double e_call = Game::hand_vs_range_equity(
                 static_cast<uint8_t>(h[0]), static_cast<uint8_t>(h[1]),
-                board, nb, belief.combos, belief.weights,
+                board.data(), nb, belief.combos, belief.weights,
                 rng_, cfg_.equity_mc_samples);
             const double ev_call = e_call * (pot0 + c) - static_cast<double>(c);
 
@@ -524,7 +529,8 @@ LBREvaluator::Result LBREvaluator::evaluate_target(ILBRTarget& target) {
                             cc[r] = belief.combos[active[r]];
                         const double e_raise = Game::hand_vs_range_equity(
                             static_cast<uint8_t>(h[0]), static_cast<uint8_t>(h[1]),
-                            board, nb, cc, call_w, rng_, cfg_.equity_mc_samples);
+                            board.data(), nb, cc, call_w, rng_,
+                            cfg_.equity_mc_samples);
                         const double ev_raise =
                             p_fold * pot0
                             + (1.0 - p_fold) * (e_raise * (pot1 + vc) - add_r);

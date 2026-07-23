@@ -89,6 +89,11 @@ BatchTurnSolver::BatchTurnSolver(TreeShape shape, std::vector<TurnSpec> specs,
     auto valid = torch::zeros({B_, n}, f);
     auto r0 = torch::zeros({B_, n}, f);
     auto r1 = torch::zeros({B_, n}, f);
+    // The f64 equivalence path must not quantize its input ranges through
+    // the production f32 staging tensors.  Keep exact normalized roots for
+    // that path; the f32 solver continues to use the compact tensors above.
+    auto r0d = torch::zeros({B_, n}, torch::kDouble);
+    auto r1d = torch::zeros({B_, n}, torch::kDouble);
     auto rok = torch::zeros({B_, kCards}, f);
     auto c0 = torch::zeros({B_, M}, f);
     auto c1 = torch::zeros({B_, M}, f);
@@ -119,13 +124,15 @@ BatchTurnSolver::BatchTurnSolver(TreeShape shape, std::vector<TurnSpec> specs,
         auto va = valid.accessor<float, 2>();
         auto a0 = r0.accessor<float, 2>();
         auto a1 = r1.accessor<float, 2>();
+        auto d0 = r0d.accessor<double, 2>();
+        auto d1 = r1d.accessor<double, 2>();
         for (int i = 0; i < n; ++i) {
             va[b][i] = vb[i] ? 1.0f : 0.0f;
             if (vb[i]) {
-                a0[b][i] = s0 > kTiny ? static_cast<float>(sp.r0[i] / s0)
-                                      : static_cast<float>(1.0 / nv4);
-                a1[b][i] = s1 > kTiny ? static_cast<float>(sp.r1[i] / s1)
-                                      : static_cast<float>(1.0 / nv4);
+                d0[b][i] = s0 > kTiny ? sp.r0[i] / s0 : 1.0 / nv4;
+                d1[b][i] = s1 > kTiny ? sp.r1[i] / s1 : 1.0 / nv4;
+                a0[b][i] = static_cast<float>(d0[b][i]);
+                a1[b][i] = static_cast<float>(d1[b][i]);
             }
         }
         auto cc0 = c0.accessor<float, 2>();
@@ -265,10 +272,12 @@ BatchTurnSolver::BatchTurnSolver(TreeShape shape, std::vector<TurnSpec> specs,
     card_b_ = cb.to(dev_);
     mask_xc_ = mxc.to(dev_).to(dt_);
     valid_ = valid.to(dev_).to(dt_);
-    r0_ = (r0 * valid).to(dev_).to(dt_);
-    r1_ = (r1 * valid).to(dev_).to(dt_);
-    r0c_ = (r0 * valid).contiguous();
-    r1c_ = (r1 * valid).contiguous();
+    const auto& root0 = dt_ == torch::kDouble ? r0d : r0;
+    const auto& root1 = dt_ == torch::kDouble ? r1d : r1;
+    r0_ = root0.to(dev_).to(dt_);
+    r1_ = root1.to(dev_).to(dt_);
+    r0c_ = root0.contiguous();
+    r1c_ = root1.contiguous();
     runout_ok_ = rok.to(dev_).to(dt_).unsqueeze(2);        // [B, 52, 1]
     c0_ = c0.to(dev_).to(dt_);
     c1_ = c1.to(dev_).to(dt_);
@@ -1128,8 +1137,11 @@ void BatchTurnSolver::all_leaf_reaches(
         if (need[m])
             pol[m] =
                 cum_[m].to(torch::kCPU).to(torch::kDouble).contiguous();
-    const float* pr0 = r0c_.data_ptr<float>();
-    const float* pr1 = r1c_.data_ptr<float>();
+    const bool double_roots = r0c_.scalar_type() == torch::kDouble;
+    const float* pr0f = double_roots ? nullptr : r0c_.data_ptr<float>();
+    const float* pr1f = double_roots ? nullptr : r1c_.data_ptr<float>();
+    const double* pr0d = double_roots ? r0c_.data_ptr<double>() : nullptr;
+    const double* pr1d = double_roots ? r1c_.data_ptr<double>() : nullptr;
     for (int j = 0; j < L; ++j) {
         out[static_cast<size_t>(j)].assign(static_cast<size_t>(B_), {});
         for (int b = 0; b < B_; ++b)
@@ -1148,10 +1160,14 @@ void BatchTurnSolver::all_leaf_reaches(
                 auto& r1v = out[static_cast<size_t>(j)]
                                [static_cast<size_t>(b)][1];
                 for (int i = 0; i < kCombos; ++i) {
-                    r0v[static_cast<size_t>(i)] = static_cast<double>(
-                        pr0[static_cast<size_t>(b) * kCombos + i]);
-                    r1v[static_cast<size_t>(i)] = static_cast<double>(
-                        pr1[static_cast<size_t>(b) * kCombos + i]);
+                    const size_t off =
+                        static_cast<size_t>(b) * kCombos + i;
+                    r0v[static_cast<size_t>(i)] =
+                        double_roots ? pr0d[off]
+                                     : static_cast<double>(pr0f[off]);
+                    r1v[static_cast<size_t>(i)] =
+                        double_roots ? pr1d[off]
+                                     : static_cast<double>(pr1f[off]);
                 }
                 int node = 0;
                 for (int a : leaf_path_[static_cast<size_t>(j)]) {
