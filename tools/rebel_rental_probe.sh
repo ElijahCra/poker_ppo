@@ -19,7 +19,21 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 BIN=./cmake-build-release/rebel_hunl
 OUT=rental_probe.log
-NP=$(nproc)
+PYTHON=${PYTHON:-python3}
+effective_cores() {
+    local online quota period limited
+    online=$(nproc)
+    if [ -r /sys/fs/cgroup/cpu.max ]; then
+        read -r quota period < /sys/fs/cgroup/cpu.max
+        if [ "$quota" != max ] && [ "$period" -gt 0 ] 2>/dev/null; then
+            limited=$(( quota / period ))
+            [ "$limited" -ge 1 ] || limited=1
+            [ "$limited" -lt "$online" ] && online=$limited
+        fi
+    fi
+    echo "$online"
+}
+NP=${NCPU:-$(effective_cores)}
 NGPU=$(nvidia-smi -L 2>/dev/null | wc -l)
 EXPECTED_GPUS=${EXPECTED_GPUS:-4}
 MIN_MEM_GIB=${MIN_MEM_GIB:-230}
@@ -28,7 +42,7 @@ MIN_DISK_GB=${MIN_DISK_GB:-600}
 {
 echo "==================== box ===================="
 date
-echo "nproc: $NP"
+echo "effective cores: $NP (nproc=$(nproc), cpu.max=$(cat /sys/fs/cgroup/cpu.max 2>/dev/null || echo unavailable))"
 free -g | head -2
 df -h . | tail -1
 nvidia-smi --query-gpu=name,compute_cap,memory.total,clocks.max.sm \
@@ -41,7 +55,7 @@ disk_gb=$(df -PB1 . | awk 'NR==2{print int($4/1000000000)}')
     || { echo "FATAL: need >=${MIN_MEM_GIB} GiB RAM, found ${mem_gib}"; exit 1; }
 [ "$disk_gb" -ge "$MIN_DISK_GB" ] \
     || { echo "FATAL: need >=${MIN_DISK_GB} GB free, found ${disk_gb}"; exit 1; }
-python3 -c 'import sys,torch; expected=int(sys.argv[1]); cv=tuple(map(int,(torch.version.cuda or "0.0").split(".")[:2])); caps=[torch.cuda.get_device_capability(i) for i in range(torch.cuda.device_count())]; arch=torch.cuda.get_arch_list(); print("torch",torch.__version__,"cuda",torch.version.cuda,"arch",arch); [print(i,torch.cuda.get_device_name(i),caps[i]) for i in range(len(caps))]; sys.exit("CUDA is unavailable") if not torch.cuda.is_available() else None; sys.exit(f"expected {expected} CUDA devices, found {len(caps)}") if len(caps)!=expected else None; sys.exit("rental GPUs are not all Blackwell sm_120") if any(c < (12,0) for c in caps) else None; sys.exit("Blackwell requires a CUDA >=12.8 torch wheel") if cv < (12,8) else None; sys.exit("torch wheel lacks sm_120 kernels") if "sm_120" not in arch else None' "$EXPECTED_GPUS"
+"$PYTHON" -c 'import sys,torch; expected=int(sys.argv[1]); cv=tuple(map(int,(torch.version.cuda or "0.0").split(".")[:2])); caps=[torch.cuda.get_device_capability(i) for i in range(torch.cuda.device_count())]; arch=torch.cuda.get_arch_list(); print("torch",torch.__version__,"cuda",torch.version.cuda,"arch",arch); [print(i,torch.cuda.get_device_name(i),caps[i]) for i in range(len(caps))]; sys.exit("CUDA is unavailable") if not torch.cuda.is_available() else None; sys.exit(f"expected {expected} CUDA devices, found {len(caps)}") if len(caps)!=expected else None; sys.exit("rental GPUs are not all Blackwell sm_120") if any(c < (12,0) for c in caps) else None; sys.exit("Blackwell requires a CUDA >=12.8 torch wheel") if cv < (12,8) else None; sys.exit("torch wheel lacks sm_120 kernels") if "sm_120" not in arch else None' "$EXPECTED_GPUS"
 
 echo "==================== validation ===================="
 # kernels: CPU fast-vs-brute; gpu_check: eager + fused NVRTC kernel vs

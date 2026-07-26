@@ -3,7 +3,7 @@
 #
 #   cd /poker_ppo/cmake-build-release && bash ../tools/vm_gen3.sh
 #
-# Shaped for 4x5090 / 128 cores / 256GB RAM / 1TB disk. Phases, each
+# Shaped for 4x5090 / ~96 effective cores / 256GB RAM / 1TB disk. Phases, each
 # gated on verifiable on-disk state (rerun after any death — finished
 # phases are detected and skipped):
 #   0  sanity ladder (kernels, early all-ins, river GPU, feature context,
@@ -25,6 +25,21 @@
 #      remains off until the rental probe proves a latency win.
 set -uo pipefail
 
+effective_cores() {
+    local online quota period limited
+    online=$(nproc)
+    if [ -r /sys/fs/cgroup/cpu.max ]; then
+        read -r quota period < /sys/fs/cgroup/cpu.max
+        if [ "$quota" != max ] && [ "$period" -gt 0 ] 2>/dev/null; then
+            limited=$(( quota / period ))
+            [ "$limited" -ge 1 ] || limited=1
+            [ "$limited" -lt "$online" ] && online=$limited
+        fi
+    fi
+    echo "$online"
+}
+
+CORES=${CORES:-$(effective_cores)}
 BIN=${BIN:-./rebel_hunl}
 if [ -z "${CHAMPION:-}" ]; then
     if [ -s cand_f1.pt ]; then CHAMPION=cand_f1.pt
@@ -40,6 +55,7 @@ RIVER_EPS=${RIVER_EPS:-25000}
 TRAIN_EPOCHS=${TRAIN_EPOCHS:-40}
 TRAIN_SGD=${TRAIN_SGD:-4000}
 GPU_CACHE=${GPU_CACHE:-500000}          # ~20GB on device; 5090 has 32GB
+DISK_HEADROOM_GB=${DISK_HEADROOM_GB:-180}
 FLOP_EPOCHS=${FLOP_EPOCHS:-25}
 FLOP_EPS=${FLOP_EPS:-500}
 FLOP_THREADS=${FLOP_THREADS:-40}
@@ -54,7 +70,7 @@ GPU_SUPPORT_THREADS=${GPU_SUPPORT_THREADS:-12}
 T_TURN=${T_TURN:-120}
 REPLAY_CAP=${REPLAY_CAP:-5600000}      # keeps the full ~5.54M mixed bank
 GATE_HANDS=${GATE_HANDS:-20000}
-GATE_THREADS=${GATE_THREADS:-128}
+GATE_THREADS=${GATE_THREADS:-$CORES}
 GATE_MAX_REGRESSION=${GATE_MAX_REGRESSION:-0.35}
 PRESSURE_HANDS=${PRESSURE_HANDS:-200}
 PRESSURE_THREADS=${PRESSURE_THREADS:-16}
@@ -62,7 +78,7 @@ LATENCY_HANDS=${LATENCY_HANDS:-20}
 ROOT_EPOCHS=${ROOT_EPOCHS:-5}
 ROOT_EPISODES=${ROOT_EPISODES:-40}
 ROOT_SGD=${ROOT_SGD:-1000}
-ROOT_THREADS=${ROOT_THREADS:-96}
+ROOT_THREADS=${ROOT_THREADS:-$CORES}
 SEED_BASE=${SEED_BASE:-0}
 # Each shard owns a disjoint seed interval.  The trainer currently reduces
 # several RNG seeds to uint32, so keep the real campaign below this stride
@@ -199,6 +215,9 @@ command -v flock >/dev/null 2>&1 || die "flock is required for campaign locking"
 exec 9>.vm_gen3.lock
 flock -n 9 || die "another vm_gen3 campaign owns .vm_gen3.lock"
 [ "$TARGET_ROWS" -gt 0 ] || die "TARGET_ROWS must be positive"
+[ "$CORES" -ge 1 ] || die "CORES must be positive"
+[ "$DISK_HEADROOM_GB" -ge 0 ] \
+    || die "DISK_HEADROOM_GB must be non-negative"
 [ $(( RIVER_EPOCHS * RIVER_EPS )) -eq "$RIVER_TARGET" ] \
     || die "RIVER_EPOCHS*RIVER_EPS must equal RIVER_TARGET exactly"
 [ "$CHUNK_EPISODES" -gt 0 ] || die "CHUNK_EPISODES must be positive"
@@ -239,7 +258,7 @@ free_gb=$(df -BG --output=avail . | tail -1 | tr -dc 0-9)
 # Transactional mixing retains every source while writing a complete temp
 # copy.  At 5M turn rows the default peak is ~444GB; require extra room for
 # logs, checkpoints, allocator spill, and filesystem accounting.
-need_gb=$(( 2 * TARGET_ROWS * ROW / 1000000000 + 180 ))
+need_gb=$(( 2 * TARGET_ROWS * ROW / 1000000000 + DISK_HEADROOM_GB ))
 [ "$(rows mix.bin)" -gt 0 ] || [ "$free_gb" -ge "$need_gb" ] \
     || die "need ~${need_gb}GB free, have ${free_gb}GB"
 
@@ -273,7 +292,7 @@ echo "   all PASS"
 # every launcher start so a stale/corrupt copy cannot survive a prior crash.
 cp "$CHAMPION" gen_oracle.pt || die "cannot stage gen_oracle.pt"
 cp "$CHAMPION" flop_oracle.pt || die "cannot stage flop_oracle.pt"
-cores=$(nproc)
+cores=$CORES
 
 RIVER_PID=; FLOP_PID=
 if [ "$(rows river_g3.bin)" -lt "$RIVER_TARGET" ]; then
